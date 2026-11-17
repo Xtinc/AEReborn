@@ -1,8 +1,10 @@
-#ifndef AEREBORN_BLOCK_H
-#define AEREBORN_BLOCK_H
+#ifndef AEREBORN_CORE_BLOCK_H
+#define AEREBORN_CORE_BLOCK_H
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <type_traits>
 #include <vector>
 
 namespace aereborn
@@ -12,6 +14,10 @@ template <class T> class View
 {
   public:
     View(T *data, std::size_t size) noexcept : data_(data), size_(size)
+    {
+    }
+    template <class U, typename std::enable_if<std::is_convertible<U (*)[], T (*)[]>::value, int>::type = 0>
+    View(View<U> other) noexcept : data_(other.data()), size_(other.size())
     {
     }
     T *data() const noexcept
@@ -28,7 +34,6 @@ template <class T> class View
     }
     T *begin() const noexcept
     {
-
         return data_;
     }
     T *end() const noexcept
@@ -46,16 +51,25 @@ template <class T> class View
     std::size_t size_;
 };
 
-// Non-owning planar views. Only the first frames() samples of each channel are valid.
-class IBlock
+// Non-owning planar views. frames() is the processing span, including any padded tail.
+template <class T> class Block
 {
+    static_assert(std::is_same<typename std::remove_const<T>::type, float>::value, "Audio samples must be float");
+    template <class> friend class Block;
+
   public:
-    IBlock() noexcept = default;
-    IBlock(const float *data, std::size_t channels, std::size_t frames, std::size_t stride) noexcept
+    Block() noexcept = default;
+    Block(T *data, std::size_t channels, std::size_t frames, std::size_t stride) noexcept
         : data_(data), channels_(channels), frames_(frames), stride_(stride)
     {
+        assert(frames <= stride);
     }
-    const float *channel(std::size_t index) const noexcept
+    template <class U, typename std::enable_if<std::is_convertible<U *, T *>::value, int>::type = 0>
+    Block(Block<U> other) noexcept
+        : data_(other.data_), channels_(other.channels_), frames_(other.frames_), stride_(other.stride_)
+    {
+    }
+    T *channel(std::size_t index) const noexcept
     {
         assert(index < channels_);
         return data_ + index * stride_;
@@ -74,51 +88,23 @@ class IBlock
         frames_ = frames;
     }
 
+    template <class U = T, typename std::enable_if<!std::is_const<U>::value, int>::type = 0> void clear() const noexcept
+    {
+        for (std::size_t ch = 0; ch < channels_; ++ch)
+        {
+            std::fill_n(channel(ch), frames_, 0.0f);
+        }
+    }
+
   private:
-    const float *data_ = nullptr;
+    T *data_ = nullptr;
     std::size_t channels_ = 0;
     std::size_t frames_ = 0;
     std::size_t stride_ = 0;
 };
 
-class OBlock
-{
-  public:
-    OBlock() noexcept = default;
-    OBlock(float *data, std::size_t channels, std::size_t frames, std::size_t stride) noexcept
-        : data_(data), channels_(channels), frames_(frames), stride_(stride)
-    {
-    }
-    float *channel(std::size_t index) const noexcept
-    {
-        assert(index < channels_);
-        return data_ + index * stride_;
-    }
-    std::size_t channels() const noexcept
-    {
-        return channels_;
-    }
-    std::size_t frames() const noexcept
-    {
-        return frames_;
-    }
-    void set_frames(std::size_t frames) noexcept
-    {
-        assert(frames <= stride_);
-        frames_ = frames;
-    }
-    void clear() const noexcept;
-    operator IBlock() const noexcept
-    {
-        return {data_, channels_, frames_, stride_};
-    }
-
-  private:
-    float *data_ = nullptr;
-    std::size_t channels_ = 0;
-    std::size_t frames_ = 0;
-    std::size_t stride_ = 0;
-};
+using IBlock = Block<const float>;
+using OBlock = Block<float>;
 
 // Allocation belongs to construction/preparation, never to block processing.
 class Buffer
@@ -145,4 +131,4 @@ class Buffer
 
 } // namespace aereborn
 
-#endif // AEREBORN_BLOCK_H
+#endif // AEREBORN_CORE_BLOCK_H
