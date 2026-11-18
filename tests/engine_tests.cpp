@@ -1,13 +1,15 @@
 #include "core/engine.h"
-#include "plugins/nodes.h"
+#include "checked.h"
+#include "nodes.h"
+#include "plugins/virtual.h"
 
 #include <cmath>
 #include <iostream>
 #include <limits>
-#include <sstream>
 #include <type_traits>
 
 using namespace aereborn;
+using namespace aereborn::test;
 
 static_assert(std::is_convertible<OBlock, IBlock>::value, "Outputs must support read-only views");
 static_assert(!std::is_convertible<IBlock, OBlock>::value, "Inputs must remain read-only");
@@ -26,7 +28,7 @@ using Source = BufferSourceNode<test_rate, test_period>;
 using Sink = BufferSinkNode<test_rate, test_period>;
 using Gain = GainNode<test_rate, test_period>;
 using Mixer = MixerNode<test_rate, test_period>;
-using Sine = SineNode<test_rate, test_period>;
+using Sine = VirtualSource<test_rate, test_period>;
 
 void check(bool condition, const char *message)
 {
@@ -41,40 +43,32 @@ void near(float actual, float expected)
     check(std::isfinite(actual) && std::abs(actual - expected) < 0.00001f, "Unexpected sample value");
 }
 
-template <class F> void expect_error(ErrorCode expected, F action)
+void expect_error(ErrorCode expected, RetCode status)
 {
-    try
-    {
-        action();
-    }
-    catch (const GraphError &error)
-    {
-        check(error.code() == expected, "Unexpected graph error code");
-        return;
-    }
-    throw std::runtime_error("Expected a graph error");
+    check(status.code() == expected, status.message());
+}
+
+template <class T> void expect_error(ErrorCode expected, const Result<T> &result)
+{
+    expect_error(expected, result.ret_code());
 }
 
 void render(TestEngine &engine)
 {
-    check(engine.process(), "Rendering failed");
+    checked(engine.process());
 }
 
 IBlock captured(TestEngine &engine, NodeId sink)
 {
-    return engine.node<Sink>(sink).block();
+    return checked(engine.node<Sink>(sink))->block();
 }
 
 // Nonuniform port widths catch assumptions about port indices and sample offsets.
 class TwoPortNode final : public NodeT<2, 2, test_rate, test_period>
 {
   public:
-    TwoPortNode() : NodeT({{ISpec{1}, ISpec{2}}}, {{OSpec{2}, OSpec{1}}})
+    TwoPortNode() : NodeT({{1, 2}}, {{2, 1}})
     {
-    }
-    void attributes(std::ostream &stream) const override
-    {
-        stream << "TwoPortNode {}";
     }
     void process(const ProcContext &context) noexcept override
     {
@@ -93,14 +87,11 @@ class CountingNode final : public NodeT<0, 1, test_rate, test_period>
     CountingNode() : NodeT({}, {{1}})
     {
     }
-    void attributes(std::ostream &stream) const override
-    {
-        stream << "CountingNode { preparations=" << preparations << ", calls=" << calls << " }";
-    }
-    void prepare() override
+    RetCode prepare() noexcept override
     {
         ++preparations;
         calls = 0;
+        return {};
     }
     void process(const ProcContext &context) noexcept override
     {
@@ -118,37 +109,41 @@ class CountingNode final : public NodeT<0, 1, test_rate, test_period>
 class RetrySink final : public NodeT<1, 0, test_rate, test_period>
 {
   public:
-    RetrySink() : NodeT({{1}}, {})
+    explicit RetrySink(bool throw_on_failure = false) : NodeT({{1}}, {}), throw_on_failure_(throw_on_failure)
     {
     }
-    void attributes(std::ostream &stream) const override
-    {
-        stream << "RetrySink { attempts=" << attempts << " }";
-    }
-    void prepare() override
+    RetCode prepare() override
     {
         if (++attempts == 1)
         {
-            throw std::runtime_error("Simulated preparation failure");
+            if (throw_on_failure_)
+            {
+                throw std::runtime_error("Simulated exception in a custom node");
+            }
+            return ErrorCode::NoMemory;
         }
+        return {};
     }
     void process(const ProcContext &) noexcept override
     {
     }
     int attempts = 0;
+
+  private:
+    bool throw_on_failure_;
 };
 
 void block_views()
 {
-    Buffer buffer(2, 5);
+    Buffer buffer;
+    checked(buffer.resize(2, 5));
     auto full = buffer.block(5);
     for (std::size_t ch = 0; ch < 2; ++ch)
     {
         std::fill_n(full.channel(ch), 5, static_cast<float>(ch + 1));
     }
     buffer.block(2).clear();
-    const Buffer &readonly = buffer;
-    const auto input = readonly.block(5);
+    const IBlock input = full;
     for (std::size_t ch = 0; ch < 2; ++ch)
     {
         near(input.channel(ch)[0], 0);
@@ -156,79 +151,31 @@ void block_views()
         near(input.channel(ch)[2], static_cast<float>(ch + 1));
         near(input.channel(ch)[4], static_cast<float>(ch + 1));
     }
-    IBlock readonly_view = full;
-    readonly_view.set_frames(2);
-    check(readonly_view.frames() == 2 && full.frames() == 5, "Copied block lengths must be independent");
-    near(readonly_view.channel(1)[1], 0);
-}
-
-void node_diagnostics()
-{
-    TestEngine engine;
-    const auto source = engine.emplace_node<Source>(2);
-    const auto gain = engine.emplace_node<Gain>(2, 1.0f);
-    const auto sink = engine.emplace_node<Sink>(2);
-    const auto mixer = engine.emplace_node<Mixer>(1);
-    const auto sine = engine.emplace_node<Sine>(2, 250, 0.25f);
-    engine.connect(engine.output(source), engine.input(gain));
-    engine.connect(engine.output(gain), engine.input(sink));
-    engine.prepare();
-    const float samples[] = {1, 10, 2, 20, 3, 30, 4, 40};
-    engine.node<Source>(source).push_interleaved(samples, 4);
-    render(engine);
-    engine.node<Source>(source).push_interleaved(samples + 4, 2);
-    engine.node<Gain>(gain).set_gain(-0.5f);
-
-    // Printing through const Node references must include subclass properties and all port specifications.
-    const TestEngine &graph = engine;
-    std::ostringstream stream;
-    stream << graph.node(source) << '\n'
-           << graph.node(gain) << '\n'
-           << graph.node(sink) << '\n'
-           << graph.node(mixer) << '\n'
-           << graph.node(sine) << '\n'
-           << TwoPortNode{};
-    const auto text = stream.str();
-    check(text.find("BufferSourceNode { capacity_frames=80, pending_frames=2 }") != std::string::npos,
-          "Source diagnostics must reflect the pending audio");
-    check(text.find("GainNode { gain=-0.5 }") != std::string::npos, "Diagnostics must reflect parameter updates");
-    check(text.find("BufferSinkNode { frame_position=0, frames=80 }") != std::string::npos,
-          "Sink diagnostics must reflect the last processed block");
-    check(text.find("MixerNode {}\n  IPort[0] channels=1 mode=Mix") != std::string::npos,
-          "Mixer diagnostics must include its input mode");
-    check(text.find("SineNode { frequency=250, amplitude=0.25 }") != std::string::npos,
-          "Generator diagnostics must include its parameters");
-    check(text.find("TwoPortNode {}\n  IPort[0] channels=1 mode=Single\n  IPort[1] channels=2 mode=Single"
-                    "\n  OPort[0] channels=2\n  OPort[1] channels=1") != std::string::npos,
-          "Diagnostics must preserve port directions, indices and channel counts");
-
-    check(engine.frame_position() == test_frames && engine.node<Source>(source).pending_frames() == 2,
-          "Diagnostics must not advance processing");
-    render(engine);
-    near(captured(engine, sink).channel(0)[0], -1.5f);
-    near(captured(engine, sink).channel(1)[1], -20.0f);
+    const IBlock short_input = buffer.block(2);
+    check(short_input.frames() == 2 && full.frames() == 5, "Block views can cover independent spans");
+    near(short_input.channel(1)[1], 0);
 }
 
 void mixing_and_fanout()
 {
     TestEngine engine;
-    const auto a = engine.emplace_node<Source>(1);
-    const auto b = engine.emplace_node<Source>(1);
-    const auto mix = engine.emplace_node<Mixer>(1);
-    const auto main = engine.emplace_node<Sink>(1);
-    const auto gain = engine.emplace_node<Gain>(1, 0.25f);
-    const auto monitor = engine.emplace_node<Sink>(1);
-    engine.connect(engine.output(a), engine.input(mix));
-    const auto connection = engine.connect(engine.output(b), engine.input(mix), {0.5f, false, {}});
-    engine.connect(engine.output(mix), engine.input(main));
-    engine.connect(engine.output(mix), engine.input(gain));
-    engine.connect(engine.output(gain), engine.input(monitor));
-    engine.prepare();
+    const auto a = checked(engine.emplace_node<Source>(1));
+    const auto b = checked(engine.emplace_node<Source>(1));
+    const auto mix = checked(engine.emplace_node<Gain>(1, 1.0f));
+    const auto main = checked(engine.emplace_node<Sink>(1));
+    const auto gain = checked(engine.emplace_node<Gain>(1, 0.25f));
+    const auto monitor = checked(engine.emplace_node<Sink>(1));
+    checked(engine.connect({a}, {mix}));
+    const auto connection = checked(engine.connect({b}, {mix}, {0.5f, false, {}}));
+    checked(engine.connect({mix}, {main}));
+    checked(engine.connect({mix}, {gain}));
+    checked(engine.connect({gain}, {monitor}));
+    checked(engine.prepare());
     const float first[] = {1, 2, 3, 4};
     const float second[] = {2, 2, 2, 2};
     auto feed = [&] {
-        engine.node<Source>(a).push_interleaved(first, 4);
-        engine.node<Source>(b).push_interleaved(second, 4);
+        checked(checked(engine.node<Source>(a))->push_interleaved(first, 4));
+        checked(checked(engine.node<Source>(b))->push_interleaved(second, 4));
     };
     feed();
     render(engine);
@@ -237,38 +184,39 @@ void mixing_and_fanout()
         near(captured(engine, main).channel(0)[i], first[i] + 1);
         near(captured(engine, monitor).channel(0)[i], (first[i] + 1) * 0.25f);
     }
-    engine.set_muted(connection, true);
+    checked(engine.set_muted(connection, true));
     feed();
     render(engine);
     near(captured(engine, main).channel(0)[0], 1);
-    engine.set_muted(connection, false);
-    engine.set_gain(connection, -1);
-    engine.node<Gain>(gain).set_gain(2);
+    checked(engine.set_muted(connection, false));
+    checked(engine.set_gain(connection, -1));
+    checked(checked(engine.node<Gain>(gain))->set_gain(2));
     feed();
     render(engine);
     near(captured(engine, main).channel(0)[0], -1);
     near(captured(engine, monitor).channel(0)[0], -2);
     check(engine.frame_position() == 3 * test_frames, "Unexpected timeline");
-    check(engine.node<Sink>(main).frame_position() == 2 * test_frames, "Sink timestamp must mark the block start");
+    check(checked(engine.node<Sink>(main))->frame_position() == 2 * test_frames, "Sink timestamp must mark the block start");
 }
 
 void multiple_ports_and_matrices()
 {
     TestEngine engine;
-    const auto mono = engine.emplace_node<Source>(1);
-    const auto stereo = engine.emplace_node<Source>(2);
-    const auto processor = engine.emplace_node<TwoPortNode>();
-    const auto stereo_sink = engine.emplace_node<Sink>(2);
-    const auto mono_sink = engine.emplace_node<Sink>(1);
-    const auto mono_connection = engine.connect(engine.output(mono), engine.input(processor, 0));
-    engine.connect(engine.output(stereo), engine.input(processor, 1), {1, false, ChMatrix(2, 2, {0, 1, 1, 0})});
-    engine.connect(engine.output(processor, 0), engine.input(stereo_sink));
-    engine.connect(engine.output(processor, 1), engine.input(mono_sink));
-    engine.prepare();
+    const auto mono = checked(engine.emplace_node<Source>(1));
+    const auto stereo = checked(engine.emplace_node<Source>(2));
+    const auto processor = checked(engine.emplace_node<TwoPortNode>());
+    const auto stereo_sink = checked(engine.emplace_node<Sink>(2));
+    const auto mono_sink = checked(engine.emplace_node<Sink>(1));
+    const auto mono_connection = checked(engine.connect({mono}, {processor, 0}));
+    auto swap_channels = checked(ChMatrix::create(2, 2, {0, 1, 1, 0}));
+    checked(engine.connect({stereo}, {processor, 1}, {1, false, std::move(swap_channels)}));
+    checked(engine.connect({processor, 0}, {stereo_sink}));
+    checked(engine.connect({processor, 1}, {mono_sink}));
+    checked(engine.prepare());
     const float a[] = {1, 2, 3, 4};
     const float b[] = {10, 20, 11, 21, 12, 22, 13, 23};
-    engine.node<Source>(mono).push({a, 1, 4, 4});
-    engine.node<Source>(stereo).push_interleaved(b, 4);
+    checked(checked(engine.node<Source>(mono))->push({a, 1, 4, 4}));
+    checked(checked(engine.node<Source>(stereo))->push_interleaved(b, 4));
     render(engine);
     near(captured(engine, stereo_sink).channel(0)[1], 23);
     near(captured(engine, stereo_sink).channel(1)[1], 11);
@@ -283,8 +231,8 @@ void multiple_ports_and_matrices()
         near(captured(engine, stereo_sink).channel(1)[i], 0);
         near(captured(engine, mono_sink).channel(0)[i], 0);
     }
-    engine.disconnect(mono_connection);
-    engine.prepare();
+    checked(engine.disconnect(mono_connection));
+    checked(engine.prepare());
     render(engine);
     near(captured(engine, mono_sink).channel(0)[0], 0);
     near(captured(engine, stereo_sink).channel(0)[0], 0);
@@ -293,36 +241,36 @@ void multiple_ports_and_matrices()
 void source_staging()
 {
     TestEngine engine;
-    const auto source = engine.emplace_node<Source>(1);
-    const auto sink = engine.emplace_node<Sink>(1);
-    engine.connect(engine.output(source), engine.input(sink));
-    auto &input = engine.node<Source>(source);
+    const auto source = checked(engine.emplace_node<Source>(1));
+    const auto sink = checked(engine.emplace_node<Sink>(1));
+    checked(engine.connect({source}, {sink}));
+    auto &input = *checked(engine.node<Source>(source));
     std::array<float, test_frames> samples;
     for (std::size_t i = 0; i < samples.size(); ++i)
     {
         samples[i] = static_cast<float>(i + 1);
     }
-    expect_error(ErrorCode::NotPrepared, [&] { input.push_interleaved(samples.data(), samples.size()); });
-    check(!engine.process(), "New graphs require preparation");
+    expect_error(ErrorCode::NotPrepared, input.push_interleaved(samples.data(), samples.size()));
+    expect_error(ErrorCode::NotPrepared, engine.process());
     check(engine.frame_position() == 0, "Rejected processing must not advance the timeline");
-    engine.prepare();
-    expect_error(ErrorCode::InvalidArgument, [&] { input.push_interleaved(samples.data(), test_frames + 1); });
-    expect_error(ErrorCode::InvalidArgument, [&] { input.push_interleaved(nullptr, 1); });
-    input.push_interleaved(samples.data(), samples.size());
-    input.push_interleaved(nullptr, 0);
-    expect_error(ErrorCode::BufferFull, [&] { input.push_interleaved(samples.data(), 1); });
-    engine.emplace_node<Mixer>(1);
-    check(!engine.process(), "Edited graphs require preparation");
+    checked(engine.prepare());
+    expect_error(ErrorCode::InvalidArg, input.push_interleaved(samples.data(), test_frames + 1));
+    expect_error(ErrorCode::InvalidArg, input.push_interleaved(nullptr, 1));
+    checked(input.push_interleaved(samples.data(), samples.size()));
+    checked(input.push_interleaved(nullptr, 0));
+    expect_error(ErrorCode::BufferFull, input.push_interleaved(samples.data(), 1));
+    checked(engine.emplace_node<Mixer>(1));
+    expect_error(ErrorCode::NotPrepared, engine.process());
     check(engine.frame_position() == 0 && input.pending_frames() == test_frames,
           "Rejected processing must not consume pending audio");
-    engine.prepare();
+    checked(engine.prepare());
     render(engine);
     near(captured(engine, sink).channel(0)[0], 1);
     near(captured(engine, sink).channel(0)[test_frames - 1], static_cast<float>(test_frames));
     check(input.pending_frames() == 0 && engine.frame_position() == test_frames,
           "Processing must consume one complete period");
 
-    input.push_interleaved(samples.data(), 2);
+    checked(input.push_interleaved(samples.data(), 2));
     render(engine);
     near(captured(engine, sink).channel(0)[0], 1);
     near(captured(engine, sink).channel(0)[1], 2);
@@ -337,7 +285,7 @@ void source_staging()
     {
         near(captured(engine, sink).channel(0)[i], 0);
     }
-    input.push_interleaved(samples.data(), samples.size());
+    checked(input.push_interleaved(samples.data(), samples.size()));
     engine.reset();
     check(input.pending_frames() == 0 && engine.frame_position() == 0, "Reset must clear staging and timeline");
     check(captured(engine, sink).frames() == 0, "Reset must release the captured view");
@@ -348,20 +296,21 @@ void source_staging()
 void channel_count_conversion()
 {
     TestEngine engine;
-    const auto source = engine.emplace_node<Source>(2);
-    const auto downmix = engine.emplace_node<Mixer>(1);
-    const auto sink = engine.emplace_node<Sink>(2);
-    const auto connection =
-        engine.connect(engine.output(source), engine.input(downmix), {2, false, ChMatrix(1, 2, {0.25f, 0.75f})});
-    engine.connect(engine.output(downmix), engine.input(sink), {1, false, ChMatrix(2, 1, {1, -1})});
-    engine.prepare();
+    const auto source = checked(engine.emplace_node<Source>(2));
+    const auto downmix = checked(engine.emplace_node<Mixer>(1));
+    const auto sink = checked(engine.emplace_node<Sink>(2));
+    auto stereo_to_mono = checked(ChMatrix::create(1, 2, {0.25f, 0.75f}));
+    auto mono_to_stereo = checked(ChMatrix::create(2, 1, {1, -1}));
+    const auto connection = checked(engine.connect({source}, {downmix}, {2, false, std::move(stereo_to_mono)}));
+    checked(engine.connect({downmix}, {sink}, {1, false, std::move(mono_to_stereo)}));
+    checked(engine.prepare());
     const float samples[] = {2, 6, 4, 8};
-    engine.node<Source>(source).push_interleaved(samples, 2);
+    checked(checked(engine.node<Source>(source))->push_interleaved(samples, 2));
     render(engine);
     near(captured(engine, sink).channel(0)[0], 10);
     near(captured(engine, sink).channel(1)[1], -14);
-    engine.set_muted(connection, true);
-    engine.node<Source>(source).push_interleaved(samples, 2);
+    checked(engine.set_muted(connection, true));
+    checked(checked(engine.node<Source>(source))->push_interleaved(samples, 2));
     render(engine);
     near(captured(engine, sink).channel(0)[0], 0);
     near(captured(engine, sink).channel(1)[1], 0);
@@ -370,29 +319,31 @@ void channel_count_conversion()
 void topology_preserves_state()
 {
     TestEngine engine;
-    const auto source = engine.emplace_node<CountingNode>();
-    const auto a = engine.emplace_node<Sink>(1);
-    engine.connect(engine.output(source), engine.input(a));
-    engine.prepare();
-    engine.prepare();
-    auto &counter = engine.node<CountingNode>(source);
+    const auto source = checked(engine.emplace_node<CountingNode>());
+    auto &counter = *checked(engine.node<CountingNode>(source));
+    checked(engine.prepare());
+    check(counter.preparations == 0, "Nodes outside the execution plan need no resources");
+    const auto a = checked(engine.emplace_node<Sink>(1));
+    const auto first_conn = checked(engine.connect({source}, {a}));
+    checked(engine.prepare());
+    checked(engine.prepare());
     check(counter.preparations == 1, "Preparation must be idempotent");
     render(engine);
-    const auto b = engine.emplace_node<Sink>(1);
-    engine.connect(engine.output(source), engine.input(b));
-    check(!engine.process(), "Topology edits must invalidate the plan");
-    engine.prepare();
+    const auto b = checked(engine.emplace_node<Sink>(1));
+    checked(engine.connect({source}, {b}));
+    expect_error(ErrorCode::NotPrepared, engine.process());
+    checked(engine.prepare());
     render(engine);
     check(counter.preparations == 1 && counter.calls == 2, "Fanout must execute the existing source once");
     near(captured(engine, a).channel(0)[0], 2);
     near(captured(engine, b).channel(0)[0], 2);
-    engine.remove_node(a);
-    engine.prepare();
+    checked(engine.remove_node(a));
+    checked(engine.prepare());
     render(engine);
     near(captured(engine, b).channel(0)[0], 3);
-    check(engine.connection_count() == 1, "Removing a node must remove incident connections");
-    engine.remove_node(b);
-    engine.prepare();
+    expect_error(ErrorCode::UnknownConn, engine.disconnect(first_conn));
+    checked(engine.remove_node(b));
+    checked(engine.prepare());
     render(engine);
     check(counter.calls == 3 && engine.frame_position() == 4 * test_frames,
           "Nodes without a downstream sink must remain idle");
@@ -401,73 +352,102 @@ void topology_preserves_state()
 void graph_validation()
 {
     TestEngine engine;
-    const auto a = engine.emplace_node<Mixer>(1);
-    const auto b = engine.emplace_node<Mixer>(1);
-    const auto sink = engine.emplace_node<Sink>(1);
-    engine.connect(engine.output(a), engine.input(b));
-    const auto connection = engine.connect(engine.output(b), engine.input(sink));
-    engine.prepare();
-    expect_error(ErrorCode::Cycle, [&] { engine.connect(engine.output(b), engine.input(a)); });
-    expect_error(ErrorCode::Cycle, [&] { engine.connect(engine.output(a), engine.input(a)); });
-    expect_error(ErrorCode::DuplicateConnection, [&] { engine.connect(engine.output(a), engine.input(b)); });
-    expect_error(ErrorCode::InputAlreadyConnected, [&] { engine.connect(engine.output(a), engine.input(sink)); });
-    expect_error(ErrorCode::InvalidPort, [&] { engine.output(sink); });
-    expect_error(ErrorCode::InvalidNodeType, [&] { engine.node<Sine>(a); });
+    const auto a = checked(engine.emplace_node<Mixer>(1));
+    const auto b = checked(engine.emplace_node<Mixer>(1));
+    const auto sink = checked(engine.emplace_node<Sink>(1));
+    checked(engine.connect({a}, {b}));
+    const auto connection = checked(engine.connect({b}, {sink}));
+    checked(engine.connect({a}, {sink}));
+    checked(engine.prepare());
+    expect_error(ErrorCode::Cycle, engine.connect({b}, {a}));
+    expect_error(ErrorCode::Cycle, engine.connect({a}, {a}));
+    expect_error(ErrorCode::DuplicateConn, engine.connect({a}, {b}));
+    expect_error(ErrorCode::InvalidPort, engine.connect({sink}, {a}));
+    expect_error(ErrorCode::InvalidPort, engine.connect({a}, {sink, 1}));
+    expect_error(ErrorCode::InvalidType, engine.node<Sine>(a));
     render(engine);
-    engine.remove_node(b);
-    expect_error(ErrorCode::UnknownNode, [&] { engine.node(b); });
-    expect_error(ErrorCode::UnknownConnection, [&] { engine.set_muted(connection, true); });
+    checked(engine.remove_node(b));
+    expect_error(ErrorCode::UnknownNode, engine.node(b));
+    expect_error(ErrorCode::UnknownNode, engine.node<Sine>(b));
+    expect_error(ErrorCode::UnknownConn, engine.set_muted(connection, true));
     TestEngine other;
-    const auto foreign = other.emplace_node<Mixer>(1);
-    expect_error(ErrorCode::UnknownNode, [&] { engine.input(foreign); });
-    const auto stereo = engine.emplace_node<Source>(2);
-    expect_error(ErrorCode::ChannelMismatch, [&] { engine.connect(engine.output(stereo), engine.input(a)); });
+    const auto foreign = checked(other.emplace_node<Mixer>(1));
+    expect_error(ErrorCode::UnknownNode, engine.connect({foreign}, {a}));
+    expect_error(ErrorCode::UnknownNode, engine.connect({a}, {foreign}));
+    const auto stereo = checked(engine.emplace_node<Source>(2));
+    expect_error(ErrorCode::ChannelMismatch, engine.connect({stereo}, {a}));
     expect_error(ErrorCode::ChannelMismatch,
-                 [&] { engine.connect(engine.output(stereo), engine.input(a), {1, false, ChMatrix::identity(2)}); });
+                 engine.connect({stereo}, {a}, {1, false, checked(ChMatrix::create(2, 2, {1, 0, 0, 1}))}));
 }
 
 void prepare_failure_and_retry()
 {
     TestEngine engine;
-    const auto source = engine.emplace_node<CountingNode>();
-    const auto sink = engine.emplace_node<RetrySink>();
-    engine.connect(engine.output(source), engine.input(sink));
-    bool failed = false;
-    try
-    {
-        engine.prepare();
-    }
-    catch (const std::runtime_error &)
-    {
-        failed = true;
-    }
-    check(failed && !engine.process(), "Failed preparation must not enable rendering");
-    check(engine.node<CountingNode>(source).calls == 0 && engine.frame_position() == 0,
+    const auto source = checked(engine.emplace_node<CountingNode>());
+    const auto sink = checked(engine.emplace_node<RetrySink>());
+    checked(engine.connect({source}, {sink}));
+    expect_error(ErrorCode::NoMemory, engine.prepare());
+    expect_error(ErrorCode::NotPrepared, engine.process());
+    check(checked(engine.node<CountingNode>(source))->calls == 0 && engine.frame_position() == 0,
           "Failed preparation must not execute nodes or advance time");
-    engine.prepare();
+    checked(engine.prepare());
     render(engine);
-    check(engine.node<RetrySink>(sink).attempts == 2, "Failed nodes must be prepared again");
-    check(engine.node<CountingNode>(source).preparations == 1, "Prepared nodes must retain their state after retry");
+    check(checked(engine.node<RetrySink>(sink))->attempts == 2, "Failed nodes must be prepared again");
+    check(checked(engine.node<CountingNode>(source))->preparations == 1, "Prepared nodes must retain their state after retry");
 
     // A failed rebuild must also leave an existing plan unusable until retry succeeds.
-    const auto added_sink = engine.emplace_node<RetrySink>();
-    engine.connect(engine.output(source), engine.input(added_sink));
-    failed = false;
-    try
-    {
-        engine.prepare();
-    }
-    catch (const std::runtime_error &)
-    {
-        failed = true;
-    }
-    check(failed && !engine.process(), "Failed rebuild must not use the old plan");
-    check(engine.node<CountingNode>(source).calls == 1 && engine.frame_position() == test_frames,
+    const auto added_sink = checked(engine.emplace_node<RetrySink>(true));
+    checked(engine.connect({source}, {added_sink}));
+    expect_error(ErrorCode::NodeFailed, engine.prepare());
+    expect_error(ErrorCode::NotPrepared, engine.process());
+    check(checked(engine.node<CountingNode>(source))->calls == 1 && engine.frame_position() == test_frames,
           "Failed rebuild must preserve the last processed state");
-    engine.prepare();
+    checked(engine.prepare());
     render(engine);
-    check(engine.node<CountingNode>(source).calls == 2, "Retry must preserve state and execute shared nodes once");
-    check(engine.node<CountingNode>(source).preparations == 1, "Rebuilding must not prepare existing nodes again");
+    check(checked(engine.node<CountingNode>(source))->calls == 2, "Retry must preserve state and execute shared nodes once");
+    check(checked(engine.node<CountingNode>(source))->preparations == 1, "Rebuilding must not prepare existing nodes again");
+}
+
+void status_and_capacity()
+{
+    const auto too_many = std::numeric_limits<std::size_t>::max();
+    const auto invalid_gain = std::numeric_limits<float>::quiet_NaN();
+    Buffer buffer;
+    checked(buffer.resize(1, 2));
+    buffer.block(2).channel(0)[0] = 1;
+    expect_error(ErrorCode::InvalidArg, buffer.resize(0, 2));
+    expect_error(ErrorCode::TooLarge, buffer.resize(too_many, 2));
+    check(buffer.block(2).channels() == 1 && buffer.capacity_frames() == 2, "Failed resize must preserve the buffer");
+    near(buffer.block(2).channel(0)[0], 1);
+    expect_error(ErrorCode::TooLarge, ChMatrix::create(too_many, too_many, {1}));
+
+    TestEngine engine;
+    expect_error(ErrorCode::InvalidArg, engine.add_node(nullptr));
+    const auto sink = checked(engine.emplace_node<Sink>(1));
+    const auto invalid_node = checked(engine.emplace_node<Gain>(1, invalid_gain));
+    checked(engine.connect({invalid_node}, {sink}));
+    expect_error(ErrorCode::InvalidArg, engine.prepare());
+    checked(engine.remove_node(invalid_node));
+    for (const auto frequency_hz : {-1.0, 8000.0})
+    {
+        const auto sine = checked(engine.emplace_node<Sine>(1, frequency_hz));
+        checked(engine.connect({sine}, {sink}));
+        expect_error(ErrorCode::InvalidArg, engine.prepare());
+        checked(engine.remove_node(sine));
+    }
+    const auto gain = checked(engine.emplace_node<Gain>(1));
+    const auto connection = checked(engine.connect({gain}, {sink}));
+    checked(engine.prepare());
+    expect_error(ErrorCode::InvalidArg, engine.set_gain(connection, invalid_gain));
+    expect_error(ErrorCode::InvalidArg, checked(engine.node<Gain>(gain))->set_gain(invalid_gain));
+    render(engine);
+
+    const auto oversized = checked(engine.emplace_node<Sink>(too_many));
+    expect_error(ErrorCode::TooLarge, engine.prepare());
+    expect_error(ErrorCode::NotPrepared, engine.process());
+    checked(engine.remove_node(oversized));
+    checked(engine.prepare());
+    render(engine);
 }
 
 void sine_and_specs()
@@ -484,17 +464,17 @@ void sine_and_specs()
         !std::is_convertible<std::unique_ptr<GainNode<>>, std::unique_ptr<Node<test_rate, test_period>>>::value,
         "Nodes with different processing specifications cannot be added");
     Engine<SampleRate::Hz48000, BlockPeriod::Ms10> empty;
-    check(!empty.process(), "Empty graphs still require preparation");
-    empty.prepare();
+    expect_error(ErrorCode::NotPrepared, empty.process());
+    checked(empty.prepare());
     check(empty.process() && empty.frame_position() == 480, "Prepared empty graphs advance a full period");
-    expect_error(ErrorCode::InvalidArgument, [] { Mixer invalid(0); });
-    expect_error(ErrorCode::InvalidArgument, [] { ChMatrix invalid(2, 1, {1}); });
-    expect_error(ErrorCode::InvalidArgument, [] { ChMatrix invalid(1, 1, {std::numeric_limits<float>::quiet_NaN()}); });
     TestEngine engine;
-    const auto source = engine.emplace_node<Sine>(2, 4000, 0.5f);
-    const auto sink = engine.emplace_node<Sink>(2);
-    engine.connect(engine.output(source), engine.input(sink));
-    engine.prepare();
+    expect_error(ErrorCode::InvalidArg, engine.emplace_node<Mixer>(0));
+    expect_error(ErrorCode::InvalidArg, ChMatrix::create(2, 1, {1}));
+    expect_error(ErrorCode::InvalidArg, ChMatrix::create(1, 1, {std::numeric_limits<float>::quiet_NaN()}));
+    const auto source = checked(engine.emplace_node<Sine>(2, 4000, 0.5f));
+    const auto sink = checked(engine.emplace_node<Sink>(2));
+    checked(engine.connect({source}, {sink}));
+    checked(engine.prepare());
     render(engine);
     const float expected[] = {0, 0.5f, 0, -0.5f};
     for (std::size_t ch = 0; ch < 2; ++ch)
@@ -518,7 +498,6 @@ int main()
         const char *name;
         void (*run)();
     } tests[] = {{"block views", block_views},
-                 {"node diagnostics", node_diagnostics},
                  {"mixing and fanout", mixing_and_fanout},
                  {"multiple ports and matrices", multiple_ports_and_matrices},
                  {"channel count conversion", channel_count_conversion},
@@ -526,6 +505,7 @@ int main()
                  {"topology preserves state", topology_preserves_state},
                  {"graph validation", graph_validation},
                  {"prepare failure and retry", prepare_failure_and_retry},
+                 {"status and capacity", status_and_capacity},
                  {"sine and specifications", sine_and_specs}};
     for (const auto &test : tests)
     {

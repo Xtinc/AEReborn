@@ -8,4 +8,8 @@ add_test(NAME aereborn_tests COMMAND aereborn_tests)
 
 add_executable(virtual_routing virtual_routing.cpp)
 target_link_libraries(virtual_routing PRIVATE aereborn::plugins)
-add_test(NAME virtual_routing_example COMMAND virtual_routing)
+add_test(NAME virtual_routing COMMAND virtual_routing)
+
+add_executable(aereborn_io_adapter_tests io_adapter_tests.cpp)
+target_link_libraries(aereborn_io_adapter_tests PRIVATE aereborn::plugins)
+add_test(NAME aereborn_io_adapter_tests COMMAND aereborn_io_adapter_tests)

@@ -1,15 +1,18 @@
 #ifndef AEREBORN_CORE_BLOCK_H
 #define AEREBORN_CORE_BLOCK_H
 
+#include "retcode.h"
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <limits>
+#include <new>
 #include <type_traits>
 #include <vector>
 
 namespace aereborn
 {
-// C++14 non-owning view. Fixed-size node arrays remain owned by their node.
+// Non-owning view. A nonempty view refers to a valid contiguous range.
 template <class T> class View
 {
   public:
@@ -51,6 +54,8 @@ template <class T> class View
     std::size_t size_;
 };
 
+static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559, "Audio samples require IEEE float32");
+
 // Non-owning planar views. frames() is the processing span, including any padded tail.
 template <class T> class Block
 {
@@ -59,20 +64,20 @@ template <class T> class Block
 
   public:
     Block() noexcept = default;
-    Block(T *data, std::size_t channels, std::size_t frames, std::size_t stride) noexcept
-        : data_(data), channels_(channels), frames_(frames), stride_(stride)
+    Block(T *data, std::size_t channels, std::size_t frames, std::size_t channel_stride) noexcept
+        : data_(data), channels_(channels), frames_(frames), channel_stride_(channel_stride)
     {
-        assert(frames <= stride);
+        assert(frames <= channel_stride);
     }
     template <class U, typename std::enable_if<std::is_convertible<U *, T *>::value, int>::type = 0>
     Block(Block<U> other) noexcept
-        : data_(other.data_), channels_(other.channels_), frames_(other.frames_), stride_(other.stride_)
+        : data_(other.data_), channels_(other.channels_), frames_(other.frames_), channel_stride_(other.channel_stride_)
     {
     }
-    T *channel(std::size_t index) const noexcept
+    T *channel(std::size_t ch) const noexcept
     {
-        assert(index < channels_);
-        return data_ + index * stride_;
+        assert(ch < channels_);
+        return data_ + ch * channel_stride_;
     }
     std::size_t channels() const noexcept
     {
@@ -82,12 +87,6 @@ template <class T> class Block
     {
         return frames_;
     }
-    void set_frames(std::size_t frames) noexcept
-    {
-        assert(frames <= stride_);
-        frames_ = frames;
-    }
-
     template <class U = T, typename std::enable_if<!std::is_const<U>::value, int>::type = 0> void clear() const noexcept
     {
         for (std::size_t ch = 0; ch < channels_; ++ch)
@@ -100,7 +99,7 @@ template <class T> class Block
     T *data_ = nullptr;
     std::size_t channels_ = 0;
     std::size_t frames_ = 0;
-    std::size_t stride_ = 0;
+    std::size_t channel_stride_ = 0;
 };
 
 using IBlock = Block<const float>;
@@ -111,12 +110,29 @@ class Buffer
 {
   public:
     Buffer() = default;
-    Buffer(std::size_t channels, std::size_t capacity_frames);
-    OBlock block(std::size_t frames) noexcept;
-    IBlock block(std::size_t frames) const noexcept;
-    std::size_t channels() const noexcept
+    RetCode resize(std::size_t channels, std::size_t capacity_frames) noexcept
+    try
     {
-        return channels_;
+        if (channels == 0 || capacity_frames == 0)
+        {
+            return ErrorCode::InvalidArg;
+        }
+        if (channels > samples_.max_size() / capacity_frames)
+        {
+            return ErrorCode::TooLarge;
+        }
+        samples_.assign(channels * capacity_frames, 0.0f);
+        channels_ = channels;
+        capacity_frames_ = capacity_frames;
+        return {};
+    }
+    catch (const std::bad_alloc &)
+    {
+        return ErrorCode::NoMemory;
+    }
+    OBlock block(std::size_t frames) noexcept
+    {
+        return {samples_.data(), channels_, frames, capacity_frames_};
     }
     std::size_t capacity_frames() const noexcept
     {

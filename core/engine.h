@@ -6,59 +6,13 @@
 #include <cmath>
 #include <map>
 #include <memory>
+#include <new>
+#include <stdexcept>
 #include <tuple>
 #include <utility>
 
 namespace aereborn
 {
-
-namespace detail
-{
-inline void validate_gain(float gain)
-{
-    if (!std::isfinite(gain))
-    {
-        throw GraphError(ErrorCode::InvalidArgument, "Connection gain must be finite");
-    }
-}
-
-template <std::size_t Frames> void mix(IBlock source, OBlock destination, const ConnOpts &options) noexcept
-{
-    if (options.muted || options.gain == 0.0f)
-    {
-        return;
-    }
-    auto add_channel = [&](std::size_t in, std::size_t out, float gain) {
-        if (gain == 0.0f)
-        {
-            return;
-        }
-        const auto *input = source.channel(in);
-        auto *output = destination.channel(out);
-        for (std::size_t frame = 0; frame < Frames; ++frame)
-        {
-            output[frame] += input[frame] * gain;
-        }
-    };
-    if (options.matrix.empty())
-    {
-        for (std::size_t ch = 0; ch < destination.channels(); ++ch)
-        {
-            add_channel(ch, ch, options.gain);
-        }
-        return;
-    }
-    const auto &coefficients = options.matrix.coefficients();
-    for (std::size_t out = 0; out < destination.channels(); ++out)
-    {
-        for (std::size_t in = 0; in < source.channels(); ++in)
-        {
-            add_channel(in, out, coefficients[out * source.channels() + in] * options.gain);
-        }
-    }
-}
-
-} // namespace detail
 
 // Phase 1: synchronous offline engine. All calls must be serialized by the caller.
 template <SampleRate Rate, BlockPeriod Period> class Engine
@@ -69,275 +23,356 @@ template <SampleRate Rate, BlockPeriod Period> class Engine
     Engine() = default;
     Engine(const Engine &) = delete;
     Engine &operator=(const Engine &) = delete;
-    NodeId add_node(std::unique_ptr<Node<Rate, Period>> node)
+    Result<NodeId> add_node(std::unique_ptr<Node<Rate, Period>> instance) noexcept
+    try
     {
         if (!instance)
         {
-            throw GraphError(ErrorCode::InvalidArgument, "Cannot add a null node");
+            return ErrorCode::InvalidArg;
         }
-        const NodeId id{get_next_identifier()};
-        nodes_.emplace(id, NodeEntry(std::move(instance)));
+        for (const auto ports : {instance->inputs(), instance->outputs()})
+        {
+            for (const auto channels : ports)
+            {
+                if (channels == 0)
+                {
+                    return ErrorCode::InvalidArg;
+                }
+            }
+        }
+        const NodeId node_id{get_next_identifier()};
+        nodes_.emplace(node_id, NodeEntry{std::move(instance)});
         ready_ = false;
-        return id;
+        return node_id;
     }
-    template <class T, class... Args> NodeId emplace_node(Args &&...args)
+    catch (const std::bad_alloc &)
+    {
+        return ErrorCode::NoMemory;
+    }
+    template <class T, class... Args> Result<NodeId> emplace_node(Args &&...args) noexcept
+    try
     {
         return add_node(std::make_unique<T>(std::forward<Args>(args)...));
     }
-    void remove_node(NodeId id)
+    catch (const std::bad_alloc &)
     {
-        const auto found = nodes_.find(id);
-        if (found == nodes_.end())
+        return ErrorCode::NoMemory;
+    }
+    catch (const std::length_error &)
+    {
+        return ErrorCode::TooLarge;
+    }
+    catch (...)
+    {
+        return ErrorCode::NodeFailed;
+    }
+    RetCode remove_node(NodeId node_id) noexcept
+    {
+        const auto node_it = nodes_.find(node_id);
+        if (node_it == nodes_.end())
         {
-            throw GraphError(ErrorCode::UnknownNode, "Node does not belong to this engine or was removed");
+            return ErrorCode::UnknownNode;
         }
         ready_ = false;
-        for (auto it = connections_.begin(); it != connections_.end();)
+        for (auto conn_it = connections_.begin(); conn_it != connections_.end();)
         {
-            if (it->second.from.node == id || it->second.to.node == id)
+            const auto &connection = conn_it->second;
+            if (connection.from.node == node_id || connection.to.node == node_id)
             {
-                it = connections_.erase(it);
+                conn_it = connections_.erase(conn_it);
             }
             else
             {
-                ++it;
+                ++conn_it;
             }
         }
-        nodes_.erase(found);
+        nodes_.erase(node_it);
+        return {};
     }
-    Node<Rate, Period> &node(NodeId id)
+    Result<Node<Rate, Period> *> node(NodeId node_id) noexcept
     {
-        return *entry(id).node;
-    }
-    const Node<Rate, Period> &node(NodeId id) const
-    {
-        return *entry(id).node;
-    }
-    template <class T> T &node(NodeId id)
-    {
-        auto *typed = dynamic_cast<T *>(&node(id));
-        if (!typed)
+        const auto node_it = nodes_.find(node_id);
+        if (node_it == nodes_.end())
         {
-            throw GraphError(ErrorCode::InvalidNodeType, "Node has a different type");
+            return ErrorCode::UnknownNode;
         }
-        return *typed;
+        return node_it->second.node.get();
     }
-    IPort input(NodeId id, std::size_t port = 0) const
+    Result<const Node<Rate, Period> *> node(NodeId node_id) const noexcept
     {
-        const IPort result{id, port};
-        input_spec(result);
-        return result;
-    }
-    OPort output(NodeId id, std::size_t port = 0) const
-    {
-        const OPort result{id, port};
-        output_spec(result);
-        return result;
-    }
-    ConnId connect(OPort from, IPort to, ConnOpts options = {})
-    {
-        const auto source_channels = output_spec(from).channels;
-        const auto &destination = input_spec(to);
-        detail::validate_gain(options.gain);
-        if (options.matrix.empty())
+        const auto node_it = nodes_.find(node_id);
+        if (node_it == nodes_.end())
         {
-            if (source_channels != destination.channels)
-            {
-                throw GraphError(ErrorCode::ChannelMismatch, "Different channel counts require an explicit matrix");
-            }
+            return ErrorCode::UnknownNode;
         }
-        else if (options.matrix.input_channels() != source_channels ||
-                 options.matrix.output_channels() != destination.channels)
+        return node_it->second.node.get();
+    }
+    template <class T> Result<T *> node(NodeId node_id) noexcept
+    {
+        const auto result = node(node_id);
+        if (!result)
         {
-            throw GraphError(ErrorCode::ChannelMismatch, "Channel matrix does not match the ports");
+            return result.ret_code();
+        }
+        auto *typed_node = dynamic_cast<T *>(result.value());
+        if (!typed_node)
+        {
+            return ErrorCode::InvalidType;
+        }
+        return typed_node;
+    }
+    Result<ConnId> connect(OPort from, IPort to, const ConnOpts &options = {}) noexcept
+    try
+    {
+        const auto src_channels = output_channels(from);
+        if (!src_channels)
+        {
+            return src_channels.ret_code();
+        }
+        const auto dst_channels = input_channels(to);
+        if (!dst_channels)
+        {
+            return dst_channels.ret_code();
+        }
+        if (!std::isfinite(options.gain))
+        {
+            return ErrorCode::InvalidArg;
+        }
+        const auto &matrix = options.matrix;
+        const bool channels_match = matrix.empty() ? src_channels.value() == dst_channels.value()
+                                                   : matrix.input_channels() == src_channels.value() &&
+                                                         matrix.output_channels() == dst_channels.value();
+        if (!channels_match)
+        {
+            return ErrorCode::ChannelMismatch;
         }
         for (const auto &item : connections_)
         {
-            const auto &existing = item.second;
-            if (existing.to.node != to.node || existing.to.index != to.index)
+            const auto &connection = item.second;
+            if (connection.to.node == to.node && connection.to.index == to.index && connection.from.node == from.node &&
+                connection.from.index == from.index)
             {
-                continue;
-            }
-            if (existing.from.node == from.node && existing.from.index == from.index)
-            {
-                throw GraphError(ErrorCode::DuplicateConnection, "These ports are already connected");
-            }
-            if (destination.mode == IMode::Single)
-            {
-                throw GraphError(ErrorCode::InputAlreadyConnected, "Input port accepts only one connection");
+                return ErrorCode::DuplicateConn;
             }
         }
         if (would_cycle(from.node, to.node))
         {
-            throw GraphError(ErrorCode::Cycle, "Connection would create a feedback cycle");
+            return ErrorCode::Cycle;
         }
-        const ConnId id{get_next_identifier()};
-        connections_.emplace(id, Connection{from, to, std::move(options)});
+        const ConnId conn_id{get_next_identifier()};
+        connections_.emplace(conn_id, Connection{from, to, options});
         ready_ = false;
-        return id;
+        return conn_id;
     }
-    void disconnect(ConnId id)
+    catch (const std::bad_alloc &)
     {
-        if (connections_.erase(id) == 0)
+        return ErrorCode::NoMemory;
+    }
+    catch (const std::length_error &)
+    {
+        return ErrorCode::TooLarge;
+    }
+    RetCode disconnect(ConnId conn_id) noexcept
+    {
+        if (connections_.erase(conn_id) == 0)
         {
-            throw GraphError(ErrorCode::UnknownConnection, "Connection does not exist");
+            return ErrorCode::UnknownConn;
         }
         ready_ = false;
+        return {};
     }
-    void set_gain(ConnId id, float linear_gain)
+    RetCode set_gain(ConnId conn_id, float linear_gain) noexcept
     {
-        detail::validate_gain(linear_gain);
-        connection(id).options.gain = linear_gain;
+        if (!std::isfinite(linear_gain))
+        {
+            return ErrorCode::InvalidArg;
+        }
+        const auto conn_it = connections_.find(conn_id);
+        if (conn_it == connections_.end())
+        {
+            return ErrorCode::UnknownConn;
+        }
+        conn_it->second.options.gain = linear_gain;
+        return {};
     }
-    void set_muted(ConnId id, bool muted)
+    RetCode set_muted(ConnId conn_id, bool muted) noexcept
     {
-        connection(id).options.muted = muted;
+        const auto conn_it = connections_.find(conn_id);
+        if (conn_it == connections_.end())
+        {
+            return ErrorCode::UnknownConn;
+        }
+        conn_it->second.options.muted = muted;
+        return {};
     }
     // Prepare after topology changes. Existing prepared nodes keep their state.
-    void prepare()
+    RetCode prepare() noexcept
+    try
     {
         if (ready_)
         {
-            return;
+            return {};
         }
         for (auto &item : nodes_)
         {
-            auto &target = item.second;
-            if (!target.prepared)
-            {
-                target.node->prepare();
-                target.prepared = true;
-            }
-            target.visited = false;
-            target.connection_count = 0;
+            item.second.visited = false;
+            item.second.conn_count = 0;
         }
 
         // Index the existing connections by destination; processing reuses this index.
-        connections_by_input_.clear();
-        connections_by_input_.reserve(connections_.size());
+        conns_by_input_.clear();
+        conns_by_input_.reserve(connections_.size());
         for (auto &item : connections_)
         {
-            connections_by_input_.push_back(&item.second);
+            conns_by_input_.push_back(&item.second);
         }
-        std::sort(connections_by_input_.begin(), connections_by_input_.end(),
-                  [](const Connection *a, const Connection *b) {
-                      return std::tie(a->to.node, a->to.index, a->from.node, a->from.index) <
-                             std::tie(b->to.node, b->to.index, b->from.node, b->from.index);
-                  });
-        // Connection endpoints are valid: connect() checks them and remove_node() erases incident edges.
-        for (std::size_t i = 0; i < connections_by_input_.size(); ++i)
+        std::sort(conns_by_input_.begin(), conns_by_input_.end(), [](const Connection *lhs, const Connection *rhs) {
+            return std::tie(lhs->to.node, lhs->to.index, lhs->from.node, lhs->from.index) <
+                   std::tie(rhs->to.node, rhs->to.index, rhs->from.node, rhs->from.index);
+        });
+        // connect() validates endpoints and remove_node() erases incident connections.
+        for (std::size_t conn_index = 0; conn_index < conns_by_input_.size(); ++conn_index)
         {
-            auto &target = nodes_.find(connections_by_input_[i]->to.node)->second;
-            if (target.connection_count == 0)
+            auto &entry = nodes_.find(conns_by_input_[conn_index]->to.node)->second;
+            if (entry.conn_count == 0)
             {
-                target.connection_begin = i;
+                entry.conn_offset = conn_index;
             }
-            ++target.connection_count;
+            ++entry.conn_count;
         }
 
         plan_.clear();
         plan_.reserve(nodes_.size());
-        std::size_t channels = 0;
-        const auto channel_limit = samples_.max_size() / block_frames();
-        auto count_channels = [&](std::size_t count) {
-            if (count > channel_limit - channels)
+        std::size_t total_channels = 0;
+        const auto max_channels = samples_.max_size() / block_frames();
+        auto visit_node = [&](auto &&self, NodeEntry &entry) -> RetCode {
+            if (entry.visited)
             {
-                throw std::length_error("Graph sample pool is too large");
+                return {};
             }
-            channels += count;
-        };
-        auto visit = [&](auto &&self, NodeEntry &target) -> void {
-            if (target.visited)
-            {
-                return;
-            }
-            target.visited = true;
+            entry.visited = true;
             // connect() already guarantees an acyclic graph.
-            for (std::size_t i = 0; i < target.connection_count; ++i)
+            for (std::size_t i = 0; i < entry.conn_count; ++i)
             {
-                const auto source = connections_by_input_[target.connection_begin + i]->from.node;
-                self(self, nodes_.find(source)->second);
+                const auto src_id = conns_by_input_[entry.conn_offset + i]->from.node;
+                const auto code = self(self, nodes_.find(src_id)->second);
+                if (!code)
+                {
+                    return code;
+                }
             }
-            for (const auto &port : target.node->inputs())
+            for (const auto ports : {entry.node->inputs(), entry.node->outputs()})
             {
-                count_channels(port.channels);
+                for (const auto channels : ports)
+                {
+                    if (channels > max_channels - total_channels)
+                    {
+                        return ErrorCode::TooLarge;
+                    }
+                    total_channels += channels;
+                }
             }
-            for (const auto &port : target.node->outputs())
+            if (!entry.prepared)
             {
-                count_channels(port.channels);
+                const auto code = entry.node->prepare();
+                if (!code)
+                {
+                    return code;
+                }
+                entry.prepared = true;
             }
-            plan_.push_back(&target);
+            plan_.push_back(&entry);
+            return {};
         };
         for (auto &item : nodes_)
         {
-            if (item.second.node->outputs().empty())
+            auto &entry = item.second;
+            if (entry.node->outputs().empty())
             {
-                visit(visit, item.second);
+                const auto code = visit_node(visit_node, entry);
+                if (!code)
+                {
+                    return code;
+                }
             }
         }
+        samples_.resize(total_channels * block_frames());
 
-        samples_.resize(channels * block_frames());
-
-        std::size_t offset = 0;
-        for (auto *target : plan_)
+        std::size_t sample_offset = 0;
+        for (auto *entry : plan_)
         {
-            auto &instance = *target->node;
-            target->inputs = instance.iblocks();
-            target->outputs = instance.oblocks();
-            const auto inputs = target->inputs;
-            const auto outputs = target->outputs;
-            const auto ispecs = instance.inputs();
-            const auto ospecs = instance.outputs();
-            const auto input_offset = offset;
-            std::size_t connection_index = 0;
-            for (std::size_t i = 0; i < inputs.size(); ++i)
+            auto &instance = *entry->node;
+            entry->inputs = instance.iblocks();
+            entry->outputs = instance.oblocks();
+            const auto input_channels = instance.inputs();
+            const auto output_channels = instance.outputs();
+            assert(entry->inputs.size() == input_channels.size() && entry->outputs.size() == output_channels.size());
+            const auto input_sample_offset = sample_offset;
+            std::size_t conn_index = 0;
+            for (std::size_t port_index = 0; port_index < entry->inputs.size(); ++port_index)
             {
-                const OBlock destination(samples_.data() + offset, ispecs[i].channels, block_frames(), block_frames());
-                inputs[i] = destination;
-                offset += ispecs[i].channels * block_frames();
+                const auto channels = input_channels[port_index];
+                const OBlock input_block(samples_.data() + sample_offset, channels, block_frames(), block_frames());
+                entry->inputs[port_index] = input_block;
+                sample_offset += channels * block_frames();
                 // Incoming edges are sorted by input port; bind each destination once.
-                while (connection_index < target->connection_count)
+                while (conn_index < entry->conn_count)
                 {
-                    auto &connection = *connections_by_input_[target->connection_begin + connection_index];
-                    if (connection.to.index != i)
+                    auto &connection = *conns_by_input_[entry->conn_offset + conn_index];
+                    if (connection.to.index != port_index)
                     {
                         break;
                     }
-                    const auto &source = nodes_.find(connection.from.node)->second;
-                    connection.source_ = &source.outputs[connection.from.index];
-                    connection.destination_ = destination;
-                    ++connection_index;
+                    const auto &src_entry = nodes_.find(connection.from.node)->second;
+                    connection.src_block = &src_entry.outputs[connection.from.index];
+                    connection.dst_block = input_block;
+                    ++conn_index;
                 }
             }
-            target->input_buffer = {samples_.data() + input_offset, offset - input_offset};
-            for (std::size_t i = 0; i < outputs.size(); ++i)
+            entry->input_samples = {samples_.empty() ? nullptr : samples_.data() + input_sample_offset,
+                                    sample_offset - input_sample_offset};
+            for (std::size_t port_index = 0; port_index < entry->outputs.size(); ++port_index)
             {
-                outputs[i] = OBlock(samples_.data() + offset, ospecs[i].channels, block_frames(), block_frames());
-                offset += ospecs[i].channels * block_frames();
+                const auto channels = output_channels[port_index];
+                entry->outputs[port_index] = {samples_.data() + sample_offset, channels, block_frames(),
+                                              block_frames()};
+                sample_offset += channels * block_frames();
             }
         }
         ready_ = true;
+        return {};
     }
-    // Processes one full period; false means prepare() is required.
-    bool process() noexcept
+    catch (const std::bad_alloc &)
+    {
+        return ErrorCode::NoMemory;
+    }
+    catch (const std::length_error &)
+    {
+        return ErrorCode::TooLarge;
+    }
+    catch (...)
+    {
+        return ErrorCode::NodeFailed;
+    }
+    // Processes one full period or reports that prepare() is required.
+    RetCode process() noexcept
     {
         if (!ready_)
         {
-            return false;
+            return ErrorCode::NotPrepared;
         }
-        for (const auto *target : plan_)
+        for (const auto *entry : plan_)
         {
-            const auto &step = *target;
-            std::fill(step.input_buffer.begin(), step.input_buffer.end(), 0.0f);
-            for (std::size_t i = 0; i < step.connection_count; ++i)
+            std::fill(entry->input_samples.begin(), entry->input_samples.end(), 0.0f);
+            for (std::size_t i = 0; i < entry->conn_count; ++i)
             {
-                const auto &connection = *connections_by_input_[step.connection_begin + i];
-                detail::mix<block_frames()>(*connection.source_, connection.destination_, connection.options);
+                const auto &connection = *conns_by_input_[entry->conn_offset + i];
+                mix(*connection.src_block, connection.dst_block, connection.options);
             }
-            step.node->process({frame_position_, step.inputs, step.outputs});
+            entry->node->process({frame_position_, entry->inputs, entry->outputs});
         }
         frame_position_ += block_frames();
-        return true;
+        return {};
     }
     void reset() noexcept
     {
@@ -355,94 +390,125 @@ template <SampleRate Rate, BlockPeriod Period> class Engine
     {
         return frame_position_;
     }
-    std::size_t node_count() const noexcept
-    {
-        return nodes_.size();
-    }
-    std::size_t connection_count() const noexcept
-    {
-        return connections_.size();
-    }
 
   private:
+    static void mix(IBlock src, OBlock dst, const ConnOpts &options) noexcept
+    {
+        if (options.muted || options.gain == 0.0f)
+        {
+            return;
+        }
+        auto add_channel = [&](std::size_t src_ch, std::size_t dst_ch, float gain) {
+            if (gain == 0.0f)
+            {
+                return;
+            }
+            const auto *src_samples = src.channel(src_ch);
+            auto *dst_samples = dst.channel(dst_ch);
+            for (std::size_t frame = 0; frame < block_frames(); ++frame)
+            {
+                dst_samples[frame] += src_samples[frame] * gain;
+            }
+        };
+        if (options.matrix.empty())
+        {
+            for (std::size_t ch = 0; ch < dst.channels(); ++ch)
+            {
+                add_channel(ch, ch, options.gain);
+            }
+            return;
+        }
+        const auto &coefficients = options.matrix.coefficients();
+        const auto src_channels = src.channels();
+        for (std::size_t dst_ch = 0; dst_ch < dst.channels(); ++dst_ch)
+        {
+            const auto row_offset = dst_ch * src_channels;
+            for (std::size_t src_ch = 0; src_ch < src_channels; ++src_ch)
+            {
+                add_channel(src_ch, dst_ch, coefficients[row_offset + src_ch] * options.gain);
+            }
+        }
+    }
+
     struct NodeEntry
     {
-        explicit NodeEntry(std::unique_ptr<Node<Rate, Period>> instance) : node(std::move(instance))
-        {
-        }
         std::unique_ptr<Node<Rate, Period>> node;
         bool prepared = false;
         bool visited = false;
-        std::size_t connection_begin = 0;
-        std::size_t connection_count = 0;
+        std::size_t conn_offset = 0;
+        std::size_t conn_count = 0;
         View<IBlock> inputs{nullptr, 0};
         View<OBlock> outputs{nullptr, 0};
-        View<float> input_buffer{nullptr, 0};
+        View<float> input_samples{nullptr, 0};
     };
 
-    const NodeEntry &entry(NodeId id) const
+    // The graph editor and processing plan share the same connection records.
+    struct Connection
     {
-        const auto found = nodes_.find(id);
-        if (found == nodes_.end())
+        OPort from;
+        IPort to;
+        ConnOpts options;
+        const OBlock *src_block = nullptr;
+        OBlock dst_block{};
+    };
+
+    Result<std::size_t> input_channels(IPort port) const noexcept
+    {
+        const auto result = node(port.node);
+        if (!result)
         {
-            throw GraphError(ErrorCode::UnknownNode, "Node does not belong to this engine or was removed");
+            return result.ret_code();
         }
-        return found->second;
-    }
-    Connection &connection(ConnId id)
-    {
-        const auto found = connections_.find(id);
-        if (found == connections_.end())
-        {
-            throw GraphError(ErrorCode::UnknownConnection, "Connection does not exist");
-        }
-        return found->second;
-    }
-    const ISpec &input_spec(IPort port) const
-    {
-        const auto &ports = node(port.node).inputs();
+        const auto ports = result.value()->inputs();
         if (port.index >= ports.size())
         {
-            throw GraphError(ErrorCode::InvalidPort, "Input port index is out of range");
+            return ErrorCode::InvalidPort;
         }
         return ports[port.index];
     }
-    const OSpec &output_spec(OPort port) const
+    Result<std::size_t> output_channels(OPort port) const noexcept
     {
-        const auto &ports = node(port.node).outputs();
+        const auto result = node(port.node);
+        if (!result)
+        {
+            return result.ret_code();
+        }
+        const auto ports = result.value()->outputs();
         if (port.index >= ports.size())
         {
-            throw GraphError(ErrorCode::InvalidPort, "Output port index is out of range");
+            return ErrorCode::InvalidPort;
         }
         return ports[port.index];
     }
     bool would_cycle(NodeId from, NodeId to)
     {
-        work_.clear();
-        work_.reserve(nodes_.size());
+        pending_node_ids_.clear();
+        pending_node_ids_.reserve(nodes_.size());
         for (auto &item : nodes_)
         {
             item.second.visited = false;
         }
         nodes_.find(to)->second.visited = true;
-        work_.push_back(to);
-        while (!work_.empty())
+        pending_node_ids_.push_back(to);
+        while (!pending_node_ids_.empty())
         {
-            const auto current = work_.back();
-            work_.pop_back();
-            if (current == from)
+            const auto node_id = pending_node_ids_.back();
+            pending_node_ids_.pop_back();
+            if (node_id == from)
             {
                 return true;
             }
             for (const auto &item : connections_)
             {
-                if (item.second.from.node == current)
+                const auto &connection = item.second;
+                if (connection.from.node == node_id)
                 {
-                    auto &target = nodes_.find(item.second.to.node)->second;
-                    if (!target.visited)
+                    const auto next_id = connection.to.node;
+                    auto &entry = nodes_.find(next_id)->second;
+                    if (!entry.visited)
                     {
-                        target.visited = true;
-                        work_.push_back(item.second.to.node);
+                        entry.visited = true;
+                        pending_node_ids_.push_back(next_id);
                     }
                 }
             }
@@ -456,9 +522,8 @@ template <SampleRate Rate, BlockPeriod Period> class Engine
     std::vector<NodeEntry *> plan_;
     std::vector<float> samples_;
     // Shared connection index for graph preparation and per-step processing.
-    std::vector<Connection *> connections_by_input_;
-    // Reused control-side scratch storage.
-    std::vector<NodeId> work_;
+    std::vector<Connection *> conns_by_input_;
+    std::vector<NodeId> pending_node_ids_;
     std::uint64_t frame_position_ = 0;
     bool ready_ = false;
 };

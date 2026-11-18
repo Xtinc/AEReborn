@@ -1,9 +1,11 @@
 #include "core/engine.h"
+#include "checked.h"
 
 #include <cmath>
 #include <iostream>
 
 using namespace aereborn;
+using aereborn::test::checked;
 
 std::array<std::uint64_t, 4> ids_from_other_translation_unit();
 
@@ -28,10 +30,6 @@ class ValueNode final : public NodeT<0, 1, test_rate, test_period>
     explicit ValueNode(float value) : NodeT({}, {{1}}), value_(value)
     {
     }
-    void attributes(std::ostream &stream) const override
-    {
-        stream << "ValueNode { value=" << value_ << ", calls=" << calls << " }";
-    }
     void process(const ProcContext &context) noexcept override
     {
         ++calls;
@@ -49,10 +47,6 @@ class CopyNode final : public NodeT<1, 1, test_rate, test_period>
     CopyNode() : NodeT({{1}}, {{1}})
     {
     }
-    void attributes(std::ostream &stream) const override
-    {
-        stream << "CopyNode { calls=" << calls << " }";
-    }
     void process(const ProcContext &context) noexcept override
     {
         ++calls;
@@ -65,12 +59,8 @@ class CopyNode final : public NodeT<1, 1, test_rate, test_period>
 class CaptureNode final : public NodeT<1, 0, test_rate, test_period>
 {
   public:
-    CaptureNode() : NodeT({{1, IMode::Mix}}, {})
+    CaptureNode() : NodeT({{1}}, {})
     {
-    }
-    void attributes(std::ostream &stream) const override
-    {
-        stream << "CaptureNode {}";
     }
     void process(const ProcContext &context) noexcept override
     {
@@ -81,7 +71,7 @@ class CaptureNode final : public NodeT<1, 0, test_rate, test_period>
 
 void expect_block(TestEngine &engine, NodeId capture, float expected)
 {
-    const auto block = engine.node<CaptureNode>(capture).block;
+    const auto block = checked(engine.node<CaptureNode>(capture))->block;
     check(block.frames() == test_frames, "Unexpected block length");
     for (std::size_t i = 0; i < test_frames; ++i)
     {
@@ -97,14 +87,14 @@ int main()
     {
         TestEngine engine;
         // Create downstream nodes first; execution order must follow dependencies, not IDs.
-        const auto unused = engine.emplace_node<CopyNode>();
-        const auto capture = engine.emplace_node<CaptureNode>();
-        const auto a = engine.emplace_node<ValueNode>(2.0f);
-        const auto b = engine.emplace_node<ValueNode>(4.0f);
+        const auto unused = checked(engine.emplace_node<CopyNode>());
+        const auto capture = checked(engine.emplace_node<CaptureNode>());
+        const auto a = checked(engine.emplace_node<ValueNode>(2.0f));
+        const auto b = checked(engine.emplace_node<ValueNode>(4.0f));
         // This inactive connection sorts before the active connections in the shared index.
-        engine.connect(engine.output(a), engine.input(unused));
-        const auto first = engine.connect(engine.output(a), engine.input(capture));
-        const auto second = engine.connect(engine.output(b), engine.input(capture), {0.5f, false, {}});
+        checked(engine.connect({a}, {unused}));
+        const auto first = checked(engine.connect({a}, {capture}));
+        const auto second = checked(engine.connect({b}, {capture}, {0.5f, false, {}}));
         const auto remote_ids = ids_from_other_translation_unit();
         for (std::size_t i = 0; i < remote_ids.size(); ++i)
         {
@@ -117,34 +107,34 @@ int main()
                 check(local_id != remote_ids[i], "IDs must be unique across translation units");
             }
         }
-        check(!engine.process() && engine.frame_position() == 0 && engine.node<ValueNode>(a).calls == 0,
+        check(!engine.process() && engine.frame_position() == 0 && checked(engine.node<ValueNode>(a))->calls == 0,
               "Unprepared processing must not execute nodes or advance time");
-        engine.prepare();
-        check(engine.process(), "Core graph failed to process");
+        checked(engine.prepare());
+        checked(engine.process());
         expect_block(engine, capture, 4);
-        check(engine.node<ValueNode>(a).calls == 1 && engine.node<CopyNode>(unused).calls == 0,
+        check(checked(engine.node<ValueNode>(a))->calls == 1 && checked(engine.node<CopyNode>(unused))->calls == 0,
               "Only nodes reaching an outputless node should execute");
 
-        engine.set_gain(second, 1);
-        engine.set_muted(first, true);
-        check(engine.process(), "Parameter changes must not require preparation");
+        checked(engine.set_gain(second, 1));
+        checked(engine.set_muted(first, true));
+        checked(engine.process());
         expect_block(engine, capture, 4);
 
-        engine.remove_node(a);
-        const auto c = engine.emplace_node<ValueNode>(10.0f);
-        const auto third = engine.connect(engine.output(c), engine.input(capture), {0.1f, false, {}});
-        const auto another_capture = engine.emplace_node<CaptureNode>();
-        engine.connect(engine.output(b), engine.input(another_capture));
+        checked(engine.remove_node(a));
+        const auto c = checked(engine.emplace_node<ValueNode>(10.0f));
+        const auto third = checked(engine.connect({c}, {capture}, {0.1f, false, {}}));
+        const auto another_capture = checked(engine.emplace_node<CaptureNode>());
+        checked(engine.connect({b}, {another_capture}));
         check(!engine.process(), "Topology edits must invalidate bindings");
-        engine.prepare();
-        check(engine.process(), "Rebound graph failed to process");
+        checked(engine.prepare());
+        checked(engine.process());
         expect_block(engine, capture, 5);
         expect_block(engine, another_capture, 4);
-        check(engine.node<ValueNode>(b).calls == 3, "Fanout must execute a custom node only once");
+        check(checked(engine.node<ValueNode>(b))->calls == 3, "Fanout must execute a custom node only once");
 
-        engine.disconnect(third);
-        engine.prepare();
-        check(engine.process(), "Disconnected graph failed to process");
+        checked(engine.disconnect(third));
+        checked(engine.prepare());
+        checked(engine.process());
         expect_block(engine, capture, 4);
         expect_block(engine, another_capture, 4);
         std::cout << "PASS: core graph without built-in plugins\n";
