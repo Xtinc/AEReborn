@@ -12,12 +12,12 @@ add_library(aereborn::core ALIAS aereborn_core)
 target_include_directories(aereborn_core
     INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}"
 )
-target_compile_features(aereborn_core INTERFACE cxx_std_14)
 
 add_library(aereborn_plugins STATIC
     plugins/adapter.cpp
     plugins/adapter.h
     plugins/virtual.h
+    plugins/virtual.cpp
 )
 add_library(aereborn::plugins ALIAS aereborn_plugins)
 target_link_libraries(aereborn_plugins PUBLIC aereborn::core)
@@ -25,4 +25,9 @@ target_link_libraries(aereborn_plugins PUBLIC aereborn::core)
 include(CTest)
 if(BUILD_TESTING)
     add_subdirectory(tests)
+endif()
+
+option(BUILD_EXAMPLES "Build AEReborn examples" ON)
+if(BUILD_EXAMPLES)
+    add_subdirectory(examples)
 endif()

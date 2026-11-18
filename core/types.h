@@ -103,7 +103,7 @@ struct PCMSpec
     SampleRate sample_rate;
     PCMFormat format;
     std::size_t channels;
-    std::size_t periods = 1; // Engine periods per device transfer.
+    std::size_t periods = 1; // Engine periods per PCM transfer, independent of the hardware period.
 };
 
 // IDs are never reused, including across Engine instances in this process.
@@ -195,6 +195,7 @@ class ChMatrix
     {
         return ErrorCode::NoMemory;
     }
+
     static Result<ChMatrix> create(std::size_t output_channels, std::size_t input_channels,
                                    std::initializer_list<float> coefficients) noexcept
     {
@@ -233,6 +234,42 @@ struct ConnOpts
     bool muted = false;
     ChMatrix matrix;
 };
+
+namespace detail
+{
+// Add into a prepared destination. Port and matrix dimensions are validated by the caller.
+inline void mix(IBlock input, OBlock output, const ChMatrix &matrix, float gain = 1.0f) noexcept
+{
+    auto add_channel = [&](std::size_t src_ch, std::size_t dst_ch, float channel_gain) {
+        if (channel_gain == 0.0f)
+        {
+            return;
+        }
+        const auto *src = input.channel(src_ch);
+        auto *dst = output.channel(dst_ch);
+        for (std::size_t frame = 0; frame < output.frames(); ++frame)
+        {
+            dst[frame] += src[frame] * channel_gain;
+        }
+    };
+    if (matrix.empty())
+    {
+        for (std::size_t ch = 0; ch < output.channels(); ++ch)
+        {
+            add_channel(ch, ch, gain);
+        }
+        return;
+    }
+    const auto &coefficients = matrix.coefficients();
+    for (std::size_t dst_ch = 0; dst_ch < output.channels(); ++dst_ch)
+    {
+        for (std::size_t src_ch = 0; src_ch < input.channels(); ++src_ch)
+        {
+            add_channel(src_ch, dst_ch, coefficients[dst_ch * input.channels() + src_ch] * gain);
+        }
+    }
+}
+} // namespace detail
 
 struct ProcContext
 {

@@ -367,7 +367,11 @@ template <SampleRate Rate, BlockPeriod Period> class Engine
             for (std::size_t i = 0; i < entry->conn_count; ++i)
             {
                 const auto &connection = *conns_by_input_[entry->conn_offset + i];
-                mix(*connection.src_block, connection.dst_block, connection.options);
+                if (!connection.options.muted)
+                {
+                    detail::mix(*connection.src_block, connection.dst_block, connection.options.matrix,
+                                connection.options.gain);
+                }
             }
             entry->node->process({frame_position_, entry->inputs, entry->outputs});
         }
@@ -392,44 +396,6 @@ template <SampleRate Rate, BlockPeriod Period> class Engine
     }
 
   private:
-    static void mix(IBlock src, OBlock dst, const ConnOpts &options) noexcept
-    {
-        if (options.muted || options.gain == 0.0f)
-        {
-            return;
-        }
-        auto add_channel = [&](std::size_t src_ch, std::size_t dst_ch, float gain) {
-            if (gain == 0.0f)
-            {
-                return;
-            }
-            const auto *src_samples = src.channel(src_ch);
-            auto *dst_samples = dst.channel(dst_ch);
-            for (std::size_t frame = 0; frame < block_frames(); ++frame)
-            {
-                dst_samples[frame] += src_samples[frame] * gain;
-            }
-        };
-        if (options.matrix.empty())
-        {
-            for (std::size_t ch = 0; ch < dst.channels(); ++ch)
-            {
-                add_channel(ch, ch, options.gain);
-            }
-            return;
-        }
-        const auto &coefficients = options.matrix.coefficients();
-        const auto src_channels = src.channels();
-        for (std::size_t dst_ch = 0; dst_ch < dst.channels(); ++dst_ch)
-        {
-            const auto row_offset = dst_ch * src_channels;
-            for (std::size_t src_ch = 0; src_ch < src_channels; ++src_ch)
-            {
-                add_channel(src_ch, dst_ch, coefficients[row_offset + src_ch] * options.gain);
-            }
-        }
-    }
-
     struct NodeEntry
     {
         std::unique_ptr<Node<Rate, Period>> node;

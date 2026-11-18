@@ -100,8 +100,8 @@ double sinc_kernel(double x, double cutoff) noexcept
         return 0.0;
     }
     const auto angle = (2.0 * pi * (x + 1.0 - order)) / (taps - 1);
-    const auto window = 0.3635819 - 0.4891775 * std::cos(angle) + 0.1365995 * std::cos(2 * angle) -
-                        0.0106411 * std::cos(3 * angle);
+    const auto window =
+        0.3635819 - 0.4891775 * std::cos(angle) + 0.1365995 * std::cos(2 * angle) - 0.0106411 * std::cos(3 * angle);
     const auto sinc_angle = pi * cutoff * x;
     const auto sinc = sinc_angle == 0 ? 1.0 : std::sin(sinc_angle) / sinc_angle;
     return sinc * window;
@@ -122,7 +122,8 @@ void calc_coffs(const float *kernel, std::uint32_t dst_fs, std::uint64_t src_pos
     }
 }
 
-float interpolate(const float *history, const float *input, std::size_t history_taps, const Coefficients &coffs) noexcept
+float interpolate(const float *history, const float *input, std::size_t history_taps,
+                  const Coefficients &coffs) noexcept
 {
     double sum = 0;
     for (std::size_t i = 0; i < history_taps; ++i)
@@ -138,22 +139,50 @@ float interpolate(const float *history, const float *input, std::size_t history_
 
 } // namespace
 
-PCMConverter::PCMConverter(PCMSpec spec, SampleRate src_fs, SampleRate dst_fs, BlockPeriod period) noexcept
-    : spec_(spec),
-      period_frames_x1000_(std::uint64_t{static_cast<std::uint32_t>(period)} *
-                           static_cast<std::uint32_t>(spec.sample_rate)),
+namespace detail
+{
+
+Result<std::unique_ptr<PCMConverter>> PCMConverter::create(PCMSpec spec, SampleRate rate, BlockPeriod period,
+                                                         std::size_t frames, std::size_t channels, bool input,
+                                                         const ChMatrix &matrix) noexcept
+try
+{
+    if (channels == 0 || spec.channels == 0)
+    {
+        return ErrorCode::InvalidArg;
+    }
+    const auto src_channels = input ? spec.channels : channels;
+    const auto dst_channels = input ? channels : spec.channels;
+    if (matrix.empty() ? src_channels != dst_channels
+                       : matrix.input_channels() != src_channels || matrix.output_channels() != dst_channels)
+    {
+        return ErrorCode::ChannelMismatch;
+    }
+    auto converter = std::unique_ptr<PCMConverter>(
+        new PCMConverter(spec, input ? spec.sample_rate : rate, input ? rate : spec.sample_rate, period, matrix));
+    const auto code = converter->prepare_pcm(frames);
+    if (!code)
+    {
+        return code;
+    }
+    return converter;
+}
+catch (const std::bad_alloc &)
+{
+    return ErrorCode::NoMemory;
+}
+
+PCMConverter::PCMConverter(PCMSpec spec, SampleRate src_fs, SampleRate dst_fs, BlockPeriod period, const ChMatrix &matrix)
+    : spec_(spec), matrix_(matrix), period_frames_x1000_(std::uint64_t{static_cast<std::uint32_t>(period)} *
+                                        static_cast<std::uint32_t>(spec.sample_rate)),
       sample_bytes_(pcm_sample_bytes(spec.format)), sample_bits_(pcm_sample_bits(spec.format)),
       src_fs_(static_cast<std::uint32_t>(src_fs)), dst_fs_(static_cast<std::uint32_t>(dst_fs))
 {
 }
 
-RetCode PCMConverter::prepare_pcm() noexcept try
+RetCode PCMConverter::prepare_pcm(std::size_t graph_frames)
 {
-    if (pcm_frames_ != 0)
-    {
-        return {};
-    }
-    if (sample_bytes_ == 0 || spec_.channels == 0 || !is_pcm_sample_rate(spec_.sample_rate) || spec_.periods == 0)
+    if (sample_bytes_ == 0 || !is_pcm_sample_rate(spec_.sample_rate) || spec_.periods == 0)
     {
         return ErrorCode::InvalidArg;
     }
@@ -170,6 +199,14 @@ RetCode PCMConverter::prepare_pcm() noexcept try
     if (spec_.channels > std::numeric_limits<std::size_t>::max() / sample_bytes_ / transfer_frames)
     {
         return ErrorCode::TooLarge;
+    }
+    if (!matrix_.empty())
+    {
+        const auto code = mapped_samples_.resize(spec_.channels, graph_frames);
+        if (!code)
+        {
+            return code;
+        }
     }
     if (src_fs_ != dst_fs_)
     {
@@ -204,23 +241,6 @@ RetCode PCMConverter::prepare_pcm() noexcept try
     pcm_frames_ = static_cast<std::size_t>(transfer_frames);
     return {};
 }
-catch (const std::bad_alloc &)
-{
-    return ErrorCode::NoMemory;
-}
-
-RetCode PCMConverter::check_pcm_buffer(std::size_t bytes, bool bound) const noexcept
-{
-    if (pcm_frames_ == 0)
-    {
-        return ErrorCode::NotPrepared;
-    }
-    if (bytes != pcm_bytes())
-    {
-        return ErrorCode::InvalidArg;
-    }
-    return bound ? ErrorCode::BufferFull : ErrorCode::Ok;
-}
 
 std::size_t PCMConverter::frame_offset(std::size_t period_index) const noexcept
 {
@@ -234,7 +254,8 @@ void PCMConverter::decode(const std::uint8_t *pcm, std::size_t period_index, OBl
     const auto first_frame = frame_offset(period_index);
     pcm += first_frame * spec_.channels * sample_bytes_;
     const bool resampling = src_fs_ != dst_fs_;
-    const auto samples = resampling ? pcm_samples_.block(frame_offset(period_index + 1) - first_frame) : output;
+    const auto mapped = matrix_.empty() ? output : mapped_samples_.block(output.frames());
+    const auto samples = resampling ? pcm_samples_.block(frame_offset(period_index + 1) - first_frame) : mapped;
     if (spec_.format == PCMFormat::F32LE)
     {
         copy_f32le(pcm, samples);
@@ -251,7 +272,12 @@ void PCMConverter::decode(const std::uint8_t *pcm, std::size_t period_index, OBl
     }
     if (resampling)
     {
-        resample(samples, output);
+        resample(samples, mapped);
+    }
+    if (!matrix_.empty())
+    {
+        output.clear();
+        mix(mapped, output, matrix_);
     }
 }
 
@@ -259,6 +285,13 @@ void PCMConverter::encode(IBlock input, std::size_t period_index, std::uint8_t *
 {
     const auto first_frame = frame_offset(period_index);
     pcm += first_frame * spec_.channels * sample_bytes_;
+    if (!matrix_.empty())
+    {
+        const auto mapped = mapped_samples_.block(input.frames());
+        mapped.clear();
+        mix(input, mapped, matrix_);
+        input = mapped;
+    }
     if (src_fs_ != dst_fs_)
     {
         const auto samples = pcm_samples_.block(frame_offset(period_index + 1) - first_frame);
@@ -298,16 +331,14 @@ void PCMConverter::resample(IBlock input, OBlock output) noexcept
         }
     }
 
-    phase_ += static_cast<std::int64_t>(output.frames()) * src_fs_ - static_cast<std::int64_t>(input.frames()) * dst_fs_;
+    phase_ +=
+        static_cast<std::int64_t>(output.frames()) * src_fs_ - static_cast<std::int64_t>(input.frames()) * dst_fs_;
     const auto copy_frames = std::min(input.frames(), taps);
     const auto keep_frames = taps - copy_frames;
     for (std::size_t ch = 0; ch < input.channels(); ++ch)
     {
         auto *history_samples = history.channel(ch);
-        if (keep_frames != 0)
-        {
-            std::memmove(history_samples, history_samples + copy_frames, keep_frames * sizeof(float));
-        }
+        std::memmove(history_samples, history_samples + copy_frames, keep_frames * sizeof(float));
         std::copy_n(input.channel(ch) + input.frames() - copy_frames, copy_frames, history_samples + keep_frames);
     }
 }
@@ -315,10 +346,8 @@ void PCMConverter::resample(IBlock input, OBlock output) noexcept
 void PCMConverter::reset_pcm() noexcept
 {
     phase_ = 0;
-    if (history_.capacity_frames() != 0)
-    {
-        history_.block(taps).clear();
-    }
+    history_.block(history_.capacity_frames()).clear();
 }
 
+} // namespace detail
 } // namespace aereborn
