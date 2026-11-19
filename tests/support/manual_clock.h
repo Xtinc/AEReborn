@@ -12,7 +12,7 @@ namespace test
 class ManualDriver final : public ClockDriver
 {
   public:
-    RetCode start(EngineSpec, Tick tick, void *context) override
+    RetCode start(BlockPeriod, Tick tick, void *context) override
     {
         tick_ = tick;
         context_ = context;

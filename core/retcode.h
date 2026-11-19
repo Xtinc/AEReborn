@@ -23,8 +23,9 @@ enum class ErrorCode
     BufferFull,
     TooLarge,
     Busy,
-    UnknownObserver,
-    Unsupported
+    Unsupported,
+    FormatMismatch,
+    InputConnected
 };
 
 class RetCode
@@ -71,8 +72,10 @@ class RetCode
             return "Requested capacity exceeds the supported size";
         case ErrorCode::Busy:
             return "The current execution context or state prevents this operation";
-        case ErrorCode::UnknownObserver:
-            return "Observer does not belong to this engine or was cancelled";
+        case ErrorCode::FormatMismatch:
+            return "Port formats do not match; connect a converter";
+        case ErrorCode::InputConnected:
+            return "Input already has a source; use a mixer for multiple sources";
         case ErrorCode::Unsupported:
             return "The platform does not support the required lock-free atomics";
         }

@@ -9,26 +9,19 @@ function(aereborn_test_group group source library)
 endfunction()
 
 aereborn_test_group(core engine_graph_tests.cpp aereborn::core
-    audio_block_layout channel_matrix_validation gain_ramp_endpoints engine_timing_validation connection_validation
-    feedback_rejection prepare_retry node_exception_propagation handle_uniqueness)
+    audio_block_layout engine_timing_validation connection_validation feedback_rejection prepare_retry
+    node_exception_propagation handle_uniqueness node_replacement)
 aereborn_test_group(runtime clocked_engine_tests.cpp aereborn::core
-    parameter_queue_and_switch plan_reclamation start_failure_rollback observer_registration_and_prepare
-    observer_timed_delivery observer_overflow_isolation observer_bounded_delivery observer_queued_task_invalidation
-    live_graph_edits pause_shared_branch stop_and_observer_removal_barriers remove_observer_during_render)
+    plan_switch plan_reclamation start_failure_rollback live_graph_edits pause_shared_branch stop_barrier)
 aereborn_test_group(routing graph_routing_tests.cpp aereborn::plugins
-    one_to_one processor_chain one_to_many many_to_one many_to_many bus_chain_and_taps
-    ports_and_matrices missing_endpoints mixed_device_cadence topology_rebuild)
-aereborn_test_group(adapter pcm_adapter_tests.cpp aereborn::plugins
-    pcm_format_conversion buffer_binding unaligned_float_pcm channel_mapping invalid_pcm_configuration
-    graph_timing_from_prepare zero_contributions integer_sample_limits)
-aereborn_test_group(resampling pcm_resampling_tests.cpp aereborn::plugins
-    rate_and_period_continuity antialias_filter)
-aereborn_test_group(device pcm_reconfiguration_tests.cpp aereborn::plugins
-    adapter_port_observation observer_pcm_batching capture_format_switch playback_format_switch)
-aereborn_test_group(virtual virtual_pcm_tests.cpp aereborn::plugins
-    source_wire_formats source_timeline sink_packet_ownership configuration_validation)
+    explicit_mix_and_fanout algorithm_chain silence_and_pruning format_validation channel_split_same_tick)
+aereborn_test_group(convert convert_tests.cpp aereborn::plugins
+    pcm_formats float_layout bit_preservation unaligned_pcm converter_validation integer_limits empty_blocks)
+aereborn_test_group(resampling pcm_resampling_tests.cpp aereborn::plugins rate_continuity antialias_filter late_join)
+aereborn_test_group(mix mix_tests.cpp aereborn::plugins matrix_mapping matrix_validation gain_ramp_and_zero mixer_mute)
+aereborn_test_group(device io_tests.cpp aereborn::plugins buffer_binding future_binding topology_format_switch)
+aereborn_test_group(tone tone_tests.cpp aereborn::plugins tone_timeline tone_validation)
 aereborn_test_group(allocation allocation_failure_tests.cpp aereborn::plugins
-    buffer_resize_rollback pcm_configuration_rollback render_uses_prepared_buffers)
-set_tests_properties(allocation.buffer_resize_rollback allocation.pcm_configuration_rollback
-    allocation.render_uses_prepared_buffers
-    PROPERTIES SKIP_RETURN_CODE 77)
+    buffer_resize_rollback conversion_rollback identity_needs_no_workspace plan_allocation_rollback render_uses_prepared_buffers)
+set_tests_properties(allocation.buffer_resize_rollback allocation.conversion_rollback allocation.identity_needs_no_workspace allocation.plan_allocation_rollback
+    allocation.render_uses_prepared_buffers PROPERTIES SKIP_RETURN_CODE 77)

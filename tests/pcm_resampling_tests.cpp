@@ -1,171 +1,105 @@
-#include "support/manual_clock.h"
-#include "support/test_harness.h"
-#include "support/pcm_reference.h"
-#include "core/engine.h"
-#include "plugins/adapter.h"
-#include "plugins/virtual.h"
-
-#include <cmath>
-#include <vector>
-
+#include "support/audio_fixture.h"
 namespace
 {
 using namespace aereborn;
 using namespace aereborn::test;
-constexpr auto rate = SampleRate::Hz48000;
-constexpr auto period = BlockPeriod::Ms05;
-constexpr double two_pi = 6.283185307179586;
-std::vector<float> input_resample(SampleRate graph_rate, BlockPeriod graph_period, SampleRate source_rate,
-                                  std::size_t pcm_frames, std::size_t periods_per_transfer)
+std::vector<float> resample(SampleRate from, SampleRate to, double frequency)
 {
-    Engine engine(graph_rate, graph_period);
+    Engine engine(period);
     ManualClock clock(engine);
-    const auto graph_frames = engine.spec().block_frames();
-    const auto source_hz = static_cast<std::uint32_t>(source_rate);
-    const PCMSpec spec{source_rate, PCMFormat::F32LE, 2, periods_per_transfer};
-    const auto input_id = checked(engine.emplace_node<IAdapter>(spec.channels, spec));
-    const auto output_id = checked(engine.emplace_node<OAdapter>(2, PCMSpec{graph_rate, PCMFormat::F32LE, 2}));
-    checked(engine.connect({input_id}, {output_id}));
+    const auto source = checked(engine.emplace_node<FloatSource>(
+        from, 2,
+        [=](std::uint64_t frame, std::size_t ch)
+        {
+            return static_cast<float>(std::sin(two_pi * frequency * frame / static_cast<std::uint32_t>(from)) *
+                                      (ch ? -0.5 : 1));
+        }));
+    const auto converter = checked(engine.emplace_node<Convert>(PortSpec(from, 2), PortSpec(to, 2)));
+    const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(to, 2)));
+    checked(engine.connect({source}, {converter}));
+    checked(engine.connect({converter}, {sink}));
     checked(engine.prepare());
-    auto *input = checked(engine.node<IAdapter>(input_id));
-    auto *output = checked(engine.node<OAdapter>(output_id));
-    check(input->pcm_frames() == pcm_frames, "Input requests a fixed integer-period transfer");
-    std::vector<std::uint8_t> pcm(pcm_frames * 8);
-    std::vector<std::uint8_t> captured(graph_frames * 8);
-    std::vector<float> converted;
-    const auto bind_output = [&] { checked(output->bind_pcm({captured.data(), captured.size()})); };
-    for (std::size_t transfer = 0; transfer < 10; ++transfer)
+    auto *out = checked(engine.node<PacketSink>(sink));
+    std::vector<float> result;
+    for (std::size_t tick = 0; tick < 40; ++tick)
     {
-        for (std::size_t i = 0; i < pcm_frames; ++i)
+        checked(clock.tick());
+        check(out->frames == PortSpec(to, 2).frames(period, tick),
+              "Fractional output sizes follow the engine timeline");
+        for (std::size_t frame = 0; frame < out->frames; ++frame)
         {
-            const auto sample = std::sin(two_pi * 1000 * (transfer * pcm_frames + i) / source_hz);
-            write_f32le(pcm.data() + 8 * i, static_cast<float>(sample));
-            write_f32le(pcm.data() + 8 * i + 4, static_cast<float>(-0.5 * sample));
-        }
-        checked(input->bind_pcm({pcm.data(), pcm.size()}));
-        for (std::size_t step = 0; step < periods_per_transfer; ++step)
-        {
-            bind_output();
-            checked(clock.tick());
-            for (std::size_t i = 0; i < graph_frames; ++i)
-            {
-                const auto left = read_f32le(captured.data() + 8 * i);
-                const auto right = read_f32le(captured.data() + 8 * i + 4);
-                check(std::abs(right + 0.5f * left) < 1e-6f, "Resampling keeps separate history for each channel");
-                converted.push_back(left);
-            }
-            if (transfer == 0 && step == 0 && periods_per_transfer > 1)
-            {
-                const auto first = captured;
-                checked(clock.reset());
-                checked(input->bind_pcm({pcm.data(), pcm.size()}));
-                bind_output();
-                checked(clock.tick());
-                check(captured == first, "Reset clears fractional phase and filter history during a device transfer");
-            }
-            if (step + 1 < periods_per_transfer)
-            {
-                check(input->bind_pcm({pcm.data(), pcm.size()}).code() == ErrorCode::BufferFull,
-                      "Input stays bound until every engine period has been consumed");
-            }
+            const auto value = out->sample(frame);
+            check(std::abs(out->sample(frame, 1) + 0.5f * value) < 1e-6,
+                  "Each channel has independent resampler history");
+            result.push_back(value);
         }
     }
-    check(engine.frame_position() == converted.size(), "Input transfers preserve the graph period");
     checked(clock.reset());
-    bind_output();
     checked(clock.tick());
-    check(std::all_of(captured.begin(), captured.end(), [](std::uint8_t byte) { return byte == 0; }),
-          "Reset discards pending input and filter history");
-    return converted;
+    for (std::size_t frame = 0; frame < out->frames; ++frame)
+        check(out->sample(frame) == result[frame], "Reset clears the filter history and restarts the shared timeline");
+    return result;
 }
-
-std::vector<float> output_resample(SampleRate graph_rate, BlockPeriod graph_period, SampleRate target_rate,
-                                   double frequency, std::size_t pcm_frames, std::size_t periods_per_transfer)
+void rate_continuity()
 {
-    const PCMSpec source_spec{graph_rate, PCMFormat::F32LE, 1};
-    VirtualSource source(source_spec, graph_period, frequency, 1.0f);
-    checked(source.prepare());
-    Engine engine(graph_rate, graph_period);
-    ManualClock clock(engine);
-    const auto input_id = checked(engine.emplace_node<IAdapter>(source_spec.channels, source_spec));
-    const auto output_id = checked(engine.emplace_node<OAdapter>(1, PCMSpec{target_rate, PCMFormat::F32LE, 1, periods_per_transfer}));
-    checked(engine.connect({input_id}, {output_id}));
-    checked(engine.prepare());
-    auto *input = checked(engine.node<IAdapter>(input_id));
-    auto *output = checked(engine.node<OAdapter>(output_id));
-    check(output->pcm_frames() == pcm_frames, "Output advertises the configured device frame count");
-    std::vector<float> converted;
-    std::vector<std::uint8_t> pcm(4 * pcm_frames);
-    for (std::size_t transfer = 0; transfer < 10; ++transfer)
+    const SampleRate pairs[][2] = {{rate, SampleRate::Hz44100},
+                                   {SampleRate::Hz44100, rate},
+                                   {rate, SampleRate::Hz11025},
+                                   {SampleRate::Hz11025, rate},
+                                   {SampleRate::Hz8000, SampleRate::Hz96000},
+                                   {SampleRate::Hz96000, SampleRate::Hz8000}};
+    for (const auto &pair : pairs)
     {
-        checked(output->bind_pcm({pcm.data(), pcm.size()}));
-        for (std::size_t step = 0; step < periods_per_transfer; ++step)
-        {
-            checked(source.generate());
-            checked(input->bind_pcm(source.pcm()));
-            checked(clock.tick());
-            if (step + 1 < periods_per_transfer)
-            {
-                check(output->bind_pcm({pcm.data(), pcm.size()}).code() == ErrorCode::BufferFull,
-                      "Output remains bound until the device period ends");
-            }
-        }
-        for (std::size_t i = 0; i < pcm_frames; ++i)
-        {
-            converted.push_back(read_f32le(pcm.data() + 4 * i));
-        }
-    }
-    return converted;
-}
-
-double rms(const std::vector<float> &samples)
-{
-    double energy = 0;
-    for (std::size_t i = 96; i < samples.size(); ++i)
-    {
-        energy += samples[i] * samples[i];
-    }
-    return std::sqrt(energy / (samples.size() - 96));
-}
-
-void check_continuity(const std::vector<float> &samples, std::uint32_t source_rate, std::uint32_t target_rate)
-{
-    const auto first = 96 * target_rate / source_rate + 1;
-    for (std::size_t i = first; i < samples.size(); ++i)
-    {
-        const auto seconds = static_cast<double>(i) / target_rate - 48.0 / source_rate;
-        const auto expected = std::sin(two_pi * 1000 * seconds);
-        check(std::abs(samples[i] - expected) < 0.01, "Resampling stays phase-continuous after the FIR delay");
+        const auto from = static_cast<std::uint32_t>(pair[0]), to = static_cast<std::uint32_t>(pair[1]);
+        const auto samples = resample(pair[0], pair[1], 1000);
+        for (std::size_t i = 96 * to / from + 1; i < samples.size(); ++i)
+            check(std::abs(samples[i] - std::sin(two_pi * 1000 * (static_cast<double>(i) / to - 48.0 / from))) < 0.01,
+                  "Resampling remains phase-continuous after the FIR delay");
     }
 }
-
-void rate_and_period_continuity()
-{
-    check_continuity(input_resample(rate, period, SampleRate::Hz44100, 441, 2), 44100, 48000);
-    check_continuity(output_resample(rate, period, SampleRate::Hz44100, 1000, 441, 2), 48000, 44100);
-
-    constexpr auto reverse_rate = SampleRate::Hz44100;
-    constexpr auto reverse_period = BlockPeriod::Ms10;
-    check_continuity(input_resample(reverse_rate, reverse_period, rate, 480, 1), 48000, 44100);
-    check_continuity(output_resample(reverse_rate, reverse_period, rate, 1000, 480, 1), 44100, 48000);
-
-    check_continuity(input_resample(rate, period, SampleRate::Hz11025, 441, 8), 11025, 48000);
-    check_continuity(input_resample(SampleRate::Hz96000, period, SampleRate::Hz8000, 40, 1), 8000, 96000);
-    check_continuity(input_resample(SampleRate::Hz8000, period, SampleRate::Hz96000, 480, 1), 96000, 8000);
-}
-
 void antialias_filter()
 {
-    const auto passband = output_resample(rate, period, SampleRate::Hz16000, 1000, 80, 1);
-    const auto stopband = output_resample(rate, period, SampleRate::Hz16000, 12000, 80, 1);
-    check(rms(passband) > 0.69 && rms(stopband) < 0.01 * rms(passband), "Downsampling must suppress aliasing");
+    const auto pass = resample(rate, SampleRate::Hz16000, 1000), stop = resample(rate, SampleRate::Hz16000, 12000);
+    const auto rms = [](const std::vector<float> &x)
+    {
+        double e = 0;
+        for (std::size_t i = 96; i < x.size(); ++i)
+            e += x[i] * x[i];
+        return std::sqrt(e / (x.size() - 96));
+    };
+    check(rms(pass) > 0.69 && rms(stop) < rms(pass) * 0.01,
+          "Downsampling suppresses frequencies above the target Nyquist limit");
 }
-
+void late_join()
+{
+    Engine engine(period);
+    ManualClock clock(engine);
+    const auto source = checked(
+        engine.emplace_node<FloatSource>(SampleRate::Hz44100, 1, [](std::uint64_t frame, std::size_t)
+                                         { return static_cast<float>(std::sin(two_pi * 997 * frame / 44100)); }));
+    const auto original = checked(engine.emplace_node<Convert>(PortSpec(SampleRate::Hz44100, 1), PortSpec(rate, 1)));
+    const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1)));
+    checked(engine.connect({source}, {original}));
+    checked(engine.connect({original}, {sink}));
+    checked(engine.prepare());
+    checked(clock.tick()); // Join on the short half of a fractional 44.1 kHz block pair.
+    const auto added = checked(engine.emplace_node<Convert>(PortSpec(SampleRate::Hz44100, 1), PortSpec(rate, 1)));
+    const auto monitor = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1)));
+    checked(engine.connect({source}, {added}));
+    checked(engine.connect({added}, {monitor}));
+    checked(engine.prepare());
+    auto *a = checked(engine.node<PacketSink>(sink));
+    auto *b = checked(engine.node<PacketSink>(monitor));
+    checked(clock.tick());
+    checked(clock.tick());
+    for (std::size_t frame = 0; frame < 240; ++frame)
+        check(a->sample(frame) == b->sample(frame),
+              "New converters align fractional phase to the existing graph timeline");
+}
 } // namespace
-
 int main(int argc, char **argv)
 {
-    return aereborn::test::run_tests(argc, argv, {
-        {"rate_and_period_continuity", rate_and_period_continuity}, {"antialias_filter", antialias_filter}
-    });
+    return run_tests(
+        argc, argv,
+        {{"rate_continuity", rate_continuity}, {"antialias_filter", antialias_filter}, {"late_join", late_join}});
 }

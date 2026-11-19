@@ -61,9 +61,9 @@ class PeriodicTask final : public RuntimeTask
 class TimerDriver final : public ClockDriver
 {
   public:
-    RetCode start(EngineSpec spec, Tick tick, void *context) override
+    RetCode start(BlockPeriod block_period, Tick tick, void *context) override
     {
-        const auto period = std::chrono::milliseconds(static_cast<std::uint32_t>(spec.block_period()));
+        const auto period = std::chrono::milliseconds(static_cast<std::uint32_t>(block_period));
         task_ = std::make_unique<PeriodicTask>(period, [tick, context] { tick(context); });
         return {};
     }

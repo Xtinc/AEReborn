@@ -14,7 +14,6 @@ find_package(Threads REQUIRED)
 
 add_library(aereborn_core STATIC
     core/engine.cpp
-    core/observer.cpp
     core/runtime.cpp
     core/types.cpp
 )
@@ -31,10 +30,11 @@ if(WIN32)
 endif()
 
 add_library(aereborn_plugins STATIC
-    plugins/adapter.cpp
-    plugins/adapter.h
-    plugins/virtual.h
-    plugins/virtual.cpp
+    plugins/convert.cpp
+    plugins/matrix.cpp
+    plugins/mixer.cpp
+    plugins/io.cpp
+    plugins/tone.cpp
 )
 add_library(aereborn::plugins ALIAS aereborn_plugins)
 target_link_libraries(aereborn_plugins PUBLIC aereborn::core)

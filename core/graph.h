@@ -17,18 +17,12 @@ class Node
     // The engine borrows these descriptors for as long as it owns the node.
     virtual View<const PortSpec> inputs() const noexcept = 0;
     virtual View<const PortSpec> outputs() const noexcept = 0;
-    // A PCM port owns or borrows its block through the end of the current tick.
-    virtual View<const std::uint8_t> pcm_block(PortDirection, std::size_t) const noexcept
-    {
-        return {nullptr, 0};
-    }
     // Validate configuration and prepare resources. The engine may retry a failed preparation.
-    virtual RetCode prepare(const EngineSpec &)
+    virtual RetCode prepare(BlockPeriod)
     {
         return {};
     }
-    // Context views are valid during this call. PCM ports have empty views at their indices.
-    // Fill every sample of each planar output and expose PCM data through pcm_block().
+    // Context views are valid during this call. Fill every sample of each output using its declared format.
     virtual void process(const ProcContext &context) noexcept = 0;
     virtual void reset() noexcept
     {

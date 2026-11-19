@@ -1,8 +1,7 @@
+#include "core/engine.h"
 #include "support/manual_clock.h"
 #include "support/test_harness.h"
 #include "support/test_node.h"
-#include "core/engine.h"
-#include "core/observer.h"
 #include <algorithm>
 #include <array>
 #include <exception>
@@ -15,12 +14,10 @@ namespace
 {
 using namespace aereborn;
 using namespace aereborn::test;
-static_assert(EngineSpec(SampleRate::Hz16000, BlockPeriod::Ms05).block_frames() == 80, "16 kHz / 5 ms");
-static_assert(EngineSpec(SampleRate::Hz44100, BlockPeriod::Ms10).block_frames() == 441, "44.1 kHz / 10 ms");
-static_assert(EngineSpec(SampleRate::Hz11025, BlockPeriod::Ms40).block_frames() == 441, "11.025 kHz / 40 ms");
-static_assert(EngineSpec(SampleRate::Hz96000, BlockPeriod::Ms40).block_frames() == 3840, "96 kHz / 40 ms");
 static_assert(std::is_convertible<OBlock, IBlock>::value, "Writable blocks become read-only views");
 static_assert(!std::is_convertible<IBlock, OBlock>::value, "Read-only blocks cannot become writable");
+static_assert(std::is_convertible<OPortBlock, IPortBlock>::value, "Port outputs become read-only inputs");
+static_assert(!std::is_convertible<IPortBlock, OPortBlock>::value, "An input cannot become a writable port output");
 
 template <class Exception, class Operation> void expect_exception(Operation operation)
 {
@@ -48,7 +45,8 @@ void audio_block_layout()
     {
         for (std::size_t frame = 0; frame < 8; ++frame)
         {
-            check(read.channel(ch)[frame] == (frame < 4 ? 0 : ch + 1), "Planar stride and processing span are independent");
+            check(read.channel(ch)[frame] == (frame < 4 ? 0 : ch + 1),
+                  "Planar stride and processing span are independent");
         }
     }
     expect_error(ErrorCode::InvalidArg, buffer.resize(0, 8));
@@ -60,75 +58,33 @@ void audio_block_layout()
     check(empty.begin() == empty.end(), "An empty view supports iteration without pointer arithmetic on null");
 }
 
-void channel_matrix_validation()
-{
-    const float coefficients[] = {1, 2, 3, 4, 5, 6};
-    const ChMatrix matrix(2, 3, View<const float>{coefficients, 6});
-    check(matrix.output_channels() == 2 && matrix.input_channels() == 3 && matrix.coefficients()[3] == 4,
-          "Matrix rows are destinations and columns are sources");
-    expect_exception<std::invalid_argument>([] { ChMatrix(0, 1, {}); });
-    expect_exception<std::invalid_argument>([] { ChMatrix(2, 1, {1}); });
-    expect_exception<std::invalid_argument>([] { ChMatrix(1, 1, {std::numeric_limits<float>::infinity()}); });
-    expect_exception<std::invalid_argument>([] { ChMatrix(1, 1, {std::numeric_limits<float>::quiet_NaN()}); });
-    expect_exception<std::length_error>([] {
-        const auto huge = std::numeric_limits<std::size_t>::max();
-        ChMatrix(huge, huge, {});
-    });
-}
-
-void gain_ramp_endpoints()
-{
-    const auto nan = std::numeric_limits<float>::quiet_NaN();
-    const auto infinity = std::numeric_limits<float>::infinity();
-    const ChMatrix identity;
-    const float crossing[] = {1, nan, 1, 1};
-    float mixed[4]{};
-    identity.mix_ramp_add({crossing, 1, 4, 4}, {mixed, 1, 4, 4}, 1.0f, -1.0f);
-    check(mixed[0] == 0.5f && mixed[1] == 0 && mixed[2] == -0.5f && mixed[3] == -1.0f,
-          "An exactly zero gain inside the ramp skips the source sample");
-
-    const float fade[] = {1, infinity};
-    float faded[] = {0, 2};
-    const ChMatrix half(1, 1, {0.5f});
-    half.mix_ramp_add({fade, 1, 2, 2}, {faded, 1, 2, 2}, 1.0f, 0.0f);
-    check(faded[0] == 0.25f && faded[1] == 2, "A silent last frame leaves the existing mix intact");
-
-    const float single = 1.0f;
-    float final = 0.0f;
-    identity.mix_ramp_add({&single, 1, 1, 1}, {&final, 1, 1, 1}, std::numeric_limits<float>::max(), 1.0f);
-    check(final == 1.0f, "A single-frame ramp uses the exact target gain");
-}
-
 void engine_timing_validation()
 {
-    const EngineSpec invalid_specs[] = {
-        {SampleRate::Hz44100, BlockPeriod::Ms05},
-        {static_cast<SampleRate>(0), BlockPeriod::Ms10},
-        {static_cast<SampleRate>(96100), BlockPeriod::Ms10},
-        {SampleRate::Hz48000, static_cast<BlockPeriod>(0)},
-        {SampleRate::Hz48000, static_cast<BlockPeriod>(15)},
-    };
-    for (const auto spec : invalid_specs)
+    for (const auto period : {static_cast<BlockPeriod>(0), static_cast<BlockPeriod>(15)})
     {
-        Engine engine(spec.sample_rate(), spec.block_period());
+        Engine engine(period);
         ManualClock clock(engine);
-        check(engine.spec().block_frames() == 0, "Invalid graph timing cannot define a block size");
-        const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>());
-        checked(engine.add_observer(std::make_unique<Observer>(OPort{source}, [](const Observation &) {})));
         expect_error(ErrorCode::InvalidArg, engine.prepare());
         expect_error(ErrorCode::NotPrepared, clock.tick());
     }
-
-    Engine custom_rate(static_cast<SampleRate>(12300), BlockPeriod::Ms10);
-    checked(custom_rate.prepare());
-    ManualClock custom_clock(custom_rate);
-    checked(custom_clock.tick());
-    check(custom_rate.frame_position() == 123, "Graph rates within the range can define integral frames");
+    const PortSpec spec(SampleRate::Hz44100, 2);
+    check(spec.max_frames(render_period) == 221, "Capacity covers the longer fractional block");
+    std::size_t total = 0;
+    for (std::uint64_t tick = 0; tick < 200; ++tick)
+    {
+        const auto frames = spec.frames(render_period, tick);
+        check(frames == (tick % 2 ? 220 : 221), "Fractional frames follow the shared tick timeline");
+        total += frames;
+        check(total == spec.frame_position(render_period, tick + 1), "No cumulative rounding drift");
+    }
+    check(total == 44100, "One second contains exactly 44100 frames");
+    const auto large = std::numeric_limits<std::uint64_t>::max() - 1;
+    check(spec.frames(render_period, large) == 221, "Per-block frame counts avoid tick multiplication overflow");
 }
 
 void connection_validation()
 {
-    Engine engine(render_rate, render_period);
+    Engine engine(render_period);
     ManualClock clock(engine);
     expect_error(ErrorCode::InvalidArg, engine.add_node(nullptr));
     expect_error(ErrorCode::InvalidArg, engine.emplace_node<VirtualNode<0, 1>>(0));
@@ -137,33 +93,30 @@ void connection_validation()
     const auto stereo = checked(engine.emplace_node<VirtualNode<1, 0>>(2));
     const auto connection = checked(engine.connect({source}, {sink}));
     expect_error(ErrorCode::DuplicateConn, engine.connect({source}, {sink}));
+    const auto second = checked(engine.emplace_node<VirtualNode<0, 1>>());
+    expect_error(ErrorCode::InputConnected, engine.connect({second}, {sink}));
     expect_error(ErrorCode::InvalidPort, engine.connect({sink}, {source}));
     expect_error(ErrorCode::InvalidPort, engine.connect({source, 1}, {sink}));
     expect_error(ErrorCode::InvalidPort, engine.connect({source}, {sink, 1}));
-    expect_error(ErrorCode::ChannelMismatch, engine.connect({source}, {stereo}));
+    expect_error(ErrorCode::FormatMismatch, engine.connect({source}, {stereo}));
     expect_error(ErrorCode::InvalidType, engine.node<VirtualNode<>>(source));
-    Engine other(render_rate, render_period);
+    Engine other(render_period);
     const auto foreign = checked(other.emplace_node<VirtualNode<>>());
     expect_error(ErrorCode::UnknownNode, engine.connect({foreign}, {sink}));
     expect_error(ErrorCode::UnknownNode, engine.connect({source}, {foreign}));
     checked(engine.prepare());
-    const auto nan = std::numeric_limits<float>::quiet_NaN();
-    expect_error(ErrorCode::InvalidArg, engine.set_gain(connection, nan));
-    expect_error(ErrorCode::InvalidArg, engine.connect({source}, {stereo}, {nan, false, {}}));
     checked(clock.tick()); // Rejected graph edits must not invalidate the prepared graph.
     checked(engine.remove_node(source));
     expect_error(ErrorCode::UnknownNode, engine.node(source));
     const auto &read_only = engine;
     expect_error(ErrorCode::UnknownNode, read_only.node(source));
     expect_error(ErrorCode::UnknownConn, engine.disconnect(connection));
-    expect_error(ErrorCode::UnknownConn, engine.set_muted(connection, true));
-    expect_error(ErrorCode::UnknownConn, engine.set_gain(connection, 1));
     expect_error(ErrorCode::UnknownNode, engine.remove_node(source));
 }
 
 void feedback_rejection()
 {
-    Engine engine(render_rate, render_period);
+    Engine engine(render_period);
     ManualClock clock(engine);
     const auto a = checked(engine.emplace_node<VirtualNode<2, 2>>());
     const auto b = checked(engine.emplace_node<VirtualNode<>>());
@@ -176,7 +129,8 @@ void feedback_rejection()
     expect_error(ErrorCode::Cycle, engine.connect({c}, {a, 1}));
     expect_error(ErrorCode::Cycle, engine.connect({a, 1}, {a, 1}));
     checked(clock.tick());
-    check(checked(engine.node<VirtualNode<2, 2>>(a))->calls == 1, "Rejected feedback leaves the valid graph executable");
+    check(checked(engine.node<VirtualNode<2, 2>>(a))->calls == 1,
+          "Rejected feedback leaves the valid graph executable");
     const auto x = checked(engine.emplace_node<VirtualNode<>>());
     const auto y = checked(engine.emplace_node<VirtualNode<>>());
     checked(engine.connect({x}, {y}));
@@ -185,12 +139,12 @@ void feedback_rejection()
 
 void prepare_retry()
 {
-    Engine engine(render_rate, render_period);
+    Engine engine(render_period);
     ManualClock clock(engine);
     expect_error(ErrorCode::NotPrepared, clock.tick());
     checked(engine.prepare());
     checked(clock.tick());
-    check(engine.frame_position() == render_frames, "An empty prepared graph advances one period");
+    check(engine.tick_position() == 1, "An empty prepared graph advances one period");
     const auto processor = checked(engine.emplace_node<VirtualNode<>>());
     const auto sink = checked(engine.emplace_node<VirtualNode<1, 0>>());
     checked(engine.connect({processor}, {sink}));
@@ -198,8 +152,7 @@ void prepare_retry()
     node->preparation = ErrorCode::InvalidArg;
     expect_error(ErrorCode::InvalidArg, engine.prepare());
     checked(clock.tick());
-    check(engine.frame_position() == 2 * render_frames && node->calls == 0,
-          "Preparation failure leaves the old plan running");
+    check(engine.tick_position() == 2 && node->calls == 0, "Preparation failure leaves the old plan running");
     node->preparation = {};
     checked(engine.prepare());
     checked(engine.prepare());
@@ -213,7 +166,7 @@ void prepare_retry()
     checked(clock.tick());
     check(node->prepares == 2 && node->calls == 3, "Capacity failure preserves previously prepared DSP state");
     checked(clock.reset());
-    check(engine.frame_position() == 0 && node->resets == 1, "Reset reaches nodes and restarts the graph clock");
+    check(engine.tick_position() == 0 && node->resets == 1, "Reset reaches nodes and restarts the graph clock");
 }
 
 class ThrowingNode : public VirtualNode<>
@@ -226,7 +179,7 @@ class ThrowingNode : public VirtualNode<>
             std::rethrow_exception(construction_error);
         }
     }
-    RetCode prepare(const EngineSpec &spec) override
+    RetCode prepare(BlockPeriod spec) override
     {
         if (fail_preparation)
         {
@@ -240,18 +193,15 @@ class ThrowingNode : public VirtualNode<>
 
 void node_exception_propagation()
 {
-    Engine engine(render_rate, render_period);
+    Engine engine(render_period);
     ManualClock clock(engine);
     checked(engine.prepare());
-    expect_exception<std::bad_alloc>([&] {
-        engine.emplace_node<ThrowingNode>(std::make_exception_ptr(std::bad_alloc()));
-    });
-    expect_exception<std::length_error>([&] {
-        engine.emplace_node<ThrowingNode>(std::make_exception_ptr(std::length_error("test capacity")));
-    });
-    expect_exception<std::runtime_error>([&] {
-        engine.emplace_node<ThrowingNode>(std::make_exception_ptr(std::runtime_error("test construction")));
-    });
+    expect_exception<std::bad_alloc>([&]
+                                     { engine.emplace_node<ThrowingNode>(std::make_exception_ptr(std::bad_alloc())); });
+    expect_exception<std::length_error>(
+        [&] { engine.emplace_node<ThrowingNode>(std::make_exception_ptr(std::length_error("test capacity"))); });
+    expect_exception<std::runtime_error>(
+        [&] { engine.emplace_node<ThrowingNode>(std::make_exception_ptr(std::runtime_error("test construction"))); });
     checked(clock.tick());
 
     const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>());
@@ -261,7 +211,7 @@ void node_exception_propagation()
     checked(engine.connect({processor}, {sink}));
     expect_exception<std::runtime_error>([&] { engine.prepare(); });
     checked(clock.tick());
-    check(engine.frame_position() == 2 * render_frames, "The previous plan runs after a preparation exception");
+    check(engine.tick_position() == 2, "The previous plan runs after a preparation exception");
     auto *node = checked(engine.node<ThrowingNode>(processor));
     node->fail_preparation = false;
     checked(engine.prepare());
@@ -270,14 +220,55 @@ void node_exception_propagation()
           "Retry after an exception preserves prepared dependencies");
 }
 
+void node_replacement()
+{
+    Engine engine(render_period);
+    ManualClock clock(engine);
+    const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>());
+    const auto sink = checked(engine.emplace_node<VirtualNode<1, 0>>());
+    checked(engine.connect({source}, {sink}));
+    checked(engine.prepare());
+    checked(clock.tick());
+    auto *original = checked(engine.node<VirtualNode<0, 1>>(source));
+
+    expect_error(ErrorCode::InvalidArg, engine.replace_node(source, nullptr));
+    expect_error(ErrorCode::UnknownNode, engine.replace_node({}, std::make_unique<VirtualNode<0, 1>>()));
+    expect_error(ErrorCode::FormatMismatch, engine.replace_node(source, std::make_unique<VirtualNode<0, 1>>(0)));
+    expect_error(ErrorCode::FormatMismatch, engine.replace_node(source, std::make_unique<VirtualNode<0, 1>>(2)));
+    expect_error(ErrorCode::FormatMismatch, engine.replace_node(source, std::make_unique<VirtualNode<1, 1>>()));
+    expect_error(ErrorCode::FormatMismatch, engine.replace_node(source, std::make_unique<VirtualNode<0, 2>>()));
+    checked(clock.tick());
+    check(checked(engine.node(source)) == original && original->calls == 2,
+          "Rejected replacements preserve the running node and its connections");
+
+    checked(engine.replace_node(source, std::make_unique<VirtualNode<0, 1>>()));
+    auto *replacement = checked(engine.node<VirtualNode<0, 1>>(source));
+    const auto revision = checked(engine.prepare());
+    checked(clock.tick());
+    check(engine.applied_revision() == revision && replacement->prepares == 1 && replacement->calls == 1 &&
+              checked(engine.node<VirtualNode<1, 0>>(sink))->calls == 3,
+          "A compatible replacement takes over existing connections at the next block boundary");
+
+    checked(clock.stop());
+    auto *old_sink = checked(engine.node<VirtualNode<1, 0>>(sink));
+    checked(engine.replace_node(source, std::make_unique<VirtualNode<0, 1>>()));
+    auto *draft = checked(engine.node<VirtualNode<0, 1>>(source));
+    const auto orphan = checked(engine.emplace_node<VirtualNode<0, 1>>());
+    checked(engine.remove_node(sink));
+    checked(engine.reset());
+    check(replacement->resets == 1 && old_sink->resets == 1 && draft->resets == 1 &&
+              checked(engine.node<VirtualNode<0, 1>>(orphan))->resets == 1,
+          "Reset reaches retained and draft node instances exactly once, including removed sinks and orphan sources");
+}
+
 void handle_uniqueness()
 {
-    Engine engine(render_rate, render_period);
+    Engine engine(render_period);
     const auto a = checked(engine.emplace_node<VirtualNode<>>());
     const auto b = checked(engine.emplace_node<VirtualNode<>>());
     const auto connection = checked(engine.connect({a}, {b}));
 
-    Engine other(SampleRate::Hz16000, BlockPeriod::Ms10);
+    Engine other(BlockPeriod::Ms10);
     const auto x = checked(other.emplace_node<VirtualNode<>>());
     const auto y = checked(other.emplace_node<VirtualNode<>>());
     const auto other_connection = checked(other.connect({x}, {y}));
@@ -296,10 +287,13 @@ void handle_uniqueness()
 
 int main(int argc, char **argv)
 {
-    return aereborn::test::run_tests(argc, argv, {
-        {"audio_block_layout", audio_block_layout}, {"channel_matrix_validation", channel_matrix_validation}, {"engine_timing_validation", engine_timing_validation},
-        {"gain_ramp_endpoints", gain_ramp_endpoints},
-        {"connection_validation", connection_validation}, {"feedback_rejection", feedback_rejection},
-        {"prepare_retry", prepare_retry}, {"node_exception_propagation", node_exception_propagation}, {"handle_uniqueness", handle_uniqueness}
-    });
+    return aereborn::test::run_tests(argc, argv,
+                                     {{"audio_block_layout", audio_block_layout},
+                                      {"engine_timing_validation", engine_timing_validation},
+                                      {"connection_validation", connection_validation},
+                                      {"feedback_rejection", feedback_rejection},
+                                      {"prepare_retry", prepare_retry},
+                                      {"node_exception_propagation", node_exception_propagation},
+                                      {"handle_uniqueness", handle_uniqueness},
+                                      {"node_replacement", node_replacement}});
 }

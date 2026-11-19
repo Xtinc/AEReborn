@@ -21,7 +21,7 @@ class VirtualNode : public NodeT<I, O>
         : NodeT<I, O>(ports<I>(channels), ports<O>(channels)), gain_(gain)
     {
     }
-    RetCode prepare(const EngineSpec &) override
+    RetCode prepare(BlockPeriod) override
     {
         ++prepares;
         return preparation;
@@ -29,11 +29,13 @@ class VirtualNode : public NodeT<I, O>
     void process(const ProcContext &context) noexcept override
     {
         ++calls;
-        for (const auto output : context.outputs)
+        for (const auto block : context.outputs)
         {
+            const auto output = block.audio();
             output.clear();
-            for (const auto input : context.inputs)
+            for (const auto source : context.inputs)
             {
+                const auto input = source.audio();
                 for (std::size_t ch = 0; ch < output.channels(); ++ch)
                 {
                     for (std::size_t frame = 0; frame < output.frames(); ++frame)
@@ -58,7 +60,7 @@ class VirtualNode : public NodeT<I, O>
     template <std::size_t N> static std::array<PortSpec, N> ports(std::size_t channels)
     {
         std::array<PortSpec, N> result{};
-        result.fill(channels);
+        result.fill(PortSpec(render_rate, channels));
         return result;
     }
     const float gain_;

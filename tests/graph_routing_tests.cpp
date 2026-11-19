@@ -1,317 +1,201 @@
-#include "support/routing_fixture.h"
-
+#include "plugins/matrix.h"
+#include "plugins/mixer.h"
+#include "plugins/tone.h"
+#include "support/audio_fixture.h"
+#include <array>
 namespace
 {
 using namespace aereborn;
 using namespace aereborn::test;
-
-void one_to_one()
+void explicit_mix_and_fanout()
 {
-    Engine engine(render_rate, render_period);
+    Engine engine(period);
     ManualClock clock(engine);
-    Playback output(engine, 2);
-    Capture input(engine, 2, 997, 0.25f);
-    checked(engine.connect({input.id}, {output.id}));
+    const auto a = checked(engine.emplace_node<Tone>(rate, 2, 997, 0.25f));
+    const auto b = checked(engine.emplace_node<Tone>(rate, 2, 431, 0.125f));
+    const auto mix = checked(engine.emplace_node<Mixer>(rate, 2, 2));
+    const auto matrix =
+        checked(engine.emplace_node<Matrix>(rate, 2, 2, std::initializer_list<float>{0, 1, 1, 0}, 0.5f));
+    const auto first = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 2)));
+    const auto second = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 2)));
+    checked(engine.connect({a}, {mix, 0}));
+    checked(engine.connect({b}, {mix, 1}));
+    checked(engine.connect({mix}, {matrix}));
+    checked(engine.connect({matrix}, {first}));
+    checked(engine.connect({matrix}, {second}));
     checked(engine.prepare());
-    for (std::size_t tick = 0; tick < 4; ++tick)
+    auto *one = checked(engine.node<PacketSink>(first));
+    auto *two = checked(engine.node<PacketSink>(second));
+    for (std::size_t tick = 0; tick < 5; ++tick)
     {
-        render_route(clock, {&input}, {&output});
-        check(output.device.matches(input.device.pcm()), "Direct virtual-device route preserves F32 PCM");
-        output.expect([&](std::size_t frame, std::size_t) { return tone(997, 0.25, tick * render_frames + frame); });
+        checked(clock.tick());
+        check(one->address == two->address, "Fan-out shares one immutable upstream buffer");
+        for (std::size_t frame = 0; frame < 240; ++frame)
+        {
+            const auto t = static_cast<double>(tick * 240 + frame) / 48000;
+            const auto expected = 0.5 * (0.25 * std::sin(two_pi * 997 * t) + 0.125 * std::sin(two_pi * 431 * t));
+            check(std::abs(one->sample(frame) - expected) < 1e-6 && one->sample(frame) == two->sample(frame),
+                  "Explicit mixer matches an independent sum");
+        }
     }
 }
-
-void processor_chain()
+class Algorithm final : public NodeT<1, 1>
 {
-    Engine engine(render_rate, render_period);
-    ManualClock clock(engine);
-    Playback output(engine, 1);
-    // Reverse creation order must not determine the execution order.
-    const auto second = checked(engine.emplace_node<VirtualNode<>>(1, -2.0f));
-    const auto first = checked(engine.emplace_node<VirtualNode<>>(1, 0.5f));
-    Capture input(engine, 1, 733, 0.25f);
-    checked(engine.connect({second}, {output.id}));
-    checked(engine.connect({first}, {second}));
-    checked(engine.connect({input.id}, {first}));
-    checked(engine.prepare());
-    render_route(clock, {&input}, {&output});
-    output.expect([](std::size_t frame, std::size_t) { return -tone(733, 0.25, frame); });
-    check(checked(engine.node<VirtualNode<>>(first))->calls == 1 &&
-              checked(engine.node<VirtualNode<>>(second))->calls == 1, "Each processor executes once");
-}
-
-void one_to_many()
-{
-    Engine engine(render_rate, render_period);
-    ManualClock clock(engine);
-    Playback main(engine, 1);
-    Playback monitor(engine, 1);
-    Capture input(engine, 1, 997, 0.25f);
-    const auto bus = checked(engine.emplace_node<VirtualNode<>>(1, 0.5f));
-    checked(engine.connect({input.id}, {bus}));
-    checked(engine.connect({bus}, {main.id}));
-    checked(engine.connect({bus}, {monitor.id}, {-0.5f, false, {}}));
-    checked(engine.prepare());
-    for (std::size_t tick = 0; tick < 4; ++tick)
+  public:
+    Algorithm()
+        : NodeT({{PortSpec(SampleRate::Hz16000, 1, Format::S16LE)}},
+                {{PortSpec(SampleRate::Hz16000, 1, Format::S16LE)}})
     {
-        render_route(clock, {&input}, {&main, &monitor});
-        main.expect([&](std::size_t frame, std::size_t) { return tone(997, 0.125, tick * render_frames + frame); });
-        monitor.expect([&](std::size_t frame, std::size_t) { return -tone(997, 0.0625, tick * render_frames + frame); });
-        check(checked(engine.node<VirtualNode<>>(bus))->calls == tick + 1,
-              "A shared bus executes once regardless of the number of destinations");
     }
-}
-
-void many_to_one()
-{
-    Engine engine(render_rate, render_period);
-    ManualClock clock(engine);
-    Playback output(engine, 1);
-    Capture voice(engine, 1, 997, 0.25f);
-    Capture music(engine, 1, 431, 0.125f);
-    const auto bus = checked(engine.emplace_node<VirtualNode<>>());
-    const auto idle = checked(engine.emplace_node<VirtualNode<>>());
-    checked(engine.connect({voice.id}, {bus}));
-    checked(engine.connect({music.id}, {bus}, {0.5f, false, {}}));
-    checked(engine.connect({bus}, {output.id}));
-    checked(engine.prepare());
-    render_route(clock, {&voice, &music}, {&output});
-    output.expect([](std::size_t frame, std::size_t) { return tone(997, 0.25, frame) + tone(431, 0.0625, frame); });
-    check(checked(engine.node<VirtualNode<>>(idle))->calls == 0 &&
-              checked(engine.node<VirtualNode<>>(idle))->prepares == 0,
-          "A node with no path to a sink is not prepared or processed");
-}
-
-void many_to_many()
-{
-    Engine engine(render_rate, render_period);
-    ManualClock clock(engine);
-    Playback main(engine, 1);
-    Playback monitor(engine, 1);
-    Capture a(engine, 1, 997, 0.25f);
-    Capture b(engine, 1, 431, 0.125f);
-    const auto a_main = checked(engine.connect({a.id}, {main.id}));
-    checked(engine.connect({b.id}, {main.id}, {0.5f, false, {}}));
-    checked(engine.connect({a.id}, {monitor.id}, {-0.5f, false, {}}));
-    checked(engine.connect({b.id}, {monitor.id}));
-    checked(engine.prepare());
-    for (std::size_t tick = 0; tick < 3; ++tick)
+    void process(const ProcContext &context) noexcept override
     {
-        if (tick == 1)
+        const auto input = context.inputs[0].bytes();
+        const auto output = context.outputs[0].bytes();
+        for (std::size_t i = 0; i < input.size(); i += 2)
         {
-            checked(engine.set_muted(a_main, true));
+            const auto word = static_cast<unsigned int>(input[i]) | (static_cast<unsigned int>(input[i + 1]) << 8);
+            const auto sample = (word >= 32768 ? static_cast<int>(word) - 65536 : static_cast<int>(word)) / 2;
+            const auto encoded = static_cast<unsigned int>(sample);
+            output[i] = static_cast<std::uint8_t>(encoded);
+            output[i + 1] = static_cast<std::uint8_t>(encoded >> 8);
         }
-        if (tick == 2)
-        {
-            checked(engine.set_muted(a_main, false));
-            checked(engine.set_gain(a_main, -1));
-        }
-        render_route(clock, {&a, &b}, {&main, &monitor});
-        main.expect([&](std::size_t frame, std::size_t) {
-            const auto index = tick * render_frames + frame;
-            const auto ramp = static_cast<double>(frame + 1) / render_frames;
-            const auto gain = tick == 0 ? 1.0 : tick == 1 ? 1.0 - ramp : -ramp;
-            return gain * tone(997, 0.25, index) + tone(431, 0.0625, index);
-        });
-        monitor.expect([&](std::size_t frame, std::size_t) {
-            const auto index = tick * render_frames + frame;
-            return -tone(997, 0.125, index) + tone(431, 0.125, index);
-        });
+        frames = context.inputs[0].frames();
+        ++calls;
     }
-    check(engine.frame_position() == 3 * render_frames, "Connection parameters apply without rebuilding the graph");
-}
-
-void bus_chain_and_taps()
+    std::size_t frames = 0, calls = 0;
+};
+void algorithm_chain()
 {
-    Engine engine(render_rate, render_period);
+    Engine engine(period);
     ManualClock clock(engine);
-    Playback pre_effects(engine, 1);
-    Playback post_effects(engine, 1);
-    Capture a(engine, 1, 997, 0.25f);
-    Capture b(engine, 1, 431, 0.125f);
-    const auto bus = checked(engine.emplace_node<VirtualNode<>>());
-    const auto effect = checked(engine.emplace_node<VirtualNode<>>(1, 0.5f));
-    const auto master = checked(engine.emplace_node<VirtualNode<>>());
-    checked(engine.connect({a.id}, {bus}));
-    checked(engine.connect({b.id}, {bus}, {0.25f, false, {}}));
-    checked(engine.connect({bus}, {pre_effects.id}));
-    checked(engine.connect({bus}, {effect}));
-    checked(engine.connect({effect}, {master}));
-    checked(engine.connect({b.id}, {master}, {0.5f, false, {}}));
-    checked(engine.connect({master}, {post_effects.id}));
+    const PortSpec bus(rate, 1), pcm(SampleRate::Hz16000, 1, Format::S16LE);
+    const auto tone = checked(engine.emplace_node<Tone>(rate, 1, 1000, 0.25f));
+    const auto mix = checked(engine.emplace_node<Mixer>(rate, 1, 1));
+    const auto down = checked(engine.emplace_node<Convert>(bus, pcm));
+    const auto algorithm = checked(engine.emplace_node<Algorithm>());
+    const auto up = checked(engine.emplace_node<Convert>(pcm, bus));
+    const auto sink = checked(engine.emplace_node<PacketSink>(bus));
+    expect_error(ErrorCode::FormatMismatch, engine.connect({mix}, {algorithm}));
+    checked(engine.connect({tone}, {mix}));
+    checked(engine.connect({mix}, {down}));
+    checked(engine.connect({down}, {algorithm}));
+    checked(engine.connect({algorithm}, {up}));
+    checked(engine.connect({up}, {sink}));
     checked(engine.prepare());
-    render_route(clock, {&a, &b}, {&pre_effects, &post_effects});
-    pre_effects.expect([](std::size_t frame, std::size_t) { return tone(997, 0.25, frame) + tone(431, 0.03125, frame); });
-    post_effects.expect([](std::size_t frame, std::size_t) { return tone(997, 0.125, frame) + tone(431, 0.078125, frame); });
-    check(checked(engine.node<VirtualNode<>>(bus))->calls == 1 &&
-              checked(engine.node<VirtualNode<>>(effect))->calls == 1 &&
-              checked(engine.node<VirtualNode<>>(master))->calls == 1,
-          "Bus taps reuse existing outputs without additional execution loops");
-}
-
-void ports_and_matrices()
-{
-    Engine engine(render_rate, render_period);
-    ManualClock clock(engine);
-    Playback stereo(engine, 2);
-    Playback mono(engine, 1);
-    Capture a(engine, 1, 997, 0.25f);
-    Capture b(engine, 1, 431, 0.125f);
-    const auto router = checked(engine.emplace_node<VirtualNode<2, 2>>(2));
-    checked(engine.connect({b.id}, {router, 1}, {1, false, {2, 1, {0.5f, 2}}}));
-    checked(engine.connect({a.id}, {router, 0}, {1, false, {2, 1, {1, -1}}}));
-    checked(engine.connect({router, 1}, {mono.id}, {1, false, {1, 2, {0.25f, 0.75f}}}));
-    checked(engine.connect({router, 0}, {stereo.id}));
-    checked(engine.prepare());
-    render_route(clock, {&a, &b}, {&stereo, &mono});
-    stereo.expect([](std::size_t frame, std::size_t ch) {
-        return (ch == 0 ? 1 : -1) * tone(997, 0.25, frame) + (ch == 0 ? 0.5 : 2) * tone(431, 0.125, frame);
-    });
-    mono.expect([](std::size_t frame, std::size_t) { return -tone(997, 0.125, frame) + tone(431, 0.203125, frame); });
-    check(checked(engine.node<VirtualNode<2, 2>>(router))->calls == 1, "All ports share one node execution");
-}
-
-void missing_endpoints()
-{
-    Engine engine(render_rate, render_period);
-    ManualClock clock(engine);
-    Capture a(engine, 1, 997, 0.25f);
-    Capture b(engine, 1, 431, 0.125f);
-    Playback main(engine, 1);
-    Playback monitor(engine, 1);
-    const auto bus = checked(engine.emplace_node<VirtualNode<>>());
-    checked(engine.connect({a.id}, {bus}));
-    checked(engine.connect({b.id}, {bus}));
-    checked(engine.connect({bus}, {main.id}));
-    checked(engine.connect({bus}, {monitor.id}));
-    checked(engine.prepare());
-    render_route(clock, {&a}, {&main});
-    main.expect([](std::size_t frame, std::size_t) { return tone(997, 0.25, frame); });
-    for (std::size_t tick = 0; tick < 2; ++tick)
+    auto *output = checked(engine.node<PacketSink>(sink));
+    auto *algo = checked(engine.node<Algorithm>(algorithm));
+    for (std::size_t tick = 0; tick < 20; ++tick)
     {
-        render_route(clock, {&b}, {&monitor});
-        monitor.expect([&](std::size_t frame, std::size_t) { return tone(431, 0.125, tick * render_frames + frame); });
-    }
-    // Both sources are absent, so this period overwrites both outputs with silence.
-    render_route(clock, {}, {&main, &monitor});
-    main.expect([](std::size_t, std::size_t) { return 0; });
-    monitor.expect([](std::size_t, std::size_t) { return 0; });
-}
-
-void mixed_device_cadence()
-{
-    Engine engine(render_rate, render_period);
-    ManualClock clock(engine);
-    const PCMSpec capture_spec{SampleRate::Hz44100, PCMFormat::F32LE, 1, 2};
-    const PCMSpec playback_spec{render_rate, PCMFormat::F32LE, 1, 3};
-    VirtualSource capture(capture_spec, render_period, 997, 0.25f);
-    VirtualSink playback(playback_spec, render_period);
-    checked(capture.prepare());
-    checked(playback.prepare());
-    const auto input_id = checked(engine.emplace_node<IAdapter>(1, capture_spec));
-    const auto output_id = checked(engine.emplace_node<OAdapter>(1, playback_spec));
-    auto *input = checked(engine.node<IAdapter>(input_id));
-    auto *output = checked(engine.node<OAdapter>(output_id));
-    Capture native(engine, 1, 431, 0.125f);
-    Playback monitor(engine, 1);
-    const auto bus = checked(engine.emplace_node<VirtualNode<>>());
-    checked(engine.connect({input_id}, {bus}));
-    checked(engine.connect({native.id}, {bus}));
-    checked(engine.connect({bus}, {output_id}));
-    checked(engine.connect({bus}, {monitor.id}));
-    checked(engine.prepare());
-    check(input->pcm_frames() == 441 && output->pcm_frames() == 720,
-          "Device packet sizes follow two capture periods and three playback periods");
-    std::vector<std::uint8_t> packet(output->pcm_bytes());
-    std::vector<std::uint8_t> observed(packet.size());
-    for (std::size_t tick = 0; tick < 6; ++tick)
-    {
-        if (tick % 2 == 0)
-        {
-            checked(capture.generate());
-            checked(input->bind_pcm(capture.pcm()));
-        }
-        if (tick % 3 == 0)
-        {
-            checked(output->bind_pcm({packet.data(), packet.size()}));
-        }
-        render_route(clock, {&native}, {&monitor});
-        const auto pcm = monitor.device.pcm();
-        std::copy(pcm.begin(), pcm.end(), observed.begin() + (tick % 3) * render_frames * 4);
-        for (std::size_t frame = 0; frame < render_frames; ++frame)
-        {
-            const auto index = tick * render_frames + frame;
-            if (index > 105) // Past the existing 96-tap filter's startup history.
+        checked(clock.tick());
+        check(algo->frames == 80 && output->frames == 240, "Every port receives its own rate's frame count");
+        if (tick > 4)
+            for (std::size_t f = 0; f < 240; ++f)
             {
-                const auto expected = 0.25 * std::sin(6.283185307179586 * 997 *
-                                                     (static_cast<double>(index) / 48000 - 48.0 / 44100)) +
-                                      tone(431, 0.125, index);
-                check(std::abs(read_f32le(pcm.data() + frame * 4) - expected) < 0.005,
-                      "Mixed-rate capture follows its own cadence while the native source stays aligned");
+                const auto seconds = static_cast<double>(tick * 240 + f) / 48000 - 48.0 / 48000 - 48.0 / 16000;
+                check(std::abs(output->sample(f) - 0.125 * std::sin(two_pi * 1000 * seconds)) < 0.003,
+                      "Algorithm chain preserves time through two explicit converters");
             }
-        }
-        if (tick % 3 == 2)
-        {
-            checked(playback.receive({packet.data(), packet.size()}));
-            check(playback.matches({observed.data(), observed.size()}),
-                  "Three-period playback contains the same ordered blocks as the one-period monitor");
-        }
     }
-    check(checked(engine.node<VirtualNode<>>(bus))->calls == 6 && engine.frame_position() == 6 * render_frames,
-          "Multiple device cadences share one graph driver");
+    check(algo->calls == 20 && engine.tick_position() == 20, "The engine only advances base periods");
 }
-
-void topology_rebuild()
+void silence_and_pruning()
 {
-    Engine engine(render_rate, render_period);
+    Engine engine(period);
     ManualClock clock(engine);
-    Capture input(engine, 1, 997, 0.25f);
-    Playback main(engine, 1);
-    const auto processor = checked(engine.emplace_node<VirtualNode<>>());
-    checked(engine.connect({input.id}, {processor}));
-    checked(engine.connect({processor}, {main.id}));
+    const auto source =
+        checked(engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 1.0f; }));
+    const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1)));
     checked(engine.prepare());
-    input.generate();
-    main.bind();
     checked(clock.tick());
-    main.receive();
-    main.expect([](std::size_t frame, std::size_t) { return tone(997, 0.25, frame); });
-    input.generate();
-    main.bind();
-    Playback monitor(engine, 1);
-    checked(engine.connect({processor}, {monitor.id}));
-    checked(clock.tick());
-    main.receive();
-    main.expect([](std::size_t frame, std::size_t) { return tone(997, 0.25, render_frames + frame); });
-    check(monitor.device.pcm().empty(), "Draft topology leaves the current route active");
-    input.generate();
-    main.bind();
-    const auto revision = checked(engine.prepare());
-    monitor.bind();
-    check(engine.applied_revision() != revision, "A submitted plan waits for the next block");
-    checked(clock.tick());
-    check(engine.applied_revision() == revision, "The next block applies the plan");
-    main.receive();
-    monitor.receive();
-    main.expect([](std::size_t frame, std::size_t) { return tone(997, 0.25, 2 * render_frames + frame); });
-    check(monitor.device.matches(main.device.pcm()), "A newly attached monitor receives the same existing output");
-    auto *node = checked(engine.node<VirtualNode<>>(processor));
-    check(node->calls == 3 && node->prepares == 1 && node->resets == 0, "Rebuilding keeps existing node state");
-    checked(engine.remove_node(processor));
+    auto *input = checked(engine.node<FloatSource>(source));
+    auto *output = checked(engine.node<PacketSink>(sink));
+    check(input->calls == 0 && input->prepares == 0 && output->sample(0) == 0,
+          "Orphan sources are pruned and disconnected inputs are silence");
+    const auto conn = checked(engine.connect({source}, {sink}));
     checked(engine.prepare());
-    render_route(clock, {}, {&main, &monitor});
-    main.expect([](std::size_t, std::size_t) { return 0; });
-    monitor.expect([](std::size_t, std::size_t) { return 0; });
+    checked(clock.tick());
+    check(input->calls == 1 && output->sample(0) == 1, "Connecting a sink activates its upstream graph");
+    checked(engine.disconnect(conn));
+    checked(engine.prepare());
+    checked(clock.tick());
+    check(input->calls == 1 && output->sample(0) == 0, "Disconnecting removes the source and exposes a silent buffer");
+}
+void format_validation()
+{
+    Engine engine(period);
+    for (const auto spec : {PortSpec(static_cast<SampleRate>(0), 1), PortSpec(static_cast<SampleRate>(96001), 1),
+                            PortSpec(rate, 0), PortSpec(rate, 1, static_cast<Format>(99))})
+        expect_error(ErrorCode::InvalidArg, engine.emplace_node<Capture>(spec));
+    const auto source =
+        checked(engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 0.0f; }));
+    for (const auto spec : {PortSpec(rate, 2), PortSpec(SampleRate::Hz16000, 1), PortSpec(rate, 1, Format::F32LE),
+                            PortSpec(rate, 1, Format::S16LE)})
+    {
+        const auto sink = checked(engine.emplace_node<PacketSink>(spec));
+        expect_error(ErrorCode::FormatMismatch, engine.connect({source}, {sink}));
+    }
+    const auto mixer = checked(engine.emplace_node<Mixer>(rate, 1, 1));
+    const auto raw = checked(engine.emplace_node<Capture>(PortSpec(rate, 1, Format::S16LE)));
+    expect_error(ErrorCode::FormatMismatch, engine.connect({raw}, {mixer}));
+}
+void channel_split_same_tick()
+{
+    constexpr auto split_rate = SampleRate::Hz44100;
+    Engine engine(period);
+    ManualClock clock(engine);
+    std::array<float, 32> left{}, right{};
+    for (std::size_t ch = 0; ch < 4; ++ch)
+    {
+        left[ch * 8 + ch] = 1;
+        right[ch * 8 + ch + 4] = 1;
+    }
+    const auto source =
+        checked(engine.emplace_node<FloatSource>(split_rate, 8, [](std::uint64_t frame, std::size_t ch)
+                                                 { return frame % 7 ? 0.0f : static_cast<float>(ch + 1); }));
+    const auto other = checked(engine.emplace_node<FloatSource>(split_rate, 4, [](std::uint64_t, std::size_t ch)
+                                                                { return static_cast<float>(ch + 1) * 0.125f; }));
+    const auto a = checked(engine.emplace_node<Matrix>(split_rate, 8, 4, View<const float>{left.data(), left.size()}));
+    const auto b =
+        checked(engine.emplace_node<Matrix>(split_rate, 8, 4, View<const float>{right.data(), right.size()}));
+    const auto mix = checked(engine.emplace_node<Mixer>(split_rate, 4, 2));
+    const auto first = checked(engine.emplace_node<PacketSink>(PortSpec(split_rate, 4)));
+    const auto second = checked(engine.emplace_node<PacketSink>(PortSpec(split_rate, 4)));
+    checked(engine.connect({source}, {a}));
+    checked(engine.connect({source}, {b}));
+    checked(engine.connect({a}, {first}));
+    checked(engine.connect({b}, {mix, 0}));
+    checked(engine.connect({other}, {mix, 1}));
+    checked(engine.connect({mix}, {second}));
+    checked(engine.prepare());
+    const auto *input = checked(engine.node<FloatSource>(source));
+    const auto *out_a = checked(engine.node<PacketSink>(first));
+    const auto *out_b = checked(engine.node<PacketSink>(second));
+    std::size_t start = 0;
+    for (std::size_t tick = 0; tick < 8; ++tick)
+    {
+        checked(clock.tick());
+        const auto frames = tick % 2 ? 220 : 221;
+        check(out_a->frames == frames && out_b->frames == frames && input->calls == tick + 1,
+              "Shared upstream views keep fractional block sizes and render once per tick");
+        for (std::size_t frame = 0; frame < frames; ++frame)
+            for (std::size_t ch = 0; ch < 4; ++ch)
+            {
+                const bool pulse = (start + frame) % 7 == 0;
+                check(out_a->sample(frame, ch) == (pulse ? static_cast<float>(ch + 1) : 0.0f) &&
+                          out_b->sample(frame, ch) ==
+                              (pulse ? static_cast<float>(ch + 5) : 0.0f) + static_cast<float>(ch + 1) * 0.125f,
+                      "Split channels and mixed branches retain sample positions within the same tick");
+            }
+        start += frames;
+    }
 }
 } // namespace
-
 int main(int argc, char **argv)
 {
-    return aereborn::test::run_tests(argc, argv, {
-        {"one_to_one", one_to_one}, {"processor_chain", processor_chain},
-        {"one_to_many", one_to_many}, {"many_to_one", many_to_one},
-        {"many_to_many", many_to_many}, {"bus_chain_and_taps", bus_chain_and_taps},
-        {"ports_and_matrices", ports_and_matrices}, {"missing_endpoints", missing_endpoints},
-        {"mixed_device_cadence", mixed_device_cadence}, {"topology_rebuild", topology_rebuild}
-    });
+    return run_tests(argc, argv,
+                     {{"explicit_mix_and_fanout", explicit_mix_and_fanout},
+                      {"algorithm_chain", algorithm_chain},
+                      {"silence_and_pruning", silence_and_pruning},
+                      {"format_validation", format_validation},
+                      {"channel_split_same_tick", channel_split_same_tick}});
 }

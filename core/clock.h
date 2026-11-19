@@ -13,7 +13,7 @@ class ClockDriver
   public:
     using Tick = void (*)(void *);
     virtual ~ClockDriver() = default;
-    virtual RetCode start(EngineSpec spec, Tick tick, void *context) = 0;
+    virtual RetCode start(BlockPeriod period, Tick tick, void *context) = 0;
     virtual void stop() noexcept = 0;
 };
 
