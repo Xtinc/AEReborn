@@ -173,6 +173,7 @@ class ChMatrix
     ChMatrix(std::size_t output_channels, std::size_t input_channels, std::initializer_list<float> coefficients);
     // Add mapped samples to output. The caller validates the block sizes and channel counts.
     void mix_add(IBlock input, OBlock output, float gain = 1.0f) const noexcept;
+    void mix_ramp_add(IBlock input, OBlock output, float from, float to) const noexcept;
     bool empty() const noexcept;
     std::size_t input_channels() const noexcept;
     std::size_t output_channels() const noexcept;

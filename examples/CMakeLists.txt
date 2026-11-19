@@ -1,7 +1,7 @@
-add_executable(virtual_routing virtual_routing.cpp)
-target_link_libraries(virtual_routing PRIVATE aereborn::plugins)
+add_executable(clocked_graph clocked_graph.cpp)
+target_link_libraries(clocked_graph PRIVATE aereborn::core)
 
 if(BUILD_TESTING)
-    add_test(NAME example.virtual_routing COMMAND virtual_routing)
-    set_tests_properties(example.virtual_routing PROPERTIES LABELS example TIMEOUT 20)
+    add_test(NAME example.clocked_graph COMMAND clocked_graph)
+    set_tests_properties(example.clocked_graph PROPERTIES LABELS example TIMEOUT 20)
 endif()

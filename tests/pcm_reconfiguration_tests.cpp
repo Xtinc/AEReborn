@@ -1,3 +1,4 @@
+#include "support/manual_clock.h"
 #include "support/test_harness.h"
 #include "support/pcm_reference.h"
 #include "core/engine.h"
@@ -19,6 +20,7 @@ constexpr double two_pi = 6.283185307179586;
 void capture_format_switch()
 {
     Engine engine(rate, period);
+    ManualClock clock(engine);
     const auto input_id = checked(engine.emplace_node<IAdapter>(2, engine.spec()));
     const auto output_id = checked(engine.emplace_node<OAdapter>(2, engine.spec()));
     auto *input = checked(engine.node<IAdapter>(input_id));
@@ -37,11 +39,11 @@ void capture_format_switch()
         checked(old_device.generate());
         checked(input->bind_pcm(old_device.pcm()));
         bind_output();
-        checked(engine.process()); // Leave one old-device period bound.
+        checked(clock.tick()); // Leave one old-device period bound.
         input->reset();           // Unplug releases borrowed memory before the device is destroyed.
     }
     bind_output();
-    checked(engine.process());
+    checked(clock.tick());
     check(std::all_of(packet.begin(), packet.end(), [](std::uint8_t byte) { return byte == 0; }),
           "Unplugged capture produces silence while the graph clock continues");
 
@@ -55,7 +57,7 @@ void capture_format_switch()
         checked(device.generate());
         checked(input->bind_pcm(device.pcm()));
         bind_output();
-        checked(engine.process());
+        checked(clock.tick());
         checked(sink.receive({packet.data(), packet.size()}));
         for (std::size_t frame = 0; frame < block_frames; ++frame)
         {
@@ -78,7 +80,7 @@ void capture_format_switch()
     checked(silence.generate());
     checked(input->bind_pcm(silence.pcm()));
     bind_output();
-    checked(engine.process());
+    checked(clock.tick());
     check(std::all_of(packet.begin(), packet.end(), [](std::uint8_t byte) { return byte == 0; }) &&
               checked(engine.node<IAdapter>(input_id)) == input && input->outputs()[0] == 2 &&
               engine.frame_position() == 13 * block_frames,
@@ -88,6 +90,7 @@ void capture_format_switch()
 void playback_format_switch()
 {
     Engine engine(rate, period);
+    ManualClock clock(engine);
     const auto input_id = checked(engine.emplace_node<IAdapter>(2, engine.spec()));
     const auto output_id = checked(engine.emplace_node<OAdapter>(2, engine.spec()));
     auto *input = checked(engine.node<IAdapter>(input_id));
@@ -106,13 +109,13 @@ void playback_format_switch()
     };
     checked(output->bind_pcm({old_packet.data(), old_packet.size()}));
     feed();
-    checked(engine.process());
+    checked(clock.tick());
     const auto previous = old_packet;
 
     const ChMatrix matrix(1, 2, {0.25f, 0.75f});
     checked(output->configure_pcm({SampleRate::Hz16000, PCMFormat::S16LE, 1}, matrix));
     feed(); // No new buffer yet: drop this output period and do not write the old device.
-    checked(engine.process());
+    checked(clock.tick());
     check(old_packet == previous, "Switching playback cancels a partially written old device buffer");
     std::vector<std::uint8_t> packet(output->pcm_bytes());
     VirtualSink sink({SampleRate::Hz16000, PCMFormat::S16LE, 1}, period);
@@ -122,7 +125,7 @@ void playback_format_switch()
     {
         checked(output->bind_pcm({packet.data(), packet.size()}));
         feed();
-        checked(engine.process());
+        checked(clock.tick());
         checked(sink.receive({packet.data(), packet.size()}));
         const auto pcm = sink.pcm();
         for (std::size_t frame = 0; frame < 80; ++frame)
@@ -145,7 +148,7 @@ void playback_format_switch()
     checked(output->configure_pcm({rate, PCMFormat::F32LE, 2}));
     std::vector<std::uint8_t> stereo(output->pcm_bytes(), 0xcd);
     checked(output->bind_pcm({stereo.data(), stereo.size()}));
-    checked(engine.process()); // Missing source is silence.
+    checked(clock.tick()); // Missing source is silence.
     check(std::all_of(stereo.begin(), stereo.end(), [](std::uint8_t byte) { return byte == 0; }) &&
               old_packet == previous && checked(engine.node<OAdapter>(output_id)) == output &&
               output->inputs()[0] == 2 && engine.frame_position() == 13 * block_frames,

@@ -17,15 +17,12 @@ class Node
     // Each entry is the channel count of one port.
     virtual View<const std::size_t> inputs() const noexcept = 0;
     virtual View<const std::size_t> outputs() const noexcept = 0;
-    // Engine binds one block view per declared port. Processing receives them through ProcContext.
-    virtual View<IBlock> iblocks() noexcept = 0;
-    virtual View<OBlock> oblocks() noexcept = 0;
     // Validate configuration and prepare resources. The engine may retry a failed preparation.
     virtual RetCode prepare(const EngineSpec &)
     {
         return {};
     }
-    // Fill every output sample in the current processing span.
+    // Use context's block views during this call and fill every output sample.
     virtual void process(const ProcContext &context) noexcept = 0;
     virtual void reset() noexcept
     {
@@ -35,7 +32,7 @@ class Node
     Node() = default;
 };
 
-// Port counts are compile-time constants; channel counts and block views are stored inline.
+// Port counts are compile-time constants. Channel counts are stored inline.
 template <std::size_t I, std::size_t O> class NodeT : public Node
 {
     static_assert(I + O > 0, "Node needs at least one port");
@@ -55,19 +52,8 @@ template <std::size_t I, std::size_t O> class NodeT : public Node
     }
 
   private:
-    View<IBlock> iblocks() noexcept final
-    {
-        return {iblocks_.data(), I};
-    }
-    View<OBlock> oblocks() noexcept final
-    {
-        return {oblocks_.data(), O};
-    }
-
     std::array<std::size_t, I> input_channels_;
     std::array<std::size_t, O> output_channels_;
-    std::array<IBlock, I> iblocks_;
-    std::array<OBlock, O> oblocks_;
 };
 
 } // namespace aereborn

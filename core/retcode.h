@@ -21,7 +21,10 @@ enum class ErrorCode
     Cycle = 9, // Preserve existing error values.
     NotPrepared,
     BufferFull,
-    TooLarge
+    TooLarge,
+    Busy,
+    UnknownObserver,
+    Unsupported
 };
 
 class RetCode
@@ -63,9 +66,15 @@ class RetCode
         case ErrorCode::NotPrepared:
             return "Preparation is required";
         case ErrorCode::BufferFull:
-            return "An audio block is still in use";
+            return "A buffer is full or still in use";
         case ErrorCode::TooLarge:
             return "Requested capacity exceeds the supported size";
+        case ErrorCode::Busy:
+            return "The current execution context or state prevents this operation";
+        case ErrorCode::UnknownObserver:
+            return "Observer does not belong to this engine or was cancelled";
+        case ErrorCode::Unsupported:
+            return "The platform does not support the required lock-free atomics";
         }
         return "Unknown error code";
     }

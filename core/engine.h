@@ -2,15 +2,42 @@
 #define AEREBORN_CORE_ENGINE_H
 
 #include "graph.h"
-#include <map>
+#include <functional>
 #include <memory>
 #include <utility>
-#include <vector>
 
 namespace aereborn
 {
 
-// Phase 1: synchronous offline engine. All calls must be serialized by the caller.
+// A driver invokes one tick at a time. stop() must wait for any in-flight tick.
+class ClockDriver
+{
+  public:
+    using Tick = void (*)(void *);
+    virtual ~ClockDriver() = default;
+    virtual RetCode start(EngineSpec spec, Tick tick, void *context) = 0;
+    virtual void stop() noexcept = 0;
+};
+
+using PlanRevision = std::uint64_t;
+using ObserverId = std::uint64_t;
+
+struct ObserverOptions
+{
+    std::size_t frames;
+    std::size_t queue_blocks = 8;
+};
+
+struct Observation
+{
+    IBlock audio;
+    std::uint64_t frame_position;
+    std::uint64_t dropped_frames;
+};
+
+using ObserverCallback = std::function<void(const Observation &)>;
+
+// Serialize control calls. frame_position() and applied_revision() may be read concurrently.
 class Engine
 {
   public:
@@ -44,50 +71,21 @@ class Engine
     RetCode disconnect(ConnId conn_id) noexcept;
     RetCode set_gain(ConnId conn_id, float linear_gain) noexcept;
     RetCode set_muted(ConnId conn_id, bool muted) noexcept;
-    // Prepare after topology changes. Existing prepared nodes keep their state.
-    RetCode prepare();
-    // Processes one full period or reports that prepare() is required.
-    RetCode process() noexcept;
-    void reset() noexcept;
+    // Prepare and submit draft topology. A running clock applies it at a block boundary.
+    Result<PlanRevision> prepare();
+    RetCode start(std::unique_ptr<ClockDriver> driver = {});
+    RetCode stop() noexcept;
+    RetCode reset() noexcept;
+    // Audio views are borrowed for the duration of the callback.
+    Result<ObserverId> subscribe(OPort port, ObserverOptions options, ObserverCallback callback);
+    RetCode unsubscribe(ObserverId observer) noexcept;
     EngineSpec spec() const noexcept;
     std::uint64_t frame_position() const noexcept;
+    PlanRevision applied_revision() const noexcept;
 
   private:
-    struct NodeEntry
-    {
-        std::unique_ptr<Node> node;
-        bool prepared = false;
-        bool visited = false;
-        std::size_t conn_offset = 0;
-        std::size_t conn_count = 0;
-        View<IBlock> inputs{nullptr, 0};
-        View<OBlock> outputs{nullptr, 0};
-        View<float> input_samples{nullptr, 0};
-    };
-
-    // The graph editor and processing plan share the same connection records.
-    struct Connection
-    {
-        OPort from;
-        IPort to;
-        ConnOpts options;
-        const OBlock *src_block = nullptr;
-        OBlock dst_block{};
-    };
-
-    bool would_cycle(NodeId from, NodeId to);
-    RetCode prepare_node(NodeEntry &entry, std::size_t max_channels, std::size_t &total_channels);
-
-    const EngineSpec spec_;
-    std::map<NodeId, NodeEntry> nodes_;
-    std::map<ConnId, Connection> connections_;
-    std::vector<NodeEntry *> plan_;
-    std::vector<float> samples_;
-    // Shared connection index for graph preparation and per-step processing.
-    std::vector<Connection *> conns_by_input_;
-    std::vector<NodeId> pending_node_ids_;
-    std::uint64_t frame_position_ = 0;
-    bool ready_ = false;
+    struct Runtime;
+    std::unique_ptr<Runtime> runtime_;
 };
 
 } // namespace aereborn

@@ -1,3 +1,4 @@
+#include "support/manual_clock.h"
 #include "support/test_harness.h"
 #include "support/pcm_reference.h"
 #include "core/engine.h"
@@ -18,6 +19,7 @@ std::vector<float> input_resample(SampleRate graph_rate, BlockPeriod graph_perio
                                   std::size_t pcm_frames, std::size_t periods_per_transfer)
 {
     Engine engine(graph_rate, graph_period);
+    ManualClock clock(engine);
     const auto graph_frames = engine.spec().block_frames();
     const auto source_hz = static_cast<std::uint32_t>(source_rate);
     const PCMSpec spec{source_rate, PCMFormat::F32LE, 2, periods_per_transfer};
@@ -46,7 +48,7 @@ std::vector<float> input_resample(SampleRate graph_rate, BlockPeriod graph_perio
         for (std::size_t step = 0; step < periods_per_transfer; ++step)
         {
             bind_output();
-            checked(engine.process());
+            checked(clock.tick());
             for (std::size_t i = 0; i < graph_frames; ++i)
             {
                 const auto left = read_f32le(captured.data() + 8 * i);
@@ -57,10 +59,10 @@ std::vector<float> input_resample(SampleRate graph_rate, BlockPeriod graph_perio
             if (transfer == 0 && step == 0 && periods_per_transfer > 1)
             {
                 const auto first = captured;
-                engine.reset();
+                checked(clock.reset());
                 checked(input->bind_pcm({pcm.data(), pcm.size()}));
                 bind_output();
-                checked(engine.process());
+                checked(clock.tick());
                 check(captured == first, "Reset clears fractional phase and filter history during a device transfer");
             }
             if (step + 1 < periods_per_transfer)
@@ -71,9 +73,9 @@ std::vector<float> input_resample(SampleRate graph_rate, BlockPeriod graph_perio
         }
     }
     check(engine.frame_position() == converted.size(), "Input transfers preserve the graph period");
-    engine.reset();
+    checked(clock.reset());
     bind_output();
-    checked(engine.process());
+    checked(clock.tick());
     check(std::all_of(captured.begin(), captured.end(), [](std::uint8_t byte) { return byte == 0; }),
           "Reset discards pending input and filter history");
     return converted;
@@ -86,6 +88,7 @@ std::vector<float> output_resample(SampleRate graph_rate, BlockPeriod graph_peri
     VirtualSource source(source_spec, graph_period, frequency, 1.0f);
     checked(source.prepare());
     Engine engine(graph_rate, graph_period);
+    ManualClock clock(engine);
     const auto input_id = checked(engine.emplace_node<IAdapter>(source_spec.channels, engine.spec()));
     checked(checked(engine.node<IAdapter>(input_id))->configure_pcm(source_spec));
     const auto output_id = checked(engine.emplace_node<OAdapter>(1, engine.spec()));
@@ -104,7 +107,7 @@ std::vector<float> output_resample(SampleRate graph_rate, BlockPeriod graph_peri
         {
             checked(source.generate());
             checked(input->bind_pcm(source.pcm()));
-            checked(engine.process());
+            checked(clock.tick());
             if (step + 1 < periods_per_transfer)
             {
                 check(output->bind_pcm({pcm.data(), pcm.size()}).code() == ErrorCode::BufferFull,

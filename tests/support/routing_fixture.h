@@ -1,6 +1,7 @@
 #ifndef AEREBORN_TESTS_ROUTING_FIXTURE_H
 #define AEREBORN_TESTS_ROUTING_FIXTURE_H
 
+#include "manual_clock.h"
 #include "pcm_reference.h"
 #include "test_harness.h"
 #include "test_node.h"
@@ -80,7 +81,7 @@ struct Playback
     std::vector<std::uint8_t> bytes;
 };
 
-inline void render_route(Engine &engine, std::initializer_list<Capture *> sources,
+inline void render_route(ManualClock &clock, std::initializer_list<Capture *> sources,
                          std::initializer_list<Playback *> sinks)
 {
     for (auto *source : sources)
@@ -91,7 +92,7 @@ inline void render_route(Engine &engine, std::initializer_list<Capture *> source
     {
         sink->bind();
     }
-    checked(engine.process());
+    checked(clock.tick());
     for (auto *sink : sinks)
     {
         sink->receive();

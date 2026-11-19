@@ -157,4 +157,48 @@ void ChMatrix::mix_add(IBlock input, OBlock output, float gain) const noexcept
     }
 }
 
+static void mix_ramp_channel(const float *src, float *dst, std::size_t frames, float coefficient,
+                             float from, float to, double step) noexcept
+{
+    if (coefficient == 0.0f)
+    {
+        return;
+    }
+    for (std::size_t frame = 0; frame < frames; ++frame)
+    {
+        const auto gain = frame + 1 == frames ? to : static_cast<float>(from + step * (frame + 1));
+        const auto scaled_gain = coefficient * gain;
+        if (scaled_gain != 0.0f)
+        {
+            dst[frame] += src[frame] * scaled_gain;
+        }
+    }
+}
+
+void ChMatrix::mix_ramp_add(IBlock input, OBlock output, float from, float to) const noexcept
+{
+    const auto frames = output.frames();
+    if (frames == 0)
+    {
+        return;
+    }
+    const auto step = (static_cast<double>(to) - from) / frames;
+    if (empty())
+    {
+        for (std::size_t ch = 0; ch < output.channels(); ++ch)
+        {
+            mix_ramp_channel(input.channel(ch), output.channel(ch), frames, 1.0f, from, to, step);
+        }
+        return;
+    }
+    for (std::size_t dst_ch = 0; dst_ch < output.channels(); ++dst_ch)
+    {
+        for (std::size_t src_ch = 0; src_ch < input.channels(); ++src_ch)
+        {
+            mix_ramp_channel(input.channel(src_ch), output.channel(dst_ch), frames,
+                             coefficients_[dst_ch * input.channels() + src_ch], from, to, step);
+        }
+    }
+}
+
 } // namespace aereborn

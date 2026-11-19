@@ -1,3 +1,4 @@
+#include "support/manual_clock.h"
 #include "support/test_harness.h"
 #include "support/test_node.h"
 #include "core/engine.h"
@@ -86,20 +87,25 @@ void engine_timing_validation()
     for (const auto spec : invalid_specs)
     {
         Engine engine(spec.sample_rate(), spec.block_period());
+        ManualClock clock(engine);
         check(engine.spec().block_frames() == 0, "Invalid graph timing cannot define a block size");
+        const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>());
+        checked(engine.subscribe({source}, {80}, [](const Observation &) {}));
         expect_error(ErrorCode::InvalidArg, engine.prepare());
-        expect_error(ErrorCode::NotPrepared, engine.process());
+        expect_error(ErrorCode::NotPrepared, clock.tick());
     }
 
     Engine custom_rate(static_cast<SampleRate>(12300), BlockPeriod::Ms10);
     checked(custom_rate.prepare());
-    checked(custom_rate.process());
+    ManualClock custom_clock(custom_rate);
+    checked(custom_clock.tick());
     check(custom_rate.frame_position() == 123, "Graph rates within the range can define integral frames");
 }
 
 void connection_validation()
 {
     Engine engine(render_rate, render_period);
+    ManualClock clock(engine);
     expect_error(ErrorCode::InvalidArg, engine.add_node(nullptr));
     expect_error(ErrorCode::InvalidArg, engine.emplace_node<VirtualNode<0, 1>>(0));
     const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>());
@@ -120,7 +126,7 @@ void connection_validation()
     const auto nan = std::numeric_limits<float>::quiet_NaN();
     expect_error(ErrorCode::InvalidArg, engine.set_gain(connection, nan));
     expect_error(ErrorCode::InvalidArg, engine.connect({source}, {stereo}, {nan, false, {}}));
-    checked(engine.process()); // Rejected graph edits must not invalidate the prepared graph.
+    checked(clock.tick()); // Rejected graph edits must not invalidate the prepared graph.
     checked(engine.remove_node(source));
     expect_error(ErrorCode::UnknownNode, engine.node(source));
     const auto &read_only = engine;
@@ -134,6 +140,7 @@ void connection_validation()
 void feedback_rejection()
 {
     Engine engine(render_rate, render_period);
+    ManualClock clock(engine);
     const auto a = checked(engine.emplace_node<VirtualNode<2, 2>>());
     const auto b = checked(engine.emplace_node<VirtualNode<>>());
     const auto c = checked(engine.emplace_node<VirtualNode<>>());
@@ -144,7 +151,7 @@ void feedback_rejection()
     checked(engine.prepare());
     expect_error(ErrorCode::Cycle, engine.connect({c}, {a, 1}));
     expect_error(ErrorCode::Cycle, engine.connect({a, 1}, {a, 1}));
-    checked(engine.process());
+    checked(clock.tick());
     check(checked(engine.node<VirtualNode<2, 2>>(a))->calls == 1, "Rejected feedback leaves the valid graph executable");
     const auto x = checked(engine.emplace_node<VirtualNode<>>());
     const auto y = checked(engine.emplace_node<VirtualNode<>>());
@@ -155,9 +162,10 @@ void feedback_rejection()
 void prepare_retry()
 {
     Engine engine(render_rate, render_period);
-    expect_error(ErrorCode::NotPrepared, engine.process());
+    ManualClock clock(engine);
+    expect_error(ErrorCode::NotPrepared, clock.tick());
     checked(engine.prepare());
-    checked(engine.process());
+    checked(clock.tick());
     check(engine.frame_position() == render_frames, "An empty prepared graph advances one period");
     const auto processor = checked(engine.emplace_node<VirtualNode<>>());
     const auto sink = checked(engine.emplace_node<VirtualNode<1, 0>>());
@@ -165,21 +173,22 @@ void prepare_retry()
     auto *node = checked(engine.node<VirtualNode<>>(processor));
     node->preparation = ErrorCode::InvalidArg;
     expect_error(ErrorCode::InvalidArg, engine.prepare());
-    expect_error(ErrorCode::NotPrepared, engine.process());
-    check(engine.frame_position() == render_frames && node->calls == 0, "Preparation failure does not process or advance time");
+    checked(clock.tick());
+    check(engine.frame_position() == 2 * render_frames && node->calls == 0,
+          "Preparation failure leaves the old plan running");
     node->preparation = {};
     checked(engine.prepare());
     checked(engine.prepare());
-    checked(engine.process());
+    checked(clock.tick());
     check(node->prepares == 2 && node->calls == 1, "Preparation is retryable and then idempotent");
     const auto huge = checked(engine.emplace_node<VirtualNode<1, 0>>(std::numeric_limits<std::size_t>::max()));
     expect_error(ErrorCode::TooLarge, engine.prepare());
-    expect_error(ErrorCode::NotPrepared, engine.process());
+    checked(clock.tick());
     checked(engine.remove_node(huge));
     checked(engine.prepare());
-    checked(engine.process());
-    check(node->prepares == 2 && node->calls == 2, "Capacity failure preserves previously prepared DSP state");
-    engine.reset();
+    checked(clock.tick());
+    check(node->prepares == 2 && node->calls == 3, "Capacity failure preserves previously prepared DSP state");
+    checked(clock.reset());
     check(engine.frame_position() == 0 && node->resets == 1, "Reset reaches nodes and restarts the graph clock");
 }
 
@@ -208,6 +217,7 @@ class ThrowingNode : public VirtualNode<>
 void node_exception_propagation()
 {
     Engine engine(render_rate, render_period);
+    ManualClock clock(engine);
     checked(engine.prepare());
     expect_exception<std::bad_alloc>([&] {
         engine.emplace_node<ThrowingNode>(std::make_exception_ptr(std::bad_alloc()));
@@ -218,7 +228,7 @@ void node_exception_propagation()
     expect_exception<std::runtime_error>([&] {
         engine.emplace_node<ThrowingNode>(std::make_exception_ptr(std::runtime_error("test construction")));
     });
-    checked(engine.process());
+    checked(clock.tick());
 
     const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>());
     const auto processor = checked(engine.emplace_node<ThrowingNode>());
@@ -226,12 +236,12 @@ void node_exception_propagation()
     checked(engine.connect({source}, {processor}));
     checked(engine.connect({processor}, {sink}));
     expect_exception<std::runtime_error>([&] { engine.prepare(); });
-    expect_error(ErrorCode::NotPrepared, engine.process());
-    check(engine.frame_position() == render_frames, "Preparation exception does not advance time");
+    checked(clock.tick());
+    check(engine.frame_position() == 2 * render_frames, "The previous plan runs after a preparation exception");
     auto *node = checked(engine.node<ThrowingNode>(processor));
     node->fail_preparation = false;
     checked(engine.prepare());
-    checked(engine.process());
+    checked(clock.tick());
     check(checked(engine.node<VirtualNode<0, 1>>(source))->prepares == 1 && node->calls == 1,
           "Retry after an exception preserves prepared dependencies");
 }

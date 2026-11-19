@@ -11,6 +11,9 @@ endfunction()
 aereborn_test_group(core engine_graph_tests.cpp aereborn::core
     audio_block_layout channel_matrix_validation engine_timing_validation connection_validation
     feedback_rejection prepare_retry node_exception_propagation handle_uniqueness)
+aereborn_test_group(runtime clocked_engine_tests.cpp aereborn::core
+    parameter_queue_and_switch plan_reclamation start_failure_rollback observer_packetization observer_overflow_isolation
+    live_graph_edits stop_and_unsubscribe_barriers)
 aereborn_test_group(routing graph_routing_tests.cpp aereborn::plugins
     one_to_one processor_chain one_to_many many_to_one many_to_many bus_chain_and_taps
     ports_and_matrices missing_endpoints mixed_device_cadence topology_rebuild)
@@ -24,6 +27,7 @@ aereborn_test_group(device pcm_reconfiguration_tests.cpp aereborn::plugins
 aereborn_test_group(virtual virtual_pcm_tests.cpp aereborn::plugins
     source_wire_formats source_timeline sink_packet_ownership configuration_validation)
 aereborn_test_group(allocation allocation_failure_tests.cpp aereborn::plugins
-    buffer_resize_rollback pcm_configuration_rollback)
+    buffer_resize_rollback pcm_configuration_rollback render_uses_prepared_buffers)
 set_tests_properties(allocation.buffer_resize_rollback allocation.pcm_configuration_rollback
+    allocation.render_uses_prepared_buffers
     PROPERTIES SKIP_RETURN_CODE 77)

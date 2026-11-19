@@ -1,3 +1,4 @@
+#include "support/manual_clock.h"
 #include "support/test_harness.h"
 #include "support/pcm_reference.h"
 #include "core/engine.h"
@@ -32,6 +33,7 @@ void pcm_format_conversion()
     for (const auto &test : cases)
     {
         Engine engine(rate, period);
+        ManualClock clock(engine);
         const PCMSpec spec{rate, test.format, 2};
         const PCMSpec float_spec{rate, PCMFormat::F32LE, 2};
         const auto input_id = checked(engine.emplace_node<IAdapter>(spec.channels, engine.spec()));
@@ -66,7 +68,7 @@ void pcm_format_conversion()
         checked(checked(engine.node<OAdapter>(capture_id))->bind_pcm({decoded.data(), decoded.size()}));
         checked(checked(engine.node<IAdapter>(playback_id))->bind_pcm({graph_pcm.data(), graph_pcm.size()}));
         checked(checked(engine.node<OAdapter>(output_id))->bind_pcm({encoded.data(), encoded.size()}));
-        checked(engine.process());
+        checked(clock.tick());
         const float expected_samples[] = {-1.0f, 0.5f, 0.25f, test.peak};
         for (std::size_t i = 0; i < decoded.size() / 4; ++i)
         {
@@ -82,13 +84,14 @@ void pcm_format_conversion()
 void buffer_binding()
 {
     Engine engine(rate, period);
+    ManualClock clock(engine);
     const PCMSpec spec{rate, PCMFormat::S16LE, 1};
     const auto input_id = checked(engine.emplace_node<IAdapter>(spec.channels, engine.spec()));
     const auto output_id = checked(engine.emplace_node<OAdapter>(spec.channels, engine.spec()));
     checked(engine.connect({input_id}, {output_id}));
     auto *input = checked(engine.node<IAdapter>(input_id));
     auto *output = checked(engine.node<OAdapter>(output_id));
-    engine.reset(); // Reset must also accept converters with no allocated history.
+    checked(clock.reset()); // Reset must also accept converters with no allocated history.
     std::array<std::uint8_t, block_frames * 2> pcm;
     for (std::size_t i = 0; i < pcm.size(); ++i)
     {
@@ -102,7 +105,7 @@ void buffer_binding()
     check(input->pcm_frames() == 0 && input->pcm_bytes() == 0 &&
               output->pcm_frames() == 0 && output->pcm_bytes() == 0,
           "Unconfigured adapters report no device buffer requirements");
-    checked(engine.process());
+    checked(clock.tick());
     check(engine.frame_position() == block_frames &&
               input->bind_pcm({pcm.data(), pcm.size()}).code() == ErrorCode::NotPrepared &&
               output->bind_pcm({packet.data(), packet.size()}).code() == ErrorCode::NotPrepared,
@@ -121,23 +124,23 @@ void buffer_binding()
     check(input->bind_pcm({pcm.data(), pcm.size()}).code() == ErrorCode::BufferFull &&
               output->bind_pcm({packet.data(), packet.size()}).code() == ErrorCode::BufferFull,
           "A bound device period survives repeated preparation and cannot be replaced early");
-    checked(engine.process());
+    checked(clock.tick());
     check(packet == pcm, "An engine period writes directly to the bound output buffer");
-    checked(engine.process());
+    checked(clock.tick());
     check(packet == pcm && engine.frame_position() == 3 * block_frames,
           "The graph continues after the device buffers are released");
     checked(output->bind_pcm({packet.data(), packet.size()}));
-    checked(engine.process());
+    checked(clock.tick());
     check(std::all_of(packet.begin(), packet.end(), [](std::uint8_t byte) { return byte == 0; }),
           "Missing input produces silence");
 
     checked(input->bind_pcm({pcm.data(), pcm.size()}));
     checked(output->bind_pcm({packet.data(), packet.size()}));
-    engine.reset();
+    checked(clock.reset());
     check(engine.frame_position() == 0, "Reset resets the graph clock");
     checked(input->bind_pcm({pcm.data(), pcm.size()}));
     checked(output->bind_pcm({packet.data(), packet.size()}));
-    checked(engine.process());
+    checked(clock.tick());
 }
 
 void unaligned_float_pcm()
@@ -146,6 +149,7 @@ void unaligned_float_pcm()
     constexpr auto frames = periods * block_frames;
     constexpr auto bytes = frames * sizeof(float);
     Engine engine(rate, period);
+    ManualClock clock(engine);
     const PCMSpec spec{rate, PCMFormat::F32LE, 1, periods};
     const auto input_id = checked(engine.emplace_node<IAdapter>(spec.channels, engine.spec()));
     checked(checked(engine.node<IAdapter>(input_id))->configure_pcm(spec));
@@ -164,7 +168,7 @@ void unaligned_float_pcm()
     checked(checked(engine.node<OAdapter>(output_id))->bind_pcm({playback.data() + 1, bytes}));
     for (std::size_t step = 0; step < periods; ++step)
     {
-        checked(engine.process());
+        checked(clock.tick());
     }
     check(playback == capture, "Same-rate mono F32LE preserves sample bytes in unaligned device buffers");
 }
@@ -172,6 +176,7 @@ void unaligned_float_pcm()
 void channel_mapping()
 {
     Engine engine(rate, period);
+    ManualClock clock(engine);
     const auto input_id = checked(engine.emplace_node<IAdapter>(2, engine.spec()));
     const auto output_id = checked(engine.emplace_node<OAdapter>(2, engine.spec()));
     auto *input = checked(engine.node<IAdapter>(input_id));
@@ -203,7 +208,7 @@ void channel_mapping()
     checked(output->bind_pcm({playback.data(), playback.size()}));
     for (std::size_t step = 0; step < 2; ++step)
     {
-        checked(engine.process());
+        checked(clock.tick());
         const float expected[] = {0.25f, 0.125f, 0.125f, 0};
         for (std::size_t frame = step * block_frames; frame < (step + 1) * block_frames; ++frame)
         {
@@ -231,7 +236,7 @@ void channel_mapping()
     write_f32le(captured.data() + 4, -0.5f);
     checked(input->bind_pcm({captured.data(), captured.size()}));
     checked(output->bind_pcm({playback.data(), playback.size()}));
-    checked(engine.process());
+    checked(clock.tick());
     check(read_f32le(playback.data()) == -0.5f && read_f32le(playback.data() + 4) == 0.25f &&
               std::all_of(playback.begin() + 8, playback.end(), [](std::uint8_t byte) { return byte == 0; }),
           "Same-channel mapping replaces the previous converter without adding delay or retaining a tail");
@@ -286,6 +291,7 @@ void graph_timing_mismatch()
     expect_error(ErrorCode::InvalidArg, standalone.configure_pcm({rate, PCMFormat::F32LE, 1}));
 
     Engine engine(rate, period);
+    ManualClock clock(engine);
     const EngineSpec other_spec(SampleRate::Hz24000, BlockPeriod::Ms10);
     const auto frames = engine.spec().block_frames();
     check(frames == block_frames && frames == other_spec.block_frames(),
@@ -294,7 +300,7 @@ void graph_timing_mismatch()
     const auto wrong_input = checked(engine.emplace_node<IAdapter>(1, other_spec));
     checked(engine.connect({wrong_input}, {output}));
     expect_error(ErrorCode::InvalidArg, engine.prepare());
-    expect_error(ErrorCode::NotPrepared, engine.process());
+    expect_error(ErrorCode::NotPrepared, clock.tick());
     checked(engine.remove_node(wrong_input));
 
     const auto input = checked(engine.emplace_node<IAdapter>(1, engine.spec()));
@@ -303,10 +309,10 @@ void graph_timing_mismatch()
     const auto wrong_output = checked(engine.emplace_node<OAdapter>(1, other_spec));
     checked(engine.connect({input}, {wrong_output}));
     expect_error(ErrorCode::InvalidArg, engine.prepare());
-    expect_error(ErrorCode::NotPrepared, engine.process());
+    expect_error(ErrorCode::NotPrepared, clock.tick());
     checked(engine.remove_node(wrong_output));
     checked(engine.prepare());
-    checked(engine.process());
+    checked(clock.tick());
     check(engine.frame_position() == block_frames, "Preparing the corrected graph makes it executable");
 }
 
@@ -316,6 +322,7 @@ void zero_contributions()
     for (const bool map_at_input : {false, true})
     {
         Engine engine(rate, period);
+        ManualClock clock(engine);
         const auto input_id = checked(engine.emplace_node<IAdapter>(2, engine.spec()));
         const auto output_id = checked(engine.emplace_node<OAdapter>(2, engine.spec()));
         auto *input = checked(engine.node<IAdapter>(input_id));
@@ -335,8 +342,8 @@ void zero_contributions()
             checked(engine.set_gain(connection, gain));
             checked(input->bind_pcm({pcm.data(), pcm.size()}));
             checked(output->bind_pcm({packet.data(), packet.size()}));
-            checked(engine.process());
-            check(read_f32le(packet.data()) == 0.5f * gain &&
+            checked(clock.tick());
+            check(read_f32le(packet.data()) == 0.5f * (gain / block_frames) &&
                       std::all_of(packet.begin() + 4, packet.end(), [](std::uint8_t byte) { return byte == 0; }),
                   "Zero gains and zero matrix coefficients suppress non-finite unused channels");
         }
@@ -346,6 +353,7 @@ void zero_contributions()
 void integer_sample_limits()
 {
     Engine engine(rate, period);
+    ManualClock clock(engine);
     const auto input_id = checked(engine.emplace_node<IAdapter>(1, engine.spec()));
     const auto output_id = checked(engine.emplace_node<OAdapter>(1, engine.spec()));
     auto *input = checked(engine.node<IAdapter>(input_id));
@@ -365,7 +373,7 @@ void integer_sample_limits()
     }
     checked(input->bind_pcm({pcm.data(), pcm.size()}));
     checked(output->bind_pcm({packet.data(), packet.size()}));
-    checked(engine.process());
+    checked(clock.tick());
     for (std::size_t frame = 0; frame < block_frames; ++frame)
     {
         const auto word = static_cast<std::uint16_t>(packet[frame * 2]) |

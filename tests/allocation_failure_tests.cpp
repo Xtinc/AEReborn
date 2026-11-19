@@ -1,3 +1,4 @@
+#include "support/manual_clock.h"
 #include "support/test_harness.h"
 #include "support/pcm_reference.h"
 #include "core/engine.h"
@@ -16,12 +17,18 @@ int main()
 #else
 namespace allocation_test
 {
-long fail_after = -1;
+thread_local long fail_after = -1;
+thread_local bool measure_heap = false;
+thread_local std::size_t heap_calls = 0;
 }
 
 // Fail each allocation in configure_pcm(), including failures after workspace preparation.
 void *operator new(std::size_t size)
 {
+    if (allocation_test::measure_heap)
+    {
+        ++allocation_test::heap_calls;
+    }
     if (allocation_test::fail_after == 0)
     {
         throw std::bad_alloc();
@@ -39,12 +46,16 @@ void *operator new(std::size_t size)
 
 void operator delete(void *memory) noexcept
 {
+    if (memory && allocation_test::measure_heap)
+    {
+        ++allocation_test::heap_calls;
+    }
     std::free(memory);
 }
 
 void operator delete(void *memory, std::size_t) noexcept
 {
-    std::free(memory);
+    ::operator delete(memory);
 }
 
 namespace
@@ -98,6 +109,7 @@ void pcm_configuration_rollback()
         for (long failure = 0;; ++failure)
         {
             Engine engine(rate, period);
+            ManualClock clock(engine);
             const auto input_id = checked(engine.emplace_node<IAdapter>(2, engine.spec()));
             const auto output_id = checked(engine.emplace_node<OAdapter>(2, engine.spec()));
             auto *input = checked(engine.node<IAdapter>(input_id));
@@ -116,7 +128,7 @@ void pcm_configuration_rollback()
             }
             checked(input->bind_pcm({pcm.data(), pcm.size()}));
             checked(output->bind_pcm({packet.data(), packet.size()}));
-            checked(engine.process());
+            checked(clock.tick());
             const auto previous = packet;
 
             const PCMSpec replacement{SampleRate::Hz16000, PCMFormat::S16LE, 1};
@@ -135,7 +147,7 @@ void pcm_configuration_rollback()
                       input->bind_pcm({pcm.data(), pcm.size()}).code() == ErrorCode::BufferFull &&
                       output->bind_pcm({packet.data(), packet.size()}).code() == ErrorCode::BufferFull,
                   "Every allocation failure preserves the partially consumed device buffers");
-            checked(engine.process());
+            checked(clock.tick());
             for (std::size_t frame = block_frames; frame < 2 * block_frames; ++frame)
             {
                 const auto expected = std::sin(two_pi * 1000 * (static_cast<double>(frame) / 48000 - 48.0 / 44100));
@@ -146,13 +158,45 @@ void pcm_configuration_rollback()
         }
     }
 }
+
+void render_uses_prepared_buffers()
+{
+    Engine engine(rate, period);
+    ManualClock clock(engine);
+    const auto input_id = checked(engine.emplace_node<IAdapter>(1, engine.spec()));
+    const auto output_id = checked(engine.emplace_node<OAdapter>(1, engine.spec()));
+    auto *input = checked(engine.node<IAdapter>(input_id));
+    auto *output = checked(engine.node<OAdapter>(output_id));
+    checked(input->configure_pcm({SampleRate::Hz16000, PCMFormat::F32LE, 1}));
+    checked(output->configure_pcm({rate, PCMFormat::F32LE, 1}));
+    const auto connection = checked(engine.connect({input_id}, {output_id}));
+    checked(engine.prepare());
+    checked(clock.start());
+
+    checked(engine.subscribe({input_id}, {block_frames}, [](const Observation &) {}));
+    const auto revision = checked(engine.prepare());
+    checked(engine.set_gain(connection, 0.5f));
+    std::vector<std::uint8_t> capture(input->pcm_bytes());
+    std::vector<std::uint8_t> playback(output->pcm_bytes());
+    checked(input->bind_pcm({capture.data(), capture.size()}));
+    checked(output->bind_pcm({playback.data(), playback.size()}));
+
+    allocation_test::heap_calls = 0;
+    allocation_test::measure_heap = true;
+    const auto code = clock.tick();
+    allocation_test::measure_heap = false;
+    checked(code);
+    check(allocation_test::heap_calls == 0 && engine.applied_revision() == revision,
+          "Plan activation, parameter ramps, resampling and observer publication do not allocate or reclaim on the driver");
+}
 } // namespace
 
 int main(int argc, char **argv)
 {
     return aereborn::test::run_tests(argc, argv, {
         {"buffer_resize_rollback", buffer_resize_rollback},
-        {"pcm_configuration_rollback", pcm_configuration_rollback}
+        {"pcm_configuration_rollback", pcm_configuration_rollback},
+        {"render_uses_prepared_buffers", render_uses_prepared_buffers}
     });
 }
 #endif
