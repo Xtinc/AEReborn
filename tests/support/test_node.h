@@ -55,9 +55,9 @@ class VirtualNode : public NodeT<I, O>
     std::size_t resets = 0;
 
   private:
-    template <std::size_t N> static std::array<std::size_t, N> ports(std::size_t channels)
+    template <std::size_t N> static std::array<PortSpec, N> ports(std::size_t channels)
     {
-        std::array<std::size_t, N> result{};
+        std::array<PortSpec, N> result{};
         result.fill(channels);
         return result;
     }

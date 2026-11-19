@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "observer.h"
 #include "runtime.h"
 
 #include <algorithm>
@@ -7,7 +8,6 @@
 #include <map>
 #include <mutex>
 #include <set>
-#include <thread>
 #include <tuple>
 
 namespace aereborn
@@ -23,37 +23,32 @@ std::uint64_t get_next_identifier() noexcept
 
 struct GraphNode
 {
-    explicit GraphNode(std::unique_ptr<Node> instance) : node(std::move(instance))
+    explicit GraphNode(std::unique_ptr<Node> instance)
+        : node(std::move(instance)), inputs(node->inputs()), outputs(node->outputs())
     {
-        const auto in = node->inputs();
-        const auto out = node->outputs();
-        if (!in.empty())
-        {
-            inputs.assign(in.begin(), in.end());
-        }
-        if (!out.empty())
-        {
-            outputs.assign(out.begin(), out.end());
-        }
+    }
+
+    View<const PortSpec> ports(PortDirection direction) const noexcept
+    {
+        return direction == PortDirection::Input ? inputs : outputs;
     }
 
     std::unique_ptr<Node> node;
-    std::vector<std::size_t> inputs;
-    std::vector<std::size_t> outputs;
+    const View<const PortSpec> inputs;
+    const View<const PortSpec> outputs;
     bool prepared = false;
 };
+
+bool same_ports(View<const PortSpec> a, View<const PortSpec> b) noexcept
+{
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
+}
 
 struct Connection
 {
     OPort from;
     IPort to;
     ConnOpts options;
-};
-
-struct Subscription
-{
-    OPort port;
-    std::shared_ptr<ObserverDelivery> delivery;
 };
 
 struct PlanConnection
@@ -79,8 +74,15 @@ struct PlanNode
 
 struct PlanObserver
 {
-    std::shared_ptr<ObserverDelivery> delivery;
+    std::shared_ptr<Observer> observer;
     IBlock source;
+    const Node *pcm_node;
+};
+
+struct ObserverUpdate
+{
+    Observer *observer;
+    Observer::Format format;
 };
 
 struct RenderPlan
@@ -91,9 +93,18 @@ struct RenderPlan
     std::vector<PlanNode> nodes;
     std::vector<PlanConnection> connections;
     std::vector<PlanObserver> observers;
+    std::vector<std::shared_ptr<Observer>> paused_observers;
     std::vector<float> samples;
     std::map<NodeId, std::size_t> node_index;
     std::map<ConnId, std::size_t> connection_index;
+
+    void start_observers() noexcept
+    {
+        for (const auto &item : observers)
+        {
+            item.observer->start();
+        }
+    }
 
     void render(std::uint64_t frame) noexcept
     {
@@ -117,9 +128,17 @@ struct RenderPlan
             item.entry->node->process({frame, {item.inputs.data(), item.inputs.size()},
                                        {item.outputs.data(), item.outputs.size()}});
         }
-        for (const auto &observer : observers)
+        for (const auto &item : observers)
         {
-            observer.delivery->publish(observer.source, frame);
+            if (item.pcm_node)
+            {
+                const auto port = item.observer->port();
+                item.observer->write(item.pcm_node->pcm_block(port.direction, port.index), frame);
+            }
+            else
+            {
+                item.observer->write(item.source, frame);
+            }
         }
     }
 };
@@ -150,17 +169,18 @@ struct Engine::Runtime
     const EngineSpec spec;
     std::map<NodeId, std::shared_ptr<GraphNode>> nodes;
     std::map<ConnId, Connection> connections;
-    std::map<ObserverId, Subscription> subscriptions;
+    std::map<ObserverId, std::shared_ptr<Observer>> observers;
+    std::set<NodeId> paused_nodes;
     std::unique_ptr<RenderPlan> current;
     std::unique_ptr<RenderPlan> pending;
     std::mutex plans_mutex; // Only the control caller and the reclamation task use this mutex.
     RenderPlan *active = nullptr; // Accessed only by the driver, or by control after the driver has joined.
     std::unique_ptr<ClockDriver> driver;
     std::unique_ptr<RuntimeTask> maintenance;
+    std::unique_ptr<ObserverWorkers> observer_workers;
     SpscRing<Command> commands{64};
     std::atomic<PlanRevision> applied{0};
     std::atomic<std::uint64_t> position{0};
-    std::atomic<std::uint64_t> render_epoch{0};
     bool dirty = true;
 
     bool on_execution_thread() const noexcept
@@ -170,23 +190,31 @@ struct Engine::Runtime
 
     bool lock_free() const noexcept
     {
-        return commands.lock_free() && applied.is_lock_free() && position.is_lock_free() &&
-               render_epoch.is_lock_free();
+        return commands.lock_free() && applied.is_lock_free() && position.is_lock_free();
     }
 
-    Result<std::size_t> port_channels(NodeId id, std::size_t index, bool input) const noexcept
+    PortSpec resolve_port_format(PortSpec format) const noexcept
     {
-        const auto found = nodes.find(id);
+        if (!format.is_pcm())
+        {
+            format.spec.sample_rate = spec.sample_rate();
+        }
+        return format;
+    }
+
+    Result<PortSpec> port_spec(ObservationPort port) const noexcept
+    {
+        const auto found = nodes.find(port.node);
         if (found == nodes.end())
         {
             return ErrorCode::UnknownNode;
         }
-        const auto &ports = input ? found->second->inputs : found->second->outputs;
-        if (index >= ports.size())
+        const auto ports = found->second->ports(port.direction);
+        if (port.index >= ports.size())
         {
             return ErrorCode::InvalidPort;
         }
-        return ports[index];
+        return resolve_port_format(ports[port.index]);
     }
 
     bool would_cycle(NodeId from, NodeId to) const
@@ -234,10 +262,28 @@ struct Engine::Runtime
         }
 
         const auto &entry = nodes.find(id)->second;
-        for (const auto *ports : {&entry->inputs, &entry->outputs})
+        if (driver)
         {
-            for (const auto channels : *ports)
+            const auto old = current->node_index.find(id);
+            if (old != current->node_index.end())
             {
+                const auto &running = current->nodes[old->second].entry;
+                if (entry != running && (!same_ports(entry->inputs, running->inputs) ||
+                                         !same_ports(entry->outputs, running->outputs)))
+                {
+                    return ErrorCode::Busy;
+                }
+            }
+        }
+        for (const auto ports : {entry->inputs, entry->outputs})
+        {
+            for (const auto &port : ports)
+            {
+                if (port.is_pcm())
+                {
+                    continue;
+                }
+                const auto channels = port.spec.channels;
                 if (channels > max_channels - total)
                 {
                     return ErrorCode::TooLarge;
@@ -260,7 +306,7 @@ struct Engine::Runtime
         return {};
     }
 
-    RetCode build_plan(RenderPlan &plan)
+    RetCode build_plan(RenderPlan &plan, std::vector<ObserverUpdate> &updates)
     {
         const auto frames = spec.block_frames();
         if (frames == 0)
@@ -270,7 +316,11 @@ struct Engine::Runtime
         Incoming incoming;
         for (const auto &item : connections)
         {
-            incoming[item.second.to.node].push_back(&item);
+            const auto &connection = item.second;
+            if (!paused_nodes.count(connection.from.node) && !paused_nodes.count(connection.to.node))
+            {
+                incoming[connection.to.node].push_back(&item);
+            }
         }
         for (auto &item : incoming)
         {
@@ -286,7 +336,14 @@ struct Engine::Runtime
         const auto max_channels = plan.samples.max_size() / frames;
         for (const auto &item : nodes)
         {
-            if (item.second->outputs.empty())
+            if (paused_nodes.count(item.first))
+            {
+                continue;
+            }
+            const auto outputs = item.second->outputs;
+            if (outputs.empty() || std::any_of(outputs.begin(), outputs.end(), [](const PortSpec &port) {
+                    return port.is_pcm();
+                }))
             {
                 const auto code = visit(item.first, incoming, plan, total_channels, max_channels);
                 if (!code)
@@ -295,9 +352,18 @@ struct Engine::Runtime
                 }
             }
         }
-        for (const auto &item : subscriptions)
+        for (const auto &item : observers)
         {
-            const auto code = visit(item.second.port.node, incoming, plan, total_channels, max_channels);
+            const auto node = item.second->port().node;
+            if (paused_nodes.count(node))
+            {
+                if (driver && current->node_index.count(node))
+                {
+                    plan.paused_observers.push_back(item.second);
+                }
+                continue;
+            }
+            const auto code = visit(node, incoming, plan, total_channels, max_channels);
             if (!code)
             {
                 return code;
@@ -317,7 +383,12 @@ struct Engine::Runtime
             const auto start = offset;
             for (std::size_t port = 0; port < node.inputs.size(); ++port)
             {
-                const auto channels = node.entry->inputs[port];
+                const auto &format = node.entry->inputs[port];
+                if (format.is_pcm())
+                {
+                    continue;
+                }
+                const auto channels = format.spec.channels;
                 const OBlock destination{plan.samples.data() + offset, channels, frames, frames};
                 node.inputs[port] = destination;
                 offset += channels * frames;
@@ -329,7 +400,7 @@ struct Engine::Runtime
                     const auto source = plan.nodes[plan.node_index.find(connection.from.node)->second]
                                             .outputs[connection.from.index];
                     auto previous = RenderPlan::no_connection;
-                    if (current)
+                    if (driver)
                     {
                         const auto old = current->connection_index.find(record.first);
                         if (old != current->connection_index.end())
@@ -342,19 +413,41 @@ struct Engine::Runtime
                     plan.connections.push_back({source, destination, connection.options.matrix, gain, gain, previous});
                 }
             }
-            node.input_samples = {plan.samples.empty() ? nullptr : plan.samples.data() + start, offset - start};
+            node.input_samples = {offset == start ? nullptr : plan.samples.data() + start, offset - start};
             for (std::size_t port = 0; port < node.outputs.size(); ++port)
             {
-                const auto channels = node.entry->outputs[port];
+                const auto &format = node.entry->outputs[port];
+                if (format.is_pcm())
+                {
+                    continue;
+                }
+                const auto channels = format.spec.channels;
                 node.outputs[port] = {plan.samples.data() + offset, channels, frames, frames};
                 offset += channels * frames;
             }
         }
-        for (const auto &item : subscriptions)
+        for (const auto &item : observers)
         {
             const auto &observer = item.second;
-            const auto &node = plan.nodes[plan.node_index.find(observer.port.node)->second];
-            plan.observers.push_back({observer.delivery, node.outputs[observer.port.index]});
+            const auto port = observer->port();
+            if (paused_nodes.count(port.node))
+            {
+                continue;
+            }
+            auto &node = plan.nodes[plan.node_index.find(port.node)->second];
+            const auto format = resolve_port_format(node.entry->ports(port.direction)[port.index]);
+            auto prepared = observer->prepare_format(spec, format);
+            if (!prepared)
+            {
+                return prepared.ret_code();
+            }
+            if (prepared.value() || (driver && current->node_index.count(port.node) == 0))
+            {
+                updates.push_back({observer.get(), std::move(prepared).value()});
+            }
+            const IBlock source = port.direction == PortDirection::Input ? node.inputs[port.index]
+                                                                          : IBlock(node.outputs[port.index]);
+            plan.observers.push_back({observer, source, format.is_pcm() ? node.entry->node.get() : nullptr});
         }
         return {};
     }
@@ -370,6 +463,11 @@ struct Engine::Runtime
                     connection.gain = active->connections[connection.previous].gain;
                 }
             }
+            for (const auto &observer : next->paused_observers)
+            {
+                observer->request_stop();
+            }
+            next->start_observers();
         }
         active = next;
         // The previous plan is no longer touched by the driver after this release.
@@ -387,13 +485,20 @@ struct Engine::Runtime
         return {};
     }
 
-    void reclaim()
+    void maintain()
     {
         const EngineExecutionScope scope(this);
         std::unique_ptr<RenderPlan> retired;
         {
             const std::lock_guard<std::mutex> lock(plans_mutex);
             retired = collect();
+            if (observer_workers)
+            {
+                for (const auto &item : current->observers)
+                {
+                    observer_workers->schedule(item.observer, this);
+                }
+            }
         }
     }
 
@@ -422,12 +527,10 @@ struct Engine::Runtime
     {
         auto &runtime = *static_cast<Runtime *>(context);
         const EngineExecutionScope scope(context);
-        runtime.render_epoch.fetch_add(1);
         runtime.apply_commands(true);
         const auto frame = runtime.position.load(std::memory_order_relaxed);
         runtime.active->render(frame);
         runtime.position.store(frame + runtime.spec.block_frames(), std::memory_order_release);
-        runtime.render_epoch.fetch_add(1);
     }
 
     RetCode set_parameter(Connection &connection, ConnId id, float gain, bool muted) noexcept
@@ -485,16 +588,18 @@ Result<NodeId> Engine::add_node(std::unique_ptr<Node> instance)
     {
         return ErrorCode::InvalidArg;
     }
-    auto entry = std::make_shared<GraphNode>(std::move(instance));
-    for (const auto *ports : {&entry->inputs, &entry->outputs})
+    GraphNode entry(std::move(instance));
+    for (const auto ports : {entry.inputs, entry.outputs})
     {
-        if (std::find(ports->begin(), ports->end(), 0) != ports->end())
+        if (std::any_of(ports.begin(), ports.end(), [](const PortSpec &port) {
+                return port.spec.channels == 0;
+            }))
         {
             return ErrorCode::InvalidArg;
         }
     }
     const NodeId id{get_next_identifier()};
-    runtime_->nodes.emplace(id, std::move(entry));
+    runtime_->nodes.emplace(id, std::make_shared<GraphNode>(std::move(entry)));
     runtime_->dirty = true;
     return id;
 }
@@ -511,9 +616,9 @@ RetCode Engine::remove_node(NodeId id) noexcept
     {
         return ErrorCode::UnknownNode;
     }
-    for (const auto &item : runtime.subscriptions)
+    for (const auto &item : runtime.observers)
     {
-        if (item.second.port.node == id)
+        if (item.second->port().node == id)
         {
             return ErrorCode::Busy;
         }
@@ -530,7 +635,58 @@ RetCode Engine::remove_node(NodeId id) noexcept
         }
     }
     runtime.nodes.erase(found);
+    runtime.paused_nodes.erase(id);
     runtime.dirty = true;
+    return {};
+}
+
+RetCode Engine::replace_node(NodeId id, std::unique_ptr<Node> replacement)
+{
+    auto &runtime = *runtime_;
+    if (runtime.on_execution_thread())
+    {
+        return ErrorCode::Busy;
+    }
+    const auto found = runtime.nodes.find(id);
+    if (found == runtime.nodes.end())
+    {
+        return ErrorCode::UnknownNode;
+    }
+    if (!replacement)
+    {
+        return ErrorCode::InvalidArg;
+    }
+    GraphNode entry(std::move(replacement));
+    const auto compatible = [](View<const PortSpec> before, View<const PortSpec> after) {
+        return before.size() == after.size() &&
+               std::equal(before.begin(), before.end(), after.begin(), [](const PortSpec &a, const PortSpec &b) {
+                   return a.layout == b.layout && b.spec.channels > 0 &&
+                          (a.is_pcm() || a.spec.channels == b.spec.channels);
+               });
+    };
+    const auto &before = *found->second;
+    if (!compatible(before.inputs, entry.inputs) || !compatible(before.outputs, entry.outputs))
+    {
+        return ErrorCode::InvalidArg;
+    }
+    found->second = std::make_shared<GraphNode>(std::move(entry));
+    runtime.dirty = true;
+    return {};
+}
+
+RetCode Engine::set_paused(NodeId id, bool paused)
+{
+    auto &runtime = *runtime_;
+    if (runtime.on_execution_thread())
+    {
+        return ErrorCode::Busy;
+    }
+    if (runtime.nodes.count(id) == 0)
+    {
+        return ErrorCode::UnknownNode;
+    }
+    const bool changed = paused ? runtime.paused_nodes.insert(id).second : runtime.paused_nodes.erase(id) != 0;
+    runtime.dirty |= changed;
     return {};
 }
 
@@ -565,25 +721,27 @@ Result<ConnId> Engine::connect(OPort from, IPort to, const ConnOpts &options)
     {
         return ErrorCode::Busy;
     }
-    const auto source = runtime.port_channels(from.node, from.index, false);
+    const auto source = runtime.port_spec(from);
     if (!source)
     {
         return source.ret_code();
     }
-    const auto destination = runtime.port_channels(to.node, to.index, true);
+    const auto destination = runtime.port_spec(to);
     if (!destination)
     {
         return destination.ret_code();
     }
+    if (source.value().is_pcm() || destination.value().is_pcm())
+    {
+        return ErrorCode::InvalidPort;
+    }
+    const auto source_channels = source.value().spec.channels;
+    const auto destination_channels = destination.value().spec.channels;
     if (!std::isfinite(options.gain))
     {
         return ErrorCode::InvalidArg;
     }
-    const auto &matrix = options.matrix;
-    const bool match = matrix.empty() ? source.value() == destination.value()
-                                      : matrix.input_channels() == source.value() &&
-                                            matrix.output_channels() == destination.value();
-    if (!match)
+    if (!options.matrix.matches(source_channels, destination_channels))
     {
         return ErrorCode::ChannelMismatch;
     }
@@ -662,7 +820,7 @@ Result<PlanRevision> Engine::prepare()
         return ErrorCode::Busy;
     }
     std::unique_ptr<RenderPlan> retired;
-    const std::lock_guard<std::mutex> lock(runtime.plans_mutex);
+    std::unique_lock<std::mutex> lock(runtime.plans_mutex);
     retired = runtime.collect();
     if (!runtime.dirty)
     {
@@ -685,11 +843,28 @@ Result<PlanRevision> Engine::prepare()
 
     auto plan = std::make_unique<RenderPlan>();
     const EngineExecutionScope scope(&runtime);
-    const auto code = runtime.build_plan(*plan);
+    std::vector<ObserverUpdate> updates;
+    const auto code = runtime.build_plan(*plan, updates);
     if (!code)
     {
         return code;
     }
+    if (slot && !plan->observers.empty() && !runtime.observer_workers)
+    {
+        runtime.observer_workers = std::make_unique<ObserverWorkers>();
+    }
+    if (!updates.empty())
+    {
+        // The previous plan has detached these writers or the driver is stopped.
+        // A user callback may still be finishing, so leave the shared scheduler free to run.
+        lock.unlock();
+        for (auto &update : updates)
+        {
+            update.observer->configure(std::move(update.format));
+        }
+        lock.lock();
+    }
+
     const auto revision = runtime.current ? runtime.current->revision + 1 : 1;
     plan->revision = revision;
     if (slot)
@@ -725,11 +900,12 @@ RetCode Engine::start(std::unique_ptr<ClockDriver> driver)
     runtime.driver = driver ? std::move(driver) : make_timer_driver();
     try
     {
-        for (const auto &item : runtime.subscriptions)
+        if (!runtime.current->observers.empty())
         {
-            item.second.delivery->start(&runtime);
+            runtime.observer_workers = std::make_unique<ObserverWorkers>();
+            runtime.current->start_observers();
         }
-        runtime.maintenance = start_runtime_task(runtime.spec, [&runtime] { runtime.reclaim(); });
+        runtime.maintenance = start_background_task([&runtime] { runtime.maintain(); });
         const auto code = runtime.driver->start(runtime.spec, &Runtime::tick, &runtime);
         if (!code)
         {
@@ -755,16 +931,17 @@ RetCode Engine::stop() noexcept
     {
         runtime.driver->stop();
         runtime.driver.reset();
-        for (const auto &item : runtime.subscriptions)
+        for (const auto &item : runtime.observers)
         {
-            item.second.delivery->request_stop();
+            item.second->request_stop();
         }
         runtime.maintenance.reset();
+        runtime.observer_workers.reset();
         runtime.apply_commands(false);
         runtime.collect();
-        for (const auto &item : runtime.subscriptions)
+        for (const auto &item : runtime.observers)
         {
-            item.second.delivery->stop();
+            item.second->clear_when_idle();
         }
     }
     return {};
@@ -787,80 +964,63 @@ RetCode Engine::reset() noexcept
     }
     for (const auto &item : runtime.nodes)
     {
-        if (!runtime.current || !runtime.current->node_index.count(item.first))
+        const auto index = runtime.current ? runtime.current->node_index.find(item.first)
+                                           : std::map<NodeId, std::size_t>::const_iterator{};
+        if (!runtime.current || index == runtime.current->node_index.end() ||
+            runtime.current->nodes[index->second].entry != item.second)
         {
             item.second->node->reset();
         }
     }
-    for (const auto &item : runtime.subscriptions)
+    for (const auto &item : runtime.observers)
     {
-        item.second.delivery->reset_when_idle();
+        item.second->reset_when_idle();
     }
     runtime.position.store(0, std::memory_order_release);
     return {};
 }
 
-Result<ObserverId> Engine::subscribe(OPort port, ObserverOptions options, ObserverCallback callback)
+Result<ObserverId> Engine::add_observer(std::unique_ptr<Observer> observer)
 {
     auto &runtime = *runtime_;
     if (runtime.on_execution_thread())
     {
         return ErrorCode::Busy;
     }
-    const auto frames = runtime.spec.block_frames();
-    if (!callback || options.frames == 0 || options.queue_blocks == 0)
+    if (!observer)
     {
         return ErrorCode::InvalidArg;
     }
-    const auto channels = runtime.port_channels(port.node, port.index, false);
-    if (!channels)
+    const auto found = runtime.port_spec(observer->port());
+    if (!found)
     {
-        return channels.ret_code();
-    }
-    if (!ObserverDelivery::fits(channels.value(), frames, options))
-    {
-        return ErrorCode::TooLarge;
-    }
-    auto observer = std::make_shared<ObserverDelivery>(runtime.spec, channels.value(), options, std::move(callback));
-    if (!observer->lock_free())
-    {
-        return ErrorCode::Unsupported;
-    }
-    if (runtime.driver)
-    {
-        observer->start(&runtime);
+        return found.ret_code();
     }
     const auto id = get_next_identifier();
-    runtime.subscriptions.emplace(id, Subscription{port, std::move(observer)});
+    runtime.observers.emplace(id, std::move(observer));
     runtime.dirty = true;
     return id;
 }
 
-RetCode Engine::unsubscribe(ObserverId id) noexcept
+Result<PortSpec> Engine::port_spec(ObservationPort port) const noexcept
+{
+    return runtime_->on_execution_thread() ? Result<PortSpec>{ErrorCode::Busy} : runtime_->port_spec(port);
+}
+
+RetCode Engine::remove_observer(ObserverId id) noexcept
 {
     auto &runtime = *runtime_;
     if (runtime.on_execution_thread())
     {
         return ErrorCode::Busy;
     }
-    const auto found = runtime.subscriptions.find(id);
-    if (found == runtime.subscriptions.end())
+    const auto found = runtime.observers.find(id);
+    if (found == runtime.observers.end())
     {
         return ErrorCode::UnknownObserver;
     }
-    auto &observer = *found->second.delivery;
-    observer.disable();
-    // A tick that saw the old enabled flag must finish before clearing its queue.
-    const auto epoch = runtime.render_epoch.load();
-    if (epoch % 2 != 0)
-    {
-        while (runtime.render_epoch.load() == epoch)
-        {
-            std::this_thread::yield();
-        }
-    }
-    observer.stop();
-    runtime.subscriptions.erase(found);
+    found->second->cancel();
+    runtime.observers.erase(found);
     runtime.dirty = true;
     return {};
 }

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace aereborn
@@ -17,8 +18,10 @@ RetCode Buffer::resize(std::size_t channels, std::size_t capacity_frames)
     {
         return ErrorCode::TooLarge;
     }
-    samples_.resize(channels * capacity_frames);
-    std::fill(samples_.begin(), samples_.end(), 0.0f);
+    const auto sample_count = channels * capacity_frames;
+    const auto retained_samples = std::min(samples_.size(), sample_count);
+    samples_.resize(sample_count);
+    std::fill_n(samples_.begin(), retained_samples, 0.0f);
     channels_ = channels;
     capacity_frames_ = capacity_frames;
     return {};
@@ -32,6 +35,31 @@ OBlock Buffer::block(std::size_t frames) noexcept
 std::size_t Buffer::capacity_frames() const noexcept
 {
     return capacity_frames_;
+}
+
+Result<std::size_t> PCMSpec::transfer_frames(BlockPeriod period) const noexcept
+{
+    if (!is_pcm_sample_rate(sample_rate) || !is_block_period(period) || periods == 0)
+    {
+        return ErrorCode::InvalidArg;
+    }
+    const auto period_frames_x1000 = std::uint64_t{static_cast<std::uint32_t>(sample_rate)} *
+                                     static_cast<std::uint32_t>(period);
+    if (periods > std::numeric_limits<std::uint64_t>::max() / period_frames_x1000)
+    {
+        return ErrorCode::TooLarge;
+    }
+    const auto frames_x1000 = period_frames_x1000 * periods;
+    if (frames_x1000 % 1000 != 0)
+    {
+        return ErrorCode::InvalidArg;
+    }
+    const auto frames = frames_x1000 / 1000;
+    if (frames > std::numeric_limits<std::size_t>::max())
+    {
+        return ErrorCode::TooLarge;
+    }
+    return static_cast<std::size_t>(frames);
 }
 
 NodeId::operator bool() const noexcept
@@ -104,6 +132,12 @@ ChMatrix::ChMatrix(std::size_t output_channels, std::size_t input_channels, std:
 {
 }
 
+bool ChMatrix::matches(std::size_t input_channels, std::size_t output_channels) const noexcept
+{
+    return empty() ? input_channels == output_channels
+                   : input_channels_ == input_channels && output_channels_ == output_channels;
+}
+
 bool ChMatrix::empty() const noexcept
 {
     return coefficients_.empty();
@@ -164,14 +198,20 @@ static void mix_ramp_channel(const float *src, float *dst, std::size_t frames, f
     {
         return;
     }
-    for (std::size_t frame = 0; frame < frames; ++frame)
+    const auto last_frame = frames - 1;
+    for (std::size_t frame = 0; frame < last_frame; ++frame)
     {
-        const auto gain = frame + 1 == frames ? to : static_cast<float>(from + step * (frame + 1));
+        const auto gain = static_cast<float>(from + step * (frame + 1));
         const auto scaled_gain = coefficient * gain;
-        if (scaled_gain != 0.0f)
+        if (scaled_gain != 0.0f) // Silent contributions also skip non-finite input samples.
         {
             dst[frame] += src[frame] * scaled_gain;
         }
+    }
+    const auto final_gain = coefficient * to;
+    if (final_gain != 0.0f)
+    {
+        dst[last_frame] += src[last_frame] * final_gain;
     }
 }
 

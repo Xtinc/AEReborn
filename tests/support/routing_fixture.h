@@ -26,11 +26,11 @@ struct Capture
 {
     Capture(Engine &engine, std::size_t channels, double frequency, float amplitude)
         : device({render_rate, PCMFormat::F32LE, channels}, render_period, frequency, amplitude),
-          id(checked(engine.emplace_node<IAdapter>(channels, engine.spec()))),
+          id(checked(engine.emplace_node<IAdapter>(channels,
+                                                  PCMSpec{render_rate, PCMFormat::F32LE, channels}))),
           adapter(checked(engine.node<IAdapter>(id)))
     {
         checked(device.prepare());
-        checked(adapter->configure_pcm({render_rate, PCMFormat::F32LE, channels}));
     }
     void generate()
     {
@@ -46,12 +46,12 @@ struct Playback
 {
     Playback(Engine &engine, std::size_t channels)
         : device({render_rate, PCMFormat::F32LE, channels}, render_period),
-          id(checked(engine.emplace_node<OAdapter>(channels, engine.spec()))),
-          adapter(checked(engine.node<OAdapter>(id))), channels(channels)
+          id(checked(engine.emplace_node<OAdapter>(channels,
+                                                  PCMSpec{render_rate, PCMFormat::F32LE, channels}))),
+          adapter(checked(engine.node<OAdapter>(id))), channels(channels),
+          bytes(render_frames * channels * sizeof(float))
     {
         checked(device.prepare());
-        checked(adapter->configure_pcm({render_rate, PCMFormat::F32LE, channels}));
-        bytes.resize(adapter->pcm_bytes());
     }
     void bind()
     {

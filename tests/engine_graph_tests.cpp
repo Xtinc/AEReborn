@@ -2,6 +2,7 @@
 #include "support/test_harness.h"
 #include "support/test_node.h"
 #include "core/engine.h"
+#include "core/observer.h"
 #include <algorithm>
 #include <array>
 #include <exception>
@@ -75,6 +76,29 @@ void channel_matrix_validation()
     });
 }
 
+void gain_ramp_endpoints()
+{
+    const auto nan = std::numeric_limits<float>::quiet_NaN();
+    const auto infinity = std::numeric_limits<float>::infinity();
+    const ChMatrix identity;
+    const float crossing[] = {1, nan, 1, 1};
+    float mixed[4]{};
+    identity.mix_ramp_add({crossing, 1, 4, 4}, {mixed, 1, 4, 4}, 1.0f, -1.0f);
+    check(mixed[0] == 0.5f && mixed[1] == 0 && mixed[2] == -0.5f && mixed[3] == -1.0f,
+          "An exactly zero gain inside the ramp skips the source sample");
+
+    const float fade[] = {1, infinity};
+    float faded[] = {0, 2};
+    const ChMatrix half(1, 1, {0.5f});
+    half.mix_ramp_add({fade, 1, 2, 2}, {faded, 1, 2, 2}, 1.0f, 0.0f);
+    check(faded[0] == 0.25f && faded[1] == 2, "A silent last frame leaves the existing mix intact");
+
+    const float single = 1.0f;
+    float final = 0.0f;
+    identity.mix_ramp_add({&single, 1, 1, 1}, {&final, 1, 1, 1}, std::numeric_limits<float>::max(), 1.0f);
+    check(final == 1.0f, "A single-frame ramp uses the exact target gain");
+}
+
 void engine_timing_validation()
 {
     const EngineSpec invalid_specs[] = {
@@ -90,7 +114,7 @@ void engine_timing_validation()
         ManualClock clock(engine);
         check(engine.spec().block_frames() == 0, "Invalid graph timing cannot define a block size");
         const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>());
-        checked(engine.subscribe({source}, {80}, [](const Observation &) {}));
+        checked(engine.add_observer(std::make_unique<Observer>(OPort{source}, [](const Observation &) {})));
         expect_error(ErrorCode::InvalidArg, engine.prepare());
         expect_error(ErrorCode::NotPrepared, clock.tick());
     }
@@ -274,6 +298,7 @@ int main(int argc, char **argv)
 {
     return aereborn::test::run_tests(argc, argv, {
         {"audio_block_layout", audio_block_layout}, {"channel_matrix_validation", channel_matrix_validation}, {"engine_timing_validation", engine_timing_validation},
+        {"gain_ramp_endpoints", gain_ramp_endpoints},
         {"connection_validation", connection_validation}, {"feedback_rejection", feedback_rejection},
         {"prepare_retry", prepare_retry}, {"node_exception_propagation", node_exception_propagation}, {"handle_uniqueness", handle_uniqueness}
     });

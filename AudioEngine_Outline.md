@@ -31,7 +31,7 @@ Node A 的 OPort ── Connection ──> Node B 的 IPort
 | Port | 节点上的多声道音频入口或出口，带声道布局 |
 | Connection | 输出端口到输入端口的有向连接，独立持有增益、静音和声道矩阵 |
 
-Port 按方向使用 `IPort/OPort` 引用，节点只声明每个端口的声道数。所有输入端口都可以接多条连接，引擎在每个周期应用各连接的增益和矩阵后求和。没有连接的输入得到静音。
+Port 按方向使用 `IPort/OPort` 引用。`PortSpec` 描述布局、采样率、声道数和样本格式。图内处理端口使用引擎规格的原生 planar float32。图内输入可以接多条连接，引擎逐周期应用增益和矩阵后求和。没有连接的图内输入得到静音。交错 PCM 端口通过设备边界交接，也可被订阅。
 一个 Port 表示一组声道，声道间的选择、复制、合并由 Connection 的矩阵表达。
 `NodeId/ConnId` 是类型化句柄，原型采用进程内不复用的唯一 ID。Node 不持有其他 Node 的共享所有权，也不各自维护连接列表或调度循环。
 
@@ -44,7 +44,7 @@ Source、Processor、Mixer、Sink 是具体节点的用途。`plugins/` 中的 `
 | Mixer | 将输入端口的混音结果转发到一个可供下游复用的输出 | 后续插件；当前输入端口已支持多连接求和 |
 | Sink | 消费图内音频 | `OAdapter` |
 
-PCM 适配器和固定端口数量的自定义节点通常继承 `NodeT<I, O>`，由它保存端口声道数。节点在 `prepare(const EngineSpec &)` 中取得引擎规格。端口数量由运行时决定的节点可以直接继承 `Node`，通过 `inputs()/outputs()` 提供端口布局，端口布局在加入引擎后保持固定。
+PCM 适配器和固定端口数量的自定义节点通常继承 `NodeT<I, O>`，由它保存端口描述。节点在 `prepare(const EngineSpec &)` 中取得引擎规格。端口数量由运行时决定的节点可以直接继承 `Node`，通过 `inputs()/outputs()` 提供固定的端口描述。引擎持有节点期间借用这些描述，节点负责保持描述及其存储有效。
 后续设备、文件、网络、滤波等节点遵循同一边界。Bus 表示 Mixer 与效果节点构成的应用层总线，不是新的核心基类。
 
 ### 从输出创建输入：直接复用端口
@@ -64,8 +64,10 @@ core/
 ├── block.h                    块视图与 Buffer 接口
 ├── retcode.h                  错误码与带值结果接口
 ├── graph.h                    Node、节点默认行为和固定端口数的 NodeT
+├── clock.h                    ClockDriver 接口
+├── observer.h / observer.cpp  端口观测、队列与回调交付
 ├── engine.h / engine.cpp      图编辑、计划提交与渲染
-└── runtime.h / runtime.cpp    内部队列、定时驱动与 Observer 交付
+└── runtime.h / runtime.cpp    内部命令队列和定时任务
 plugins/
 ├── adapter.h / adapter.cpp    PCM 输入和输出适配
 └── virtual.h / virtual.cpp    图外正弦 PCM 发端与原始 PCM 收端
@@ -85,7 +87,7 @@ examples/
 
 `core/types.cpp` 集中实现缓冲、错误消息、图句柄和声道矩阵。`core/engine.cpp` 实现引擎生命周期。节点的默认行为、模板和 `constexpr` 函数定义放在头文件中。`aereborn::core` 是 CMake 静态库目标，提供核心实现和头文件路径。`aereborn::plugins` 提供 PCM 适配器和图外虚拟收发端点，并链接核心库。
 Engine 持有编辑图和渲染计划。`prepare()` 按节点依赖排序，为新计划分配缓冲并建立块视图。渲染侧在块边界切换到已准备的计划，并按计划顺序执行节点。
-固定端口数量通过 `NodeT<I, O>` 确定，端口声道数使用 `std::array`。采样数据集中在图缓冲池，节点执行顺序和连接索引使用可复用的连续数组。
+固定端口数量通过 `NodeT<I, O>` 确定，端口描述使用 `std::array`。采样数据集中在图缓冲池，节点执行顺序和连接索引使用可复用的连续数组。
 `IBlock/OBlock` 分别是 `Block<const float>/Block<float>`，共享布局与寻址实现，只允许可写块转换为只读块。`ProcContext` 向节点借出计划中的块视图，供当前 `process()` 调用使用。
 编辑图的连接记录持有端口引用和参数。渲染计划将它们编译成块视图与连接区间，渲染侧直接处理已解析的连接。
 每个节点记录保存输入缓冲的连续采样区间；渲染阶段一次清零该区间，无需恢复声道数、逐声道清零或重新累加端口偏移。
@@ -123,7 +125,7 @@ Engine 持有编辑图和渲染计划。`prepare()` 按节点依赖排序，为�
 主设备能提供基础节拍时，可以直接在其回调或设备线程执行渲染。
 主驱动切换须先确认旧驱动退出，再接管执行权；帧序号继续递增，并报告时钟切换或数据不连续。
 
-内部统一使用 planar float32。`Engine(sample_rate, block_period)` 构造时固定图规格，通过 `spec()` 按值返回 `EngineSpec`。创建 PCM 适配器时传入这份规格和图内端口声道数。
+内部统一使用 planar float32。`Engine(sample_rate, block_period)` 构造时固定图规格，通过 `spec()` 按值返回 `EngineSpec`。创建 PCM 适配器时传入图内端口声道数和设备侧 `PCMSpec`，引擎在准备时提供图规格。
 `SampleRate` 提供 8000、11025、16000、22050、24000、32000、44100、48000、88200、96000 Hz 的枚举值。图采样率范围为 1 至 96000 Hz，`BlockPeriod` 支持 `Ms05`、`Ms10`、`Ms20` 和 `Ms40`。
 每周期帧数按 `采样率 × 周期毫秒 / 1000` 精确计算，通过 `engine.spec().block_frames()` 查询。例如 44.1 kHz / 10 ms 为 441 帧。44.1 kHz / 5 ms 无法得到整数帧，规格中的帧数为零，`Engine::prepare()` 返回 `InvalidArg`。
 引擎将规格传给节点的 `prepare(const EngineSpec &)`，节点可以据此准备算法资源。`ProcContext` 提供当前帧位置及输入输出块视图，块视图提供实际帧数。
@@ -172,7 +174,7 @@ Asio 控制执行器 ──> 计划/参数 ──> 渲染路径
 - NetworkSource：会话识别、乱序整理、按播放期限解码/FEC/PLC，再交付音频。NetworkSink：排队、编码、发送。先 PCM，后 Opus；协议独立版本化。
 - FileSource：工作线程预读，独立 PlaybackHandle 管理循环、暂停和停止。FileSink：排队写入，支持分段保存。
 - PushSource：应用显式推入带格式、帧时间和连续性信息的音频，接口报告接收数量或队列满。
-- Observer：订阅现有输出端口，指定格式和交付帧数，回调携带帧时间及缺口标记。它不参与驱动音频图。
+- Observer：订阅输入或输出端口，按该端口的格式取得数据，回调携带帧时间及缺口标记。它跟随引擎时钟。
 
 ## 6. 混音策略归属
 
@@ -191,53 +193,48 @@ Connection 增益/矩阵 -> Bus 混音 -> 效果链 -> 总线音量 -> 最终输
 
 ## 7. 时钟运行 API
 
-应用按顺序创建 Engine、编辑图并调用 `prepare()`，然后用 `start()` 启动时钟。完整示例演示图内信号、音量更新、Observer 和停止。[时钟运行示例](examples/clocked_graph.cpp)
+应用创建 Engine，将节点和 Observer 交给它，连接端口并调用 `prepare()`，然后用 `start()` 启动时钟。应用可将自定义 `ClockDriver` 交给 `start()`。完整示例演示组件组装、音量更新和停止。[时钟运行示例](examples/clocked_graph.cpp)
 
 - 图编辑修改待提交的图。`prepare()` 返回提交的计划版本。停止时立即应用计划，运行时在后续块边界应用，`applied_revision()` 可查询实际版本。图准备失败时，时钟继续驱动当前计划。
-- Sink 和订阅输出都是依赖遍历的根。每个节点按依赖顺序执行一次，修改连接时保留同一节点的 DSP 状态。新计划回收旧计划前，控制线程等候渲染侧确认。
+- Sink、带 PCM 输出的节点和被订阅的节点都是依赖遍历的根。每个节点按依赖顺序执行一次，修改连接时保留同一节点的 DSP 状态。新计划回收旧计划前，控制线程等候渲染侧确认。
 - `set_gain()` 和 `set_muted()` 将有效增益提交到一个容量为 64 的命令队列，下一块从当前值线性过渡到目标值。运行期间最多有一个待应用计划。队列或提交槽满时返回 `BufferFull`，调用方可以重试。
 - 控制调用由应用串行发起。运行中，节点实例和 Adapter 缓冲由驱动的执行域独占。Observer 和节点回调可查询 `frame_position()` 与 `applied_revision()`，同步修改或停止 Engine 会返回 `Busy`。
 - `stop()` 等待时钟和回调退出，应用已接收的命令并清空待交付数据。重启延续帧位置、图状态和仍注册的订阅。应用可在停止后通过 `reset()` 将帧位置和 DSP 状态归零。
 - 自定义节点在 `prepare(const EngineSpec &)` 中准备资源，使用 `ProcContext` 的输入输出块视图处理实际帧数。可预期失败通过 `RetCode` 或 `Result<T>` 返回，控制侧分配失败及节点构造、准备时抛出的异常传给调用方。
 
-### 观测输出
+### 端口与 Observer
 
-`subscribe(OPort, ObserverOptions, ObserverCallback)` 指定现有输出、每次交付的帧数与队列容量。默认容量为八个图块。订阅在下一次提交该图时开始。回调由 Engine 的每订阅独立交付线程调用，收到图采样率的 planar float32、起始帧号和前置缺失帧数，块视图有效期为回调执行期间。
+- `port_spec(IPort{node, index})` 和 `port_spec(OPort{node, index})` 查询编辑图的端口描述。图内端口的采样率来自 `EngineSpec`，布局为 `PlanarFloat`。设备侧端口的布局为 `InterleavedPCM`，`PortSpec::spec` 包含实际的 PCM 规格，`periods` 只用于这类端口。`ProcContext` 保留端口索引，PCM 端口对应的音频视图为空，实际字节由节点的 `pcm_block()` 提供。
+- `Observer(port, callback, options)` 接受一个 `IPort` 或 `OPort`。`add_observer(std::unique_ptr<Observer>)` 检查端口并将组件加入草稿，返回 `ObserverId`。`prepare()` 按实际格式准备队列，计划生效后开始交付。`IPort` 交付实际输入，图内端口已应用连接增益、矩阵和多路混音。`OPort` 交付节点产出的数据。
+- Observer 按端口实际格式交付。回调通过 `Observation::port` 取得本批的格式，通过 `audio` 读取 planar float32，或通过 `pcm` 读取原始交错字节。视图在回调期间有效。共享 Asio 定时器当前固定为 30 Hz，`ObserverOptions::interval` 可填写目标间隔，暂用于保留接口。每个任务交付开始时已入队的数据，遇到缺口分批交付，期间新入队的数据留给下一轮。
+- 每个订阅持有一个预分配的单生产者、单消费者环形缓冲，默认容纳 16 个引擎块。渲染直接写入队列，队列满时丢弃新块。`dropped_frames` 是自上一批结束以来缺少的引擎帧数，也覆盖采集中断和格式切换时丢弃的积压。新批次的 `frame_position` 始终指向实际交付数据。
+- Engine 为首个含 Observer 的运行计划按需创建两个共享 Asio worker。同一个 Observer 串行交付。两个 worker 都被占用时，其他 Observer 等待空闲 worker。`remove_observer(id)` 使该 Observer 的排队任务失效，并等待它正在执行的交付。旧计划在退役前保留组件和队列，已开始的写入可安全结束。回调抛出异常后停止交付，调用方仍可移除该 Observer。
 
-队列满时只丢弃该订阅的新块。交付在缺口处重新拼包，下一包标明缺失帧数。`unsubscribe()` 等待在途回调和数据写入结束，随后可用 `prepare()` 从图中移除观测根。移除被订阅节点前须取消订阅。抛出异常的回调停止该订阅的交付，应用仍可以取消它。
+### 固定规格的 PCM Adapter
 
-### 外部 PCM 输入和输出
+`IAdapter(channels, pcm_spec, matrix)` 和 `OAdapter(channels, pcm_spec, matrix)` 均有一个输入和一个输出。采集方向是交错 PCM → planar float32，播放方向相反。四个端口均可由 Observer 观察，例如 `Observer(OPort{playback_id}, callback)` 交付实际编码的播放 PCM。`PCMSpec::periods` 是一次设备缓冲交接覆盖的图周期数。
 
-`plugins/adapter.h` 提供两个独立的节点 `IAdapter` 和 `OAdapter`，构造时接收固定的图内端口声道数和 `EngineSpec`。通过 `configure_pcm(PCMSpec spec, const ChMatrix &matrix = {})` 配置或替换设备侧转换状态。`PCMSpec{sample_rate, format, channels, periods}` 全部描述设备侧 PCM，设备声道数可以与图内声道数不同。`periods` 是一块 PCM 覆盖的引擎周期数，默认为 1。当前虚拟设备的收发周期与该交付块一致。
+- `prepare()` 根据引擎规格校验 PCM 规格、矩阵与周期，分配转换工作区和播放端口的单周期 PCM 缓冲。端口规格随转换实例固定。矩阵以目标声道为行、源声道为列。空矩阵要求两端声道数相同。
+- `pcm_frames()` 和 `pcm_bytes()` 在准备后给出一次设备交接的大小。调用方与渲染串行交接，设备缓冲保持有效到第 `periods` 次 tick 完成。已有缓冲尚未消耗完时，`bind_pcm()` 返回 `BufferFull`。48 kHz / 5 ms 图接 44.1 kHz / 10 ms 设备时，441 帧的 PCM 分为 221 和 220 帧两个周期切片。
+- 采集直接解码本周期借来的设备字节，按需重采样并映射到图内声道。PCM 输入端口提供同一切片，供 Observer 在本周期结束前写入自己的队列。缺少设备输入时，图内输出静音，PCM 订阅在恢复后能看到缺口。播放直接编码到已绑定的设备缓冲，未绑定时使用预分配的缓冲。PCM 输出端口提供实际编码的切片。
+- PCM 端口支持交错 `S16LE`、`S24_3LE`、`S24LE`、`S32LE` 和 `F32LE`。`pcm_sample_bits()` 与 `pcm_sample_bytes()` 分别描述有效位数和存储宽度。转换在当前周期完成。
 
-外部使用交错 PCM，格式包括 `S16LE`、`S24_3LE`、`S24LE`、`S32LE` 和 `F32LE`。`pcm_sample_bits()` 查询样本位深，`pcm_sample_bytes()` 查询存储字节数。`S24_3LE` 每样本占三字节，`S24LE` 每样本占四字节，低 24 位有效，写出的高字节为零。
+### 局部暂停与更换设备规格
 
-- 图内端口声道数在加入引擎时校验。Adapter 在首次进入执行计划时核对其构造规格与当前图一致。未配置设备时输入产生静音，输出丢弃数据，图照常推进，此时 `bind_pcm()` 返回 `NotPrepared`。独立配置时也会校验图规格和逻辑声道数。
-- `configure_pcm()` 在临时转换器中完成校验、缓冲分配及滤波准备，成功后替换旧转换器、解除旧缓冲绑定并从新流的第一个周期开始。无论返回错误码还是抛出异常，旧配置、缓冲绑定、周期索引和滤波历史都保持有效。配置可以在图准备前或准备后进行，无需再次调用 `Engine::prepare()`，节点身份、图内端口、连接及引擎帧位置保持不变。
-- `ChMatrix` 的行是目标声道，列是源声道。输入适配器的矩阵方向是设备→图，输出适配器是图→设备。相同声道数时空矩阵表示直通；不同声道数必须提供显式矩阵，否则返回 `ChannelMismatch`。不自动复制单声道，也不自动混合多声道；相同声道数也可用显式矩阵选择、交换或混合声道。
-- `pcm_frames()` 和 `pcm_bytes()` 在配置成功后返回一块设备 PCM 的帧数和字节数，未配置时返回零。设备采样率限于 `SampleRate` 列出的值，周期配置必须能得到整数 PCM 帧数。以 48 kHz / 5 ms 的图连接 44.1 kHz / 10 ms 设备为例，一块 441 帧的 PCM 在图内按 221 帧和 220 帧处理。
-- 调用方在各设备周期开始前用 `bind_pcm()` 绑定对应的整块缓冲，并保证它在接下来 `periods` 次引擎推进期间有效。适配器逐周期读写对应片段，设备周期结束后自动解除绑定，驱动可提交输出。上一块仍在使用时重新绑定返回 `BufferFull`。缺少输入时图得到静音，缺少输出缓冲时图继续推进。
-- 两个适配器公开继承 `NodeT`，各自保存借用的设备缓冲和一个 `PCMConverter`。适配器共用配置和绑定校验，转换器负责计算 PCM 切片和推进周期。输入先解码为设备声道的 float32，重采样后映射到图内声道。输出先映射到设备声道，再重采样和编码。Adapter 和图连接都用 `ChMatrix::mix_add()` 累加样本，尺寸在各自的配置入口校验。同采样率、空矩阵的 `F32LE` 保持样本位表示，小端单声道可以整块复制，多声道按布局重排。整数 PCM 在设备边界做归一化或量化。
-- **不新增缓冲延迟。** 解码、声道映射和编码在当前 `process()` 内完成，工作缓冲不跨周期排队。即使绑定了多个周期的 PCM，也逐周期直接写入输出，不等待整块计算结束。只有既有 sinc 重采样器带来 48 个源端帧的滤波延迟；本次声道映射和配置切换不叠加额外周期或帧延迟。
-- `reset()` 解除绑定、将周期索引归零并清除相位和滤波历史，保留设备配置。拔出设备时重置对应 Adapter，停止绑定数据；重新接入后配置新格式并绑定新缓冲。不调用全局 `Engine::reset()`，其他节点和引擎时间继续运行。
-- `configure_pcm()` 会分配和释放资源，必须在非音频线程执行，且与 `prepare()/bind_pcm()/reset()/process()` 串行。本阶段不提供并发配置或无停顿的后台状态交接。
+1. 对受影响的 Adapter、节点和总线调用 `set_paused(id, true)`，用一次 `prepare()` 提交暂停范围。等到 `applied_revision()` 确认后，这些节点停止渲染，相关连接暂时从计划移除，订阅停止接收新块。设备后端可结束旧设备缓冲的交接。其他分支继续运行，图内输入继续混合仍接入的来源。
+2. 在控制侧构造新的 Adapter，用 `replace_node(id, replacement)` 替换草稿。原节点 ID、连接和订阅保留。端口数量、方向和布局需要兼容，图内声道数保持相同。运行中的节点若尚未脱离计划，提交改变端口格式的草稿时 `prepare()` 返回 `Busy`。
+3. 调用 `set_paused(id, false)`，再用 `prepare()` 准备并提交恢复。Engine 等待受影响的在途回调，清空积压并按实际端口格式准备订阅缓冲。准备失败时该路径保持暂停。等到恢复版本生效，再按新 Adapter 的规格交接设备缓冲。其他分支继续渲染和交付。
 
-例如图内始终为 48 kHz、2ch，采集设备改为 16 kHz、1ch 时，调用方显式决定复制规则：
-
-```cpp
-const ChMatrix capture_matrix(2, 1, {1, 1});
-checked(input->configure_pcm({SampleRate::Hz16000, PCMFormat::S16LE, 1}, capture_matrix));
-// 下一次绑定使用 input->pcm_bytes() 对应的新规格；现有图连接保持不变。
-```
+暂停范围由控制侧指定。只改变播放 Adapter 的设备 PCM 时，通常只暂停该 Adapter。共享上游仍可为其他输出工作。恢复同一节点实例时，已准备的插件状态继续使用。需要平滑切换时，控制侧可先静音相关连接，确认淡出块已渲染后再暂停。恢复时保持静音，待计划生效后解除静音，使连接按块淡入。
 
 ### 后续设备后端的接入边界
 
-当前 Adapter 支持固定逻辑端口和串行设备格式切换。设备会话、I/O 和队列与图节点分离，可以继续用于 ALSA、文件或网络后端；接入真实设备还需要补齐以下能力。
+当前 Adapter 支持固定端口规格，Engine 通过块边界局部暂停和节点替换应用新格式。设备会话、I/O 和队列与图节点分离，可以继续用于 ALSA、文件或网络后端；接入真实设备还需要补齐以下能力。
 
 - **硬件收发与图周期解耦。** 例如 48 kHz 的 256 帧硬件周期不是 5 ms 图周期的整数倍。后端通过预分配的有界缓冲拼接和拆分数据，处理短读写，再向 Adapter 交付完整 PCM 块。`PCMSpec::periods` 表示这块数据的图周期数，不应直接等同于 ALSA 的硬件 period。ALSA 还支持非交错和 mmap 布局；当前接口只接收连续交错 PCM，其他布局由后端整理，后续有实际需求再扩展视图。[ALSA PCM 接口](https://www.alsa-project.org/alsa-doc/alsa-lib/pcm.html)与[读写接口说明](https://www.alsa-project.org/alsa-doc/alsa-lib/group___p_c_m.html)描述了这些布局和实际传输帧数。
 - **设备时钟适配。** 当前重采样按固定标称采样率转换，没有队列水位反馈，也不会修正两个同采样率设备的时钟漂移。真实多设备接入时，需要在边界支持根据缓冲水位微调转换比例，并报告欠载、溢出和数据缺口，不能只依赖现有固定比例转换器。
-- **恢复和连续性。** 当前可串行调用 `configure_pcm()` 切换设备规格，后续设备后端负责转换状态的跨线程交接。当前缺少绑定时不会推进转换器的滤波历史；流中断后重新绑定前应调用该 Adapter 的 `reset()`，或成功配置一份新转换状态。时间戳、缺口标记与会话代际尚未实现。
-- **缓冲所有权。** 当前绑定借用调用方内存，并要求与渲染串行操作。异步设备线程不能直接与 `process()` 并发调用 `bind_pcm()` 或 `reset()`；后续由后端队列完成所有权交接，再由渲染侧绑定。完成通知和停止屏障由运行内核提供。
+- **恢复和连续性。** 设备后端负责缓冲和设备会话的跨线程交接。可用节点替换应用新设备规格。继续使用同规格时，可以串行调用 Adapter 的 `reset()` 重新开始传输和滤波状态。当前 Observer 的时间戳和缺口以引擎帧表示，硬件时间戳和设备会话代际由后续设备后端提供。
+- **缓冲所有权。** 当前绑定借用调用方内存，绑定、重置与整个 tick 串行。后续由后端队列完成所有权交接，再由渲染侧绑定。完成通知和停止屏障由运行内核提供。
 
 上述扩展继续放在设备边界，不要求 Engine 识别 ALSA 或其他具体后端。当前实现尚不能直接充当完整的异步设备适配层。
 
@@ -268,7 +265,7 @@ ctest --test-dir build -C Debug --output-on-failure
 | `core` | `engine_graph_tests.cpp` | 只链接核心库，覆盖块视图、矩阵构造、运行时图规格、句柄、端口、反馈拒绝、准备重试和异常传播 |
 | `runtime` | `clocked_engine_tests.cpp` | 块边界提交、参数队列、计划回收、Observer 拼包与停止屏障 |
 | `routing` | `graph_routing_tests.cpp` | 经 Adapter 连接图外 `VirtualSource/VirtualSink`，验证路由、拓扑重建和跨设备周期 |
-| `adapter` | `pcm_adapter_tests.cpp` | 独立字节参照、PCM 量化与格式、缓冲绑定、图规格匹配、声道映射和脉冲延迟 |
+| `adapter` | `pcm_adapter_tests.cpp` | 独立字节参照、PCM 量化与格式、缓冲绑定、引擎周期、声道映射和脉冲延迟 |
 | `resampling` | `pcm_resampling_tests.cpp` | 正弦相位参照、分数周期、8–96 kHz 极端比例、滤波历史重置和抗混叠 |
 | `device` | `pcm_reconfiguration_tests.cpp` | 模拟采集和播放切换、旧缓冲解绑、稳定的节点身份和逻辑端口 |
 | `virtual` | `virtual_pcm_tests.cpp` | 发端 PCM 字节和独立时间线、收端报文所有权、端点配置校验 |

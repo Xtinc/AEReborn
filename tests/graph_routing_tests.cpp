@@ -208,12 +208,10 @@ void mixed_device_cadence()
     VirtualSink playback(playback_spec, render_period);
     checked(capture.prepare());
     checked(playback.prepare());
-    const auto input_id = checked(engine.emplace_node<IAdapter>(1, engine.spec()));
-    const auto output_id = checked(engine.emplace_node<OAdapter>(1, engine.spec()));
+    const auto input_id = checked(engine.emplace_node<IAdapter>(1, capture_spec));
+    const auto output_id = checked(engine.emplace_node<OAdapter>(1, playback_spec));
     auto *input = checked(engine.node<IAdapter>(input_id));
     auto *output = checked(engine.node<OAdapter>(output_id));
-    checked(input->configure_pcm(capture_spec));
-    checked(output->configure_pcm(playback_spec));
     Capture native(engine, 1, 431, 0.125f);
     Playback monitor(engine, 1);
     const auto bus = checked(engine.emplace_node<VirtualNode<>>());
@@ -272,9 +270,9 @@ void topology_rebuild()
     const auto processor = checked(engine.emplace_node<VirtualNode<>>());
     checked(engine.connect({input.id}, {processor}));
     checked(engine.connect({processor}, {main.id}));
+    checked(engine.prepare());
     input.generate();
     main.bind();
-    checked(engine.prepare());
     checked(clock.tick());
     main.receive();
     main.expect([](std::size_t frame, std::size_t) { return tone(997, 0.25, frame); });
@@ -288,8 +286,8 @@ void topology_rebuild()
     check(monitor.device.pcm().empty(), "Draft topology leaves the current route active");
     input.generate();
     main.bind();
-    monitor.bind();
     const auto revision = checked(engine.prepare());
+    monitor.bind();
     check(engine.applied_revision() != revision, "A submitted plan waits for the next block");
     checked(clock.tick());
     check(engine.applied_revision() == revision, "The next block applies the plan");

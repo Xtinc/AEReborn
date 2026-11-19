@@ -1,0 +1,3877 @@
+
+===== AudioEngine_Outline.md =====
+# AEReborn：音频引擎框架草案
+
+项目使用 C++14。时钟运行和 Observer 交付使用 standalone Asio。设备、文件和网络后端沿用本稿定义的运行边界。
+命名空间统一为 `aereborn`，方向类型采用 `IPort/OPort`、`IBlock/OBlock` 的对称命名。
+离线图和虚拟 PCM 路径已由第一阶段验证。第二阶段由时钟驱动同一套渲染逻辑，实际 API、运行约定和构建方法见第 7 节。
+
+## 1. 参考与取舍
+
+下面区分成熟引擎已有的设计，以及本项目据此作出的选择。参考设计思路，不引入这些引擎作为依赖。
+
+| 官方参考 | 可借鉴的设计 | 本项目的选择 |
+| --- | --- | --- |
+| [JUCE AudioProcessorGraph](https://docs.juce.com/master/classjuce_1_1AudioProcessorGraph.html) | 处理器组成节点图，通过通道连接；提供图重建机制 | 统一 Node/Port/Connection，将图描述编译为执行计划 |
+| [JACK 实时处理回调](https://jackaudio.org/api/group__ClientCallbacks.html) | 处理回调禁止内存分配及可能阻塞的 I/O、锁和等待 | 音频执行路径只处理已准备的数据，外部工作通过有界队列交换 |
+| [PipeWire 图运行](https://docs.pipewire.org/devel/page_running.html)、[调度](https://docs.pipewire.org/page_scheduling.html)、[时钟](https://docs.pipewire.org/page_man_pipewire-props_7.html) | 调度组选择 driver；配置与数据处理分离；区分设备时钟并适配 | 第一版只做一个渲染执行域、一个 ClockDriver，预留边界时钟适配 |
+| [FMOD 混音与连接](https://www.fmod.com/docs/2.04/api/mixing-and-routing-in-the-core-api.html)、[DSPConnection](https://www.fmod.com/docs/2.04/api/core-api-dspconnection.html) | 总线分组、子混音、效果处理；连接持有增益和声道矩阵 | Bus 可接 Bus；Connection 持有增益、静音和声道矩阵，处理器保持单一职责 |
+
+第一版不做多进程共享图、节点并行调度、插件宿主或完整 DAW 自动化系统。先实现能运行、能恢复、能验证的单进程引擎。
+
+## 2. 核心概念与节点实现
+
+Engine 只处理 Node、Port、Connection 三个核心概念。它拥有节点和连接，校验图、准备缓冲并按依赖顺序执行节点；不需要识别节点的具体业务角色。
+
+```text
+Node A 的 OPort ── Connection ──> Node B 的 IPort
+```
+
+| 对象 | 定位 |
+| --- | --- |
+| Node | 具有输入/输出端口的执行单元 |
+| Port | 节点上的多声道音频入口或出口，带声道布局 |
+| Connection | 输出端口到输入端口的有向连接，独立持有增益、静音和声道矩阵 |
+
+Port 按方向使用 `IPort/OPort` 引用。`PortSpec` 描述布局、采样率、声道数和样本格式。图内处理端口使用引擎规格的原生 planar float32。图内输入可以接多条连接，引擎逐周期应用增益和矩阵后求和。没有连接的图内输入得到静音。交错 PCM 端口通过设备边界交接，也可被订阅。
+一个 Port 表示一组声道，声道间的选择、复制、合并由 Connection 的矩阵表达。
+`NodeId/ConnId` 是类型化句柄，原型采用进程内不复用的唯一 ID。Node 不持有其他 Node 的共享所有权，也不各自维护连接列表或调度循环。
+
+Source、Processor、Mixer、Sink 是具体节点的用途。`plugins/` 中的 `IAdapter/OAdapter` 是图节点；`VirtualSource/VirtualSink` 模拟图外设备，只产生和接收指定格式的 PCM，由 Adapter 完成与引擎音频块之间的转换。
+
+| 用途 | 职责 | 当前实现 |
+| --- | --- | --- |
+| Source | 向图提供音频 | `IAdapter` |
+| Processor | 处理输入并产生输出 | 后续插件 |
+| Mixer | 将输入端口的混音结果转发到一个可供下游复用的输出 | 后续插件；当前输入端口已支持多连接求和 |
+| Sink | 消费图内音频 | `OAdapter` |
+
+PCM 适配器和固定端口数量的自定义节点通常继承 `NodeT<I, O>`，由它保存端口描述。节点在 `prepare(const EngineSpec &)` 中取得引擎规格。端口数量由运行时决定的节点可以直接继承 `Node`，通过 `inputs()/outputs()` 提供端口布局，端口布局在加入引擎后保持固定。
+后续设备、文件、网络、滤波等节点遵循同一边界。Bus 表示 Mixer 与效果节点构成的应用层总线，不是新的核心基类。
+
+### 从输出创建输入：直接复用端口
+
+任何 OPort 都能继续连接到其他节点，也能被订阅。Bus 可提供 PreEffects、PostEffects、PostFader 等命名输出位置，第一版先提供最终输出。
+监听总线输出只返回端口引用，不再引入 BusTapSource 类、虚拟设备或额外定时循环。
+编译器保证一个节点每个渲染块只执行一次，同一输出供多个下游只读使用；需要修改数据的下游使用自己的工作缓冲。
+
+这支持“输出作为另一个输入”，并且不依赖物理设备是否在线。系统全局回环录音则作为独立 CaptureSource 能力接入。
+第一版拒绝所有图内反馈环，校验同时覆盖音频与侧链依赖。
+
+## 3. 引擎骨架
+
+```text
+core/
+├── types.h / types.cpp        公共规格、图句柄、声道矩阵和基础类型实现
+├── block.h                    块视图与 Buffer 接口
+├── retcode.h                  错误码与带值结果接口
+├── graph.h                    Node、节点默认行为和固定端口数的 NodeT
+├── engine.h / engine.cpp      图编辑、计划提交与渲染
+└── runtime.h / runtime.cpp    内部队列、定时驱动与 Observer 交付
+plugins/
+├── adapter.h / adapter.cpp    PCM 输入和输出适配
+└── virtual.h / virtual.cpp    图外正弦 PCM 发端与原始 PCM 收端
+tests/
+├── engine_graph_tests.cpp        块、矩阵、图校验、准备重试和句柄
+├── clocked_engine_tests.cpp      图切换、参数队列、Observer 与停止屏障
+├── graph_routing_tests.cpp       使用虚拟端点和测试节点验证离线路由
+├── pcm_adapter_tests.cpp         PCM 格式、绑定、配置校验与声道映射
+├── pcm_resampling_tests.cpp      相位连续性、采样率比例和抗混叠
+├── pcm_reconfiguration_tests.cpp  虚拟设备切换和逻辑端口稳定性
+├── virtual_pcm_tests.cpp         虚拟 PCM 发端与收端的独立行为
+├── allocation_failure_tests.cpp  缓冲扩容和 PCM 配置的分配失败恢复
+└── support/                      用例入口、独立 PCM 参照和路由夹具
+examples/
+└── clocked_graph.cpp          定时时钟、音量更新与 Observer
+```
+
+`core/types.cpp` 集中实现缓冲、错误消息、图句柄和声道矩阵。`core/engine.cpp` 实现引擎生命周期。节点的默认行为、模板和 `constexpr` 函数定义放在头文件中。`aereborn::core` 是 CMake 静态库目标，提供核心实现和头文件路径。`aereborn::plugins` 提供 PCM 适配器和图外虚拟收发端点，并链接核心库。
+Engine 持有编辑图和渲染计划。`prepare()` 按节点依赖排序，为新计划分配缓冲并建立块视图。渲染侧在块边界切换到已准备的计划，并按计划顺序执行节点。
+固定端口数量通过 `NodeT<I, O>` 确定，端口描述使用 `std::array`。采样数据集中在图缓冲池，节点执行顺序和连接索引使用可复用的连续数组。
+`IBlock/OBlock` 分别是 `Block<const float>/Block<float>`，共享布局与寻址实现，只允许可写块转换为只读块。`ProcContext` 向节点借出计划中的块视图，供当前 `process()` 调用使用。
+编辑图的连接记录持有端口引用和参数。渲染计划将它们编译成块视图与连接区间，渲染侧直接处理已解析的连接。
+每个节点记录保存输入缓冲的连续采样区间；渲染阶段一次清零该区间，无需恢复声道数、逐声道清零或重新累加端口偏移。
+节点统一使用准备、处理、重置生命周期。后续设备、网络、文件的后台服务负责外部资源，其音频入口与出口由插件节点接入；服务不继承 Node，也不使用全局后台线程单例。
+
+### 图描述与音频执行分离
+
+```text
+编辑节点与连接 -> 校验并准备 -> 执行计划 -> 块边界切换
+参数更新 ---------------------------------> 块边界应用并平滑
+```
+
+执行计划保存内部节点执行顺序与连接索引。控制侧提交已准备的计划，渲染侧在块边界切换。
+音频侧使用已解析端口和分配好的缓冲，不遍历可变容器查找目标，也不现场建立连接。
+运行中的 DSP 状态仅由渲染侧修改。图更新时按稳定节点身份保留未改变的状态，避免每次连线都重置滤波器、播放位置和增益包络。
+旧计划及已移除状态在确认音频侧不再使用后，由非音频线程销毁。
+
+修改节点、连接和布局才重建计划。音量、静音、暂停、抑制目标等通过有界参数通道更新；增益在音频侧平滑，避免频繁重建和突变。
+参数绑定句柄及计划代际，过期更新不会误操作被复用的对象。第一版按块应用参数，不做逐采样自动化时间轴。
+
+## 4. 执行与时钟
+
+第一版只有一个串行渲染执行域：任意时刻只有一个执行上下文可以调用 render。
+选定的 ClockDriver 驱动整张图，其他设备仅通过边界适配器交换数据，不分别执行同一张图。
+引擎周期是运行时的基础节拍。当前 Adapter 的每块 PCM 覆盖整数个引擎周期；这是图边界的交付约定，不要求硬件周期也满足这个比例。后端负责将实际设备收发整理为该交付粒度，驱动按基础周期推进图。
+
+| 场景 | ClockDriver |
+| --- | --- |
+| 主设备周期等于引擎周期 | 该设备的音频回调或设备 I/O 线程可提供基础节拍 |
+| 设备周期覆盖多个引擎周期 | 由基础周期驱动器推进图，设备在各自的周期边界收发 |
+| 主设备掉线、纯网络或无物理设备 | 独立的 TimerDriver，保持逻辑时间推进 |
+| 确定性测试 | 测试时钟逐块触发 |
+
+主设备由显式配置或确定的选择策略指定，可以是采集或播放设备，不把某一方向写死为主时钟。
+主设备能提供基础节拍时，可以直接在其回调或设备线程执行渲染。
+主驱动切换须先确认旧驱动退出，再接管执行权；帧序号继续递增，并报告时钟切换或数据不连续。
+
+内部统一使用 planar float32。`Engine(sample_rate, block_period)` 构造时固定图规格，通过 `spec()` 按值返回 `EngineSpec`。创建 PCM 适配器时传入这份规格、图内端口声道数和设备侧 `PCMSpec`。
+`SampleRate` 提供 8000、11025、16000、22050、24000、32000、44100、48000、88200、96000 Hz 的枚举值。图采样率范围为 1 至 96000 Hz，`BlockPeriod` 支持 `Ms05`、`Ms10`、`Ms20` 和 `Ms40`。
+每周期帧数按 `采样率 × 周期毫秒 / 1000` 精确计算，通过 `engine.spec().block_frames()` 查询。例如 44.1 kHz / 10 ms 为 441 帧。44.1 kHz / 5 ms 无法得到整数帧，规格中的帧数为零，`Engine::prepare()` 返回 `InvalidArg`。
+引擎将规格传给节点的 `prepare(const EngineSpec &)`，节点可以据此准备算法资源。`ProcContext` 提供当前帧位置及输入输出块视图，块视图提供实际帧数。
+`ClockDriver` 每次触发一个完整图周期，包括已准备的空图。`Engine::start()` 在首次准备前返回 `NotPrepared`。默认时钟使用 standalone Asio 的单调定时器，遇到延误时跳过过期的定时期限，渲染帧位置只按实际处理的块推进。
+`IAdapter` 和 `OAdapter` 在每个图周期处理已绑定设备缓冲的一段 PCM。跨线程 PCM 缓冲交接由后续设备后端提供。
+
+从设备与引擎时钟不一致时，在边界做缓冲与自适应重采样。即使标称采样率相同，也不能默认两个设备共享时钟。
+
+### Asio 与实时处理的边界
+
+Asio 负责控制命令、UDP I/O、设备事件、恢复定时及非实时任务协调。
+设备打开/关闭、文件访问、编解码和应用回调都在非渲染路径完成。设备必要的实时缓冲交付由平台后端封装。
+音频路径不分配/释放堆内存，不等待互斥锁，不打印日志，不调用普通应用回调，也不依赖一次 asio::post 在截止时间前完成。
+
+```text
+Asio 控制执行器 ──> 计划/参数 ──> 渲染路径
+从设备 / 网络 / 文件 ──> 有界队列 ──> 音频入口节点
+音频出口节点 ──> 有界队列 ──> 从设备 / 网络 / 文件
+观测点 ──> 有界订阅队列 ──> 用户回调执行器
+```
+
+队列预先明确单/多生产者归属、容量和满队列行为。活跃数据流不允许无限堆积；慢订阅只影响自身，录音写入跟不上时报告可观测的数据缺口。
+调用停止或取消订阅的完成通知代表相关处理已经退出；不能仅取消定时器就释放仍在使用的对象。
+
+## 5. 外部资源与恢复
+
+逻辑端点长期存在，物理句柄归 DeviceSession。DeviceService 分开维护设备清单、选择策略与运行会话。
+选择可以是固定设备、跟随系统默认、优先某类设备；不在收到任意插入事件后立即抢占当前设备。
+设备身份使用平台稳定标识及匹配规则，不依赖枚举序号永久不变。
+
+```text
+逻辑意图：Running / Paused / Stopped
+资源状态：WaitingDevice -> Opening -> Ready -> Recovering / Failed
+```
+
+两组状态分别维护：恢复完成仍要服从用户当前意图。
+掉线期间保留图、音量、订阅和连接；缺失采集数据补静音并标记，输出设备不可用时丢弃该设备数据，总线及其他下游继续处理。
+可就地恢复的欠载由后端处理；需重开、等待设备、不可恢复的配置错误由统一恢复策略区分。
+重试带退避和取消，主动定期重开也是同一策略的选项。会话代际编号屏蔽过期打开结果与旧设备数据。
+
+同一设备的兼容逻辑端点共享 DeviceSession。播放侧明确汇入该设备的最终混音节点，再交给唯一设备写入者；独占或格式冲突明确报错。
+设备协商格式与逻辑音频格式分离，恢复不改变应用看到的端口布局；适配不了时报告端点失败。
+
+网络与文件复用相同入口/出口节点机制：
+
+- NetworkSource：会话识别、乱序整理、按播放期限解码/FEC/PLC，再交付音频。NetworkSink：排队、编码、发送。先 PCM，后 Opus；协议独立版本化。
+- FileSource：工作线程预读，独立 PlaybackHandle 管理循环、暂停和停止。FileSink：排队写入，支持分段保存。
+- PushSource：应用显式推入带格式、帧时间和连续性信息的音频，接口报告接收数量或队列满。
+- Observer：订阅输入或输出端口，按该端口的格式取得数据，回调携带帧时间及缺口标记。它跟随引擎时钟。
+
+## 6. 混音策略归属
+
+Bus 负责混音与分组控制，Connection 描述输入角色；抑制策略根据 Voice、Music、Alert 等角色决定目标增益。
+策略最终产生独立的增益包络处理，不把角色判断散落到设备、网络或所有节点的 process 中。
+
+```text
+Connection 增益/矩阵 -> Bus 混音 -> 效果链 -> 总线音量 -> 最终输出
+                         ↑
+                  MixPolicy / 侧链检测
+```
+
+普通相加是默认策略，ducking 是可配置策略，具有 attack、hold、release。
+策略明确按“有效帧”“能量”还是“语音活动”触发；补出的静音、暂停或断流不算活动。
+同一 Source 在不同 Connection 中可以有不同角色。同一处理器接口可表达限幅、滤波及带参考输入的自适应滤波，不为每种算法扩展 Engine API。
+
+## 7. 时钟运行 API
+
+应用按顺序创建 Engine、编辑图并调用 `prepare()`，然后用 `start()` 启动时钟。完整示例演示图内信号、音量更新、Observer 和停止。[时钟运行示例](examples/clocked_graph.cpp)
+
+- 图编辑修改待提交的图。`prepare()` 返回提交的计划版本。停止时立即应用计划，运行时在后续块边界应用，`applied_revision()` 可查询实际版本。图准备失败时，时钟继续驱动当前计划。
+- Sink、带 PCM 输出的节点和被订阅的节点都是依赖遍历的根。每个节点按依赖顺序执行一次，修改连接时保留同一节点的 DSP 状态。新计划回收旧计划前，控制线程等候渲染侧确认。
+- `set_gain()` 和 `set_muted()` 将有效增益提交到一个容量为 64 的命令队列，下一块从当前值线性过渡到目标值。运行期间最多有一个待应用计划。队列或提交槽满时返回 `BufferFull`，调用方可以重试。
+- 控制调用由应用串行发起。运行中，节点实例和 Adapter 缓冲由驱动的执行域独占。Observer 和节点回调可查询 `frame_position()` 与 `applied_revision()`，同步修改或停止 Engine 会返回 `Busy`。
+- `stop()` 等待时钟和回调退出，应用已接收的命令并清空待交付数据。重启延续帧位置、图状态和仍注册的订阅。应用可在停止后通过 `reset()` 将帧位置和 DSP 状态归零。
+- 自定义节点在 `prepare(const EngineSpec &)` 中准备资源，使用 `ProcContext` 的输入输出块视图处理实际帧数。可预期失败通过 `RetCode` 或 `Result<T>` 返回，控制侧分配失败及节点构造、准备时抛出的异常传给调用方。
+
+### 端口与 Observer
+
+- `port_spec(IPort{node, index})` 和 `port_spec(OPort{node, index})` 查询编辑图的端口描述。图内端口的采样率来自 `EngineSpec`，布局为 `PlanarFloat`。设备侧端口的布局为 `InterleavedPCM`，`PortSpec::spec` 包含实际的 PCM 规格。
+- `subscribe(port, ObserverOptions, callback)` 同时接受 `IPort` 与 `OPort`。订阅在计划提交后生效。`IPort` 交付实际输入，图内端口已应用连接增益、矩阵和多路混音。`OPort` 交付节点产出的数据。
+- Observer 按端口实际格式交付。回调通过 `Observation::port` 取得本批的格式，通过 `audio` 读取 planar float32，或通过 `pcm` 读取原始交错字节。视图在回调期间有效。共享 Asio 定时器当前固定为 30 Hz，`ObserverOptions::interval` 可填写目标间隔，暂用于保留接口。每次到期交付当时可用的连续数据，长度由实际收到的块决定，空队列跳过回调。
+- 每个订阅持有一个预分配的连续环形缓冲，默认容纳八个引擎块。引擎把本块数据直接写给订阅。缓冲满或正在被读取时，写入可以放弃当前块。`dropped_frames` 是自上一批结束以来缺少的引擎帧数，也覆盖采集中断和格式切换时丢弃的积压。新批次的 `frame_position` 始终指向实际交付数据。
+- Engine 为首个含订阅的运行计划按需创建两个共享 Asio worker。同一订阅随计划生效后串行交付，回调在缓冲锁外运行。两个 worker 都被占用时，其他订阅等待空闲 worker。`unsubscribe()` 等待该订阅的在途回调和数据写入结束。回调抛出异常后停止交付，调用方仍可取消订阅。
+
+### 固定规格的 PCM Adapter
+
+`IAdapter(channels, engine.spec(), pcm_spec, matrix)` 和 `OAdapter(channels, engine.spec(), pcm_spec, matrix)` 均有一个输入和一个输出。采集方向是交错 PCM → planar float32，播放方向相反。四个端口均可通过同一个接口订阅，例如 `subscribe(OPort{playback_id}, {}, callback)` 交付实际编码的播放 PCM。 `PCMSpec::periods` 是一次设备缓冲交接覆盖的图周期数。
+
+- `prepare()` 校验构造规格、矩阵与周期，分配单周期 PCM 端口缓冲和转换工作区。端口规格随转换实例固定。矩阵以目标声道为行、源声道为列。空矩阵要求两端声道数相同。
+- `pcm_frames()` 和 `pcm_bytes()` 在准备后给出一次设备交接的大小。设备缓冲跨 `periods` 次处理保持有效。已有缓冲尚未消耗完时，`bind_pcm()` 返回 `BufferFull`。调用方与渲染串行交接。48 kHz / 5 ms 图接 44.1 kHz / 10 ms 设备时，441 帧的 PCM 分为 221 和 220 帧两个周期切片。
+- 采集将本周期的设备字节放入 PCM 输入端口，然后解码、按需重采样并映射到图内声道。缺少设备输入时，图内输出静音，PCM 订阅在恢复后能看到缺口。播放将混音后的图内样本映射、重采样并编码一次，把本周期的 PCM 输出交给订阅和已绑定设备缓冲。只订阅播放输出时也能取得 PCM。
+- PCM 端口支持交错 `S16LE`、`S24_3LE`、`S24LE`、`S32LE` 和 `F32LE`。`pcm_sample_bits()` 与 `pcm_sample_bytes()` 分别描述有效位数和存储宽度。转换在当前周期完成。
+
+### 局部暂停与更换设备规格
+
+1. 对受影响的 Adapter、节点和总线调用 `set_paused(id, true)`，用一次 `prepare()` 提交暂停范围。等到 `applied_revision()` 确认后，这些节点停止渲染，相关连接暂时从计划移除，订阅停止接收新块。设备后端可结束旧设备缓冲的交接。其他分支继续运行，图内输入继续混合仍接入的来源。
+2. 在控制侧构造新的 Adapter，用 `replace_node(id, replacement)` 替换草稿。原节点 ID、连接和订阅保留。端口数量、方向和布局需要兼容，图内声道数保持相同。运行中的节点若尚未脱离计划，提交改变端口格式的草稿时 `prepare()` 返回 `Busy`。
+3. 调用 `set_paused(id, false)`，再用 `prepare()` 准备并提交恢复。Engine 等待受影响的在途回调，清空积压并按实际端口格式准备订阅缓冲。准备失败时该路径保持暂停。等到恢复版本生效，再按新 Adapter 的规格交接设备缓冲。其他分支继续渲染和交付。
+
+暂停范围由控制侧指定。只改变播放 Adapter 的设备 PCM 时，通常只暂停该 Adapter。共享上游仍可为其他输出工作。恢复同一节点实例时，已准备的插件状态继续使用。
+
+### 后续设备后端的接入边界
+
+当前 Adapter 支持固定端口规格，Engine 通过块边界局部暂停和节点替换应用新格式。设备会话、I/O 和队列与图节点分离，可以继续用于 ALSA、文件或网络后端；接入真实设备还需要补齐以下能力。
+
+- **硬件收发与图周期解耦。** 例如 48 kHz 的 256 帧硬件周期不是 5 ms 图周期的整数倍。后端通过预分配的有界缓冲拼接和拆分数据，处理短读写，再向 Adapter 交付完整 PCM 块。`PCMSpec::periods` 表示这块数据的图周期数，不应直接等同于 ALSA 的硬件 period。ALSA 还支持非交错和 mmap 布局；当前接口只接收连续交错 PCM，其他布局由后端整理，后续有实际需求再扩展视图。[ALSA PCM 接口](https://www.alsa-project.org/alsa-doc/alsa-lib/pcm.html)与[读写接口说明](https://www.alsa-project.org/alsa-doc/alsa-lib/group___p_c_m.html)描述了这些布局和实际传输帧数。
+- **设备时钟适配。** 当前重采样按固定标称采样率转换，没有队列水位反馈，也不会修正两个同采样率设备的时钟漂移。真实多设备接入时，需要在边界支持根据缓冲水位微调转换比例，并报告欠载、溢出和数据缺口，不能只依赖现有固定比例转换器。
+- **恢复和连续性。** 设备后端负责缓冲和设备会话的跨线程交接。可用节点替换应用新设备规格。继续使用同规格时，可以串行调用 Adapter 的 `reset()` 重新开始传输和滤波状态。当前 Observer 的时间戳和缺口以引擎帧表示，硬件时间戳和设备会话代际由后续设备后端提供。
+- **缓冲所有权。** 当前绑定借用调用方内存，并要求与渲染串行操作。异步设备线程不能直接与 `process()` 并发调用 `bind_pcm()` 或 `reset()`；后续由后端队列完成所有权交接，再由渲染侧绑定。完成通知和停止屏障由运行内核提供。
+
+上述扩展继续放在设备边界，不要求 Engine 识别 ALSA 或其他具体后端。当前实现尚不能直接充当完整的异步设备适配层。
+
+### 图外虚拟 PCM 端点
+
+`plugins/virtual.h` 提供非模板类 `VirtualSource` 和 `VirtualSink`，两者都不继承 `Node` 或 `PCMConverter`。它们接收 `PCMSpec` 和引擎周期，用设备采样率、格式、声道数和跨越的引擎周期数确定一包交错 PCM 的布局。
+
+`VirtualSource::generate()` 按自身连续的采样位置直接生成指定格式的正弦 PCM，通过 `pcm()` 借出一整包数据，不依赖引擎的帧位置。调用方将这包数据绑定到 `IAdapter`，在其消耗完之前不再生成下一包。源端 `reset()` 才会重启正弦波时间位置，单独重置引擎不影响源端。
+
+`OAdapter` 将图内音频转换到调用方绑定的 PCM 缓冲，完成 `periods` 次引擎推进后，调用方将整包交给 `VirtualSink::receive()` 保存。收端不解码、不重采样；`matches(expected)` 逐字节比较最近收到的 PCM。需要验证混音或重采样时，测试独立计算采样参照与误差，避免使用待验证的转换器生成参照。
+
+构建需要 standalone Asio。CMake 优先搜索仓库根目录下的 `asio-1.30.2/include`。其他位置可通过 `-DASIO_INCLUDE_DIR=<头文件目录>` 指定。
+
+构建与验证（Visual Studio 多配置生成器）：
+
+```powershell
+cmake -S . -B build -DBUILD_TESTING=ON
+cmake --build build --config Debug --parallel
+ctest --test-dir build -C Debug --output-on-failure
+```
+
+使用 PCM 适配器或虚拟端点的应用链接 `aereborn::plugins`，自定义节点可以只链接 `aereborn::core`。
+
+测试源文件按验证对象命名，统一使用小写下划线和 `_tests.cpp` 后缀。共用的断言、PCM 参照和路由夹具放在 `tests/support/`。每个用例独立注册为 CTest 的 `组名.场景名`，并使用组名作为 label。
+
+| 分组 | 源文件 | 验证边界 |
+| --- | --- | --- |
+| `core` | `engine_graph_tests.cpp` | 只链接核心库，覆盖块视图、矩阵构造、运行时图规格、句柄、端口、反馈拒绝、准备重试和异常传播 |
+| `runtime` | `clocked_engine_tests.cpp` | 块边界提交、参数队列、计划回收、Observer 拼包与停止屏障 |
+| `routing` | `graph_routing_tests.cpp` | 经 Adapter 连接图外 `VirtualSource/VirtualSink`，验证路由、拓扑重建和跨设备周期 |
+| `adapter` | `pcm_adapter_tests.cpp` | 独立字节参照、PCM 量化与格式、缓冲绑定、图规格匹配、声道映射和脉冲延迟 |
+| `resampling` | `pcm_resampling_tests.cpp` | 正弦相位参照、分数周期、8–96 kHz 极端比例、滤波历史重置和抗混叠 |
+| `device` | `pcm_reconfiguration_tests.cpp` | 模拟采集和播放切换、旧缓冲解绑、稳定的节点身份和逻辑端口 |
+| `virtual` | `virtual_pcm_tests.cpp` | 发端 PCM 字节和独立时间线、收端报文所有权、端点配置校验 |
+| `allocation` | `allocation_failure_tests.cpp` | 分配失败后的状态保留与渲染过程中无堆分配或释放 |
+| `example` | `examples/clocked_graph.cpp` | 构建并运行可独立使用的示例 |
+
+`routing` 覆盖一对一、一对多、多对一、多对多、处理器串联、Bus 串联、效果前后输出监听、多输入输出端口、声道矩阵、缺失端点和不同设备周期。输出与独立计算的正弦叠加、增益和矩阵结果比较，并检查共享节点每周期只执行一次。虚拟路由测试使用手动时钟逐块驱动。设备线程、系统回环和热插拔服务在设备后端阶段接入。
+
+MSVC Debug 的标准容器会在 `noexcept` 构造内分配迭代器代理，因此分配失败注入在该配置下显式标记为跳过，在 Release 中完整执行。无效参数、容量超限和失败状态保留在两种配置下均验证。
+
+可以单独执行一个分组或场景：
+
+```powershell
+ctest --test-dir build -C Debug -L routing --output-on-failure
+ctest --test-dir build -C Debug -R '^core.feedback_rejection$' --output-on-failure
+ctest --test-dir build -C Release -L allocation --output-on-failure
+```
+
+示例由 `BUILD_EXAMPLES` 控制，默认开启，也会作为 `example.clocked_graph` 加入 CTest。关闭测试后仍可独立构建和运行示例：
+
+```powershell
+cmake -S . -B build/examples-only -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=ON
+cmake --build build/examples-only --config Debug --parallel
+./build/examples-only/examples/Debug/clocked_graph.exe
+```
+
+## 8. 实现顺序
+
+1. **离线图核心**：Node、Port、Connection、音频块及 Engine 的准备与执行。用插件节点验证多对多、处理器串联、总线互连、输出分发、环路拒绝。
+2. **运行内核**：ClockDriver、块边界计划切换、参数更新、有界队列、Observer、停止屏障。验证调音量不重建图，修改连接不重置未变节点的状态。
+3. **一个平台的设备闭环**：主设备驱动、多设备边界适配、DeviceSession、热插拔与恢复。验证同一张图只被一个驱动执行，拔插不破坏其他连接；再接另一个平台。
+4. **文件、推入和混音策略**：预读/录制、PlaybackHandle、PushSource、DSP 链、ducking。验证多实例、循环、过载报告和增益包络。
+5. **网络**：先 PCM，再 Opus、乱序/抖动缓冲与丢包恢复；验证本地与远程源进入同一 Bus，断网后有界退化并恢复。
+
+第一步先写少量核心类型和离线执行，不接系统设备，不启动 Asio 线程。每一步复用同一张图与同一套节点执行机制。
+
+第一步的验收用例包括 `core.audio_block_layout`、`core.prepare_retry`、`routing.many_to_many`、`routing.processor_chain`、`routing.bus_chain_and_taps`、`routing.one_to_many` 和 `core.feedback_rejection`。路由走实际的 PCM Adapter，处理器和总线由测试节点提供。
+
+第二步的验收覆盖 `runtime` 用例、`allocation.render_uses_prepared_buffers` 和 `example.clocked_graph`。
+
+===== CODING_GUIDELINES.md =====
+# AEReborn 编程约束
+
+## 1. 命名
+
+**变量名用能清楚表达含义的最短写法。** 缩写应当能从组合词或局部上下文直接读懂。需要查注释才能知道变量指什么时，用全称。
+
+| 场景 | 写法 |
+| --- | --- |
+| 连接 | 单独指一个连接时用 `connection`。组合词可用 `conn`，如 `conn_id`、`conn_count`。 |
+| 声道 | 声道循环的索引用 `ch`。声明端口时用 `channels` 表示声道数，用 `input_channels`、`output_channels` 区分方向。 |
+| 采样率 | 配置和公开接口用 `sample_rate`。重采样内部可以用常见的 DSP 记号 `src_fs`、`dst_fs`。 |
+| 帧、采样点、字节 | 根据单位使用 `frames`、`samples`、`bytes`。含义可能混淆时，用 `frame_offset`、`byte_offset` 或 `period_ms` 写明单位。 |
+
+- **成对的变量保持对称。** 用同一组方向词、相同的后缀和缩写程度，例如 `src_fs` / `dst_fs`、`input_channels` / `output_channels`、`from` / `to`。同一个值在相邻函数中沿用同一术语。
+- **名字反映变量的用途。** `conn_count` 是数量，`conn_index` 是索引。短循环可以用 `i` 和 `ch`，跨多个步骤使用的变量写明角色，例如 `frame_offset`。
+- **沿用项目的拼写风格。** 局部变量、参数和函数用 `snake_case`，私有成员变量在末尾加 `_`，如 `frame_position_`。类型和枚举值通常用 `PascalCase`，例如 `ConnId`、`ErrorCode::InvalidPort`。PCM 枚举沿用 `S16LE`、`S24_3LE`、`F32LE` 这样的格式名。
+
+## 2. 类型与接口
+
+- 优先复用现有类型。只有在需要表达独立的含义、约束、所有权或生命周期时才引入新类型。单纯的数量和索引使用现有整数类型。
+- 一项规格只保留一个定义来源。采样率和 PCM 格式由 `core/types.h` 提供，样本位深和存储字节数从 `PCMFormat` 推导。节点声明端口布局与声道数，设备侧端口还声明实际 PCM 规格。
+- 函数名和参数顺序应能直接说明调用方向。底层函数、辅助记录和临时状态放在使用它们的实现范围内。对外接口集中表达调用方需要配置、传递或查询的内容。
+- 保持调用路径直接。抽取能消除重复、集中维护同一约束的逻辑，优先选用普通函数和直接的成员状态。模板用于确有编译期差异的场景，例如固定端口数量。采样率和处理周期作为运行时规格传递。
+
+## 3. 错误处理
+
+- 参数、状态和容量校验等可预期的操作失败通过 `RetCode` 返回，需要同时返回结果时用 `Result<T>`。检查成功后再读 `value()`。
+- 标准库的分配异常和自定义节点在构造或准备时抛出的异常交由调用方处理。构造函数可以抛异常来维护对象不变量。会分配资源或调用可抛异常代码的控制侧接口允许异常传播，实时 `process()` 保持 `noexcept`。
+- 在建立约束的入口做校验。连接时检查端口和矩阵尺寸，绑定设备缓冲时检查长度与占用状态。处理路径直接使用已经校验和准备好的数据。
+- 资源准备成功后再发布可用状态。失败时保留有效状态，使调用方可以重试。内部不变量可以用断言表达。
+
+## 4. 音频处理
+
+- 每次时钟触发推进一个固定的引擎周期。节点写满输出块，输入由引擎清零并累加各条连接。矩阵的行对应目标输入声道，列对应源输出声道。
+- 引擎内部使用按声道存放的 IEEE float32。设备 PCM 的格式和采样率转换放在 Adapter 边界。同采样率的 float32 保持样本的位表示，只做复制和必要的布局、字节序调整。
+- 在 `prepare()` 中分配缓冲并准备滤波等资源。把阻塞 I/O、锁等待、日志和堆分配放在实时处理路径之外。接口借用缓冲时，应写清谁持有缓冲以及它需要保持有效的时间。
+
+## 5. 修改与验证
+
+- 使用 C++14。修改集中在受影响的接口和实现，沿用周围代码的风格。注释优先说明约束和原因。
+- 沿实际调用入口验证改动。优先复用现有测试，在现有测试覆盖不到具体回归时补充用例。音频转换和图处理的边界用实际帧数、声道数和输出值验证。
+- 路由测试用图外 `VirtualSource/VirtualSink` 经 Adapter 收发，中间节点使用测试目录中的虚拟处理器。格式转换使用独立的字节参照，混音和重采样使用独立的数值参照。测试按职责分组、每个场景独立注册到 CTest；共用准备和断言工具，不复制路由驱动逻辑。
+
+项目的接口、处理流程和构建方法见 [AudioEngine_Outline.md](AudioEngine_Outline.md)。
+
+===== CMakeLists.txt =====
+cmake_minimum_required(VERSION 3.16)
+
+project(aereborn VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+find_path(ASIO_INCLUDE_DIR asio.hpp HINTS "${CMAKE_CURRENT_SOURCE_DIR}/asio-1.30.2/include")
+if(NOT EXISTS "${ASIO_INCLUDE_DIR}/asio.hpp")
+    message(FATAL_ERROR "Standalone Asio is required. Provide asio-1.30.2/include or set ASIO_INCLUDE_DIR.")
+endif()
+find_package(Threads REQUIRED)
+
+add_library(aereborn_core STATIC
+    core/engine.cpp
+    core/runtime.cpp
+    core/types.cpp
+)
+add_library(aereborn::core ALIAS aereborn_core)
+
+target_include_directories(aereborn_core
+    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+target_include_directories(aereborn_core SYSTEM PRIVATE "${ASIO_INCLUDE_DIR}")
+target_compile_definitions(aereborn_core PRIVATE ASIO_STANDALONE)
+target_link_libraries(aereborn_core PRIVATE Threads::Threads)
+if(WIN32)
+    target_link_libraries(aereborn_core PRIVATE ws2_32 mswsock)
+endif()
+
+add_library(aereborn_plugins STATIC
+    plugins/adapter.cpp
+    plugins/adapter.h
+    plugins/virtual.h
+    plugins/virtual.cpp
+)
+add_library(aereborn::plugins ALIAS aereborn_plugins)
+target_link_libraries(aereborn_plugins PUBLIC aereborn::core)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()
+
+option(BUILD_EXAMPLES "Build AEReborn examples" ON)
+if(BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()
+
+===== core/block.h =====
+#ifndef AEREBORN_CORE_BLOCK_H
+#define AEREBORN_CORE_BLOCK_H
+
+#include "retcode.h"
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <limits>
+#include <type_traits>
+#include <vector>
+
+namespace aereborn
+{
+// Non-owning view. A nonempty view refers to a valid contiguous range.
+template <class T> class View
+{
+  public:
+    View(T *data, std::size_t size) noexcept : data_(data), size_(size)
+    {
+    }
+    template <class U, typename std::enable_if<std::is_convertible<U (*)[], T (*)[]>::value, int>::type = 0>
+    View(View<U> other) noexcept : data_(other.data()), size_(other.size())
+    {
+    }
+    T *data() const noexcept
+    {
+        return data_;
+    }
+    std::size_t size() const noexcept
+    {
+        return size_;
+    }
+    bool empty() const noexcept
+    {
+        return size_ == 0;
+    }
+    T *begin() const noexcept
+    {
+        return data_;
+    }
+    T *end() const noexcept
+    {
+        return size_ == 0 ? data_ : data_ + size_;
+    }
+    T &operator[](std::size_t index) const noexcept
+    {
+        assert(index < size_);
+        return data_[index];
+    }
+
+  private:
+    T *data_;
+    std::size_t size_;
+};
+
+static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559, "Audio samples require IEEE float32");
+
+// Non-owning planar views. frames() is the processing span, including any padded tail.
+template <class T> class Block
+{
+    static_assert(std::is_same<typename std::remove_const<T>::type, float>::value, "Audio samples must be float");
+    template <class> friend class Block;
+
+  public:
+    Block() noexcept = default;
+    Block(T *data, std::size_t channels, std::size_t frames, std::size_t channel_stride) noexcept
+        : data_(data), channels_(channels), frames_(frames), channel_stride_(channel_stride)
+    {
+        assert(frames <= channel_stride);
+    }
+    template <class U, typename std::enable_if<std::is_convertible<U *, T *>::value, int>::type = 0>
+    Block(Block<U> other) noexcept
+        : data_(other.data_), channels_(other.channels_), frames_(other.frames_), channel_stride_(other.channel_stride_)
+    {
+    }
+    T *channel(std::size_t ch) const noexcept
+    {
+        assert(ch < channels_);
+        return data_ + ch * channel_stride_;
+    }
+    std::size_t channels() const noexcept
+    {
+        return channels_;
+    }
+    std::size_t frames() const noexcept
+    {
+        return frames_;
+    }
+    template <class U = T, typename std::enable_if<!std::is_const<U>::value, int>::type = 0> void clear() const noexcept
+    {
+        for (std::size_t ch = 0; ch < channels_; ++ch)
+        {
+            std::fill_n(channel(ch), frames_, 0.0f);
+        }
+    }
+
+  private:
+    T *data_ = nullptr;
+    std::size_t channels_ = 0;
+    std::size_t frames_ = 0;
+    std::size_t channel_stride_ = 0;
+};
+
+using IBlock = Block<const float>;
+using OBlock = Block<float>;
+
+// Allocation belongs to construction/preparation, never to block processing.
+class Buffer
+{
+  public:
+    RetCode resize(std::size_t channels, std::size_t capacity_frames);
+    OBlock block(std::size_t frames) noexcept;
+    std::size_t capacity_frames() const noexcept;
+
+  private:
+    std::vector<float> samples_;
+    std::size_t channels_ = 0;
+    std::size_t capacity_frames_ = 0;
+};
+
+} // namespace aereborn
+
+#endif // AEREBORN_CORE_BLOCK_H
+
+===== core/engine.cpp =====
+#include "engine.h"
+#include "runtime.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <map>
+#include <mutex>
+#include <set>
+#include <tuple>
+
+namespace aereborn
+{
+namespace
+{
+
+std::uint64_t get_next_identifier() noexcept
+{
+    static std::atomic<std::uint64_t> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+struct GraphNode
+{
+    explicit GraphNode(std::unique_ptr<Node> instance) : node(std::move(instance))
+    {
+        const auto in = node->inputs();
+        const auto out = node->outputs();
+        if (!in.empty())
+        {
+            inputs.assign(in.begin(), in.end());
+        }
+        if (!out.empty())
+        {
+            outputs.assign(out.begin(), out.end());
+        }
+    }
+
+    const std::vector<PortSpec> &ports(PortDirection direction) const noexcept
+    {
+        return direction == PortDirection::Input ? inputs : outputs;
+    }
+
+    std::unique_ptr<Node> node;
+    std::vector<PortSpec> inputs;
+    std::vector<PortSpec> outputs;
+    bool prepared = false;
+};
+
+struct Connection
+{
+    OPort from;
+    IPort to;
+    ConnOpts options;
+};
+
+struct Subscription
+{
+    ObservationPort port;
+    std::shared_ptr<ObserverDelivery> delivery;
+};
+
+struct PlanConnection
+{
+    IBlock source;
+    OBlock destination;
+    ChMatrix matrix;
+    float gain;
+    float target;
+    std::size_t previous;
+};
+
+struct PlanNode
+{
+    NodeId id;
+    std::shared_ptr<GraphNode> entry;
+    std::vector<IBlock> inputs;
+    std::vector<OBlock> outputs;
+    View<float> input_samples{nullptr, 0};
+    std::size_t first_connection = 0;
+    std::size_t connection_count = 0;
+};
+
+struct PlanObserver
+{
+    std::shared_ptr<ObserverDelivery> delivery;
+    IBlock source;
+    const Node *pcm_node;
+    ObservationPort port;
+};
+
+struct ObserverUpdate
+{
+    ObserverDelivery *delivery;
+    ObserverDelivery::Format format;
+};
+
+struct RenderPlan
+{
+    static constexpr auto no_connection = std::numeric_limits<std::size_t>::max();
+
+    PlanRevision revision = 0;
+    std::vector<PlanNode> nodes;
+    std::vector<PlanConnection> connections;
+    std::vector<PlanObserver> observers;
+    std::vector<std::shared_ptr<ObserverDelivery>> paused_observers;
+    std::vector<float> samples;
+    std::map<NodeId, std::size_t> node_index;
+    std::map<ConnId, std::size_t> connection_index;
+
+    void start_observers() noexcept
+    {
+        for (const auto &observer : observers)
+        {
+            observer.delivery->start();
+        }
+    }
+
+    void render(std::uint64_t frame) noexcept
+    {
+        for (const auto &item : nodes)
+        {
+            std::fill(item.input_samples.begin(), item.input_samples.end(), 0.0f);
+            for (std::size_t i = item.first_connection; i < item.first_connection + item.connection_count; ++i)
+            {
+                auto &connection = connections[i];
+                if (connection.gain != connection.target)
+                {
+                    connection.matrix.mix_ramp_add(connection.source, connection.destination,
+                                                   connection.gain, connection.target);
+                    connection.gain = connection.target;
+                }
+                else if (connection.gain != 0.0f)
+                {
+                    connection.matrix.mix_add(connection.source, connection.destination, connection.gain);
+                }
+            }
+            item.entry->node->process({frame, {item.inputs.data(), item.inputs.size()},
+                                       {item.outputs.data(), item.outputs.size()}});
+        }
+        for (const auto &observer : observers)
+        {
+            if (observer.pcm_node)
+            {
+                const auto bytes = observer.pcm_node->pcm_block(observer.port.direction, observer.port.index);
+                observer.delivery->write(bytes, frame);
+            }
+            else
+            {
+                observer.delivery->write(observer.source, frame);
+            }
+        }
+    }
+};
+
+struct Command
+{
+    RenderPlan *plan = nullptr;
+    PlanConnection *connection = nullptr;
+    float gain = 0.0f;
+};
+
+using ConnectionEntry = std::pair<const ConnId, Connection>;
+using Incoming = std::map<NodeId, std::vector<const ConnectionEntry *>>;
+
+float effective_gain(float gain, bool muted) noexcept
+{
+    return muted ? 0.0f : gain;
+}
+
+} // namespace
+
+struct Engine::Runtime
+{
+    explicit Runtime(EngineSpec spec) : spec(spec)
+    {
+    }
+
+    const EngineSpec spec;
+    std::map<NodeId, std::shared_ptr<GraphNode>> nodes;
+    std::map<ConnId, Connection> connections;
+    std::map<ObserverId, Subscription> subscriptions;
+    std::set<NodeId> paused_nodes;
+    std::unique_ptr<RenderPlan> current;
+    std::unique_ptr<RenderPlan> pending;
+    std::mutex plans_mutex; // Only the control caller and the reclamation task use this mutex.
+    RenderPlan *active = nullptr; // Accessed only by the driver, or by control after the driver has joined.
+    std::unique_ptr<ClockDriver> driver;
+    std::unique_ptr<RuntimeTask> maintenance;
+    std::unique_ptr<ObserverWorkers> observer_workers;
+    SpscRing<Command> commands{64};
+    std::atomic<PlanRevision> applied{0};
+    std::atomic<std::uint64_t> position{0};
+    bool dirty = true;
+
+    bool on_execution_thread() const noexcept
+    {
+        return engine_execution_context == this;
+    }
+
+    bool lock_free() const noexcept
+    {
+        return commands.lock_free() && applied.is_lock_free() && position.is_lock_free();
+    }
+
+    PortSpec resolve_port_format(PortSpec format) const noexcept
+    {
+        if (!format.is_pcm())
+        {
+            format.spec.sample_rate = spec.sample_rate();
+        }
+        return format;
+    }
+
+    Result<PortSpec> port_spec(ObservationPort port) const noexcept
+    {
+        const auto found = nodes.find(port.node);
+        if (found == nodes.end())
+        {
+            return ErrorCode::UnknownNode;
+        }
+        const auto &ports = found->second->ports(port.direction);
+        if (port.index >= ports.size())
+        {
+            return ErrorCode::InvalidPort;
+        }
+        return resolve_port_format(ports[port.index]);
+    }
+
+    bool would_cycle(NodeId from, NodeId to) const
+    {
+        std::vector<NodeId> stack{to};
+        std::set<NodeId> visited{to};
+        while (!stack.empty())
+        {
+            const auto id = stack.back();
+            stack.pop_back();
+            if (id == from)
+            {
+                return true;
+            }
+            for (const auto &item : connections)
+            {
+                const auto &connection = item.second;
+                if (connection.from.node == id && visited.insert(connection.to.node).second)
+                {
+                    stack.push_back(connection.to.node);
+                }
+            }
+        }
+        return false;
+    }
+
+    RetCode visit(NodeId id, const Incoming &incoming, RenderPlan &plan, std::size_t &total,
+                  std::size_t max_channels)
+    {
+        if (plan.node_index.count(id))
+        {
+            return {};
+        }
+        const auto found = incoming.find(id);
+        if (found != incoming.end())
+        {
+            for (const auto *connection : found->second)
+            {
+                const auto code = visit(connection->second.from.node, incoming, plan, total, max_channels);
+                if (!code)
+                {
+                    return code;
+                }
+            }
+        }
+
+        const auto &entry = nodes.find(id)->second;
+        if (driver && current)
+        {
+            const auto old = current->node_index.find(id);
+            if (old != current->node_index.end())
+            {
+                const auto &running = current->nodes[old->second].entry;
+                if (entry != running && (entry->inputs != running->inputs || entry->outputs != running->outputs))
+                {
+                    return ErrorCode::Busy;
+                }
+            }
+        }
+        for (const auto *ports : {&entry->inputs, &entry->outputs})
+        {
+            for (const auto &port : *ports)
+            {
+                if (port.is_pcm())
+                {
+                    continue;
+                }
+                const auto channels = port.spec.channels;
+                if (channels > max_channels - total)
+                {
+                    return ErrorCode::TooLarge;
+                }
+                total += channels;
+            }
+        }
+        if (!entry->prepared)
+        {
+            const auto code = entry->node->prepare(spec);
+            if (!code)
+            {
+                return code;
+            }
+            entry->prepared = true;
+        }
+        plan.node_index.emplace(id, plan.nodes.size());
+        plan.nodes.push_back(PlanNode{id, entry, std::vector<IBlock>(entry->inputs.size()),
+                                      std::vector<OBlock>(entry->outputs.size())});
+        return {};
+    }
+
+    RetCode build_plan(RenderPlan &plan, std::vector<ObserverUpdate> &updates)
+    {
+        const auto frames = spec.block_frames();
+        if (frames == 0)
+        {
+            return ErrorCode::InvalidArg;
+        }
+        Incoming incoming;
+        for (const auto &item : connections)
+        {
+            const auto &connection = item.second;
+            if (!paused_nodes.count(connection.from.node) && !paused_nodes.count(connection.to.node))
+            {
+                incoming[connection.to.node].push_back(&item);
+            }
+        }
+        for (auto &item : incoming)
+        {
+            auto &ports = item.second;
+            std::sort(ports.begin(), ports.end(), [](const ConnectionEntry *lhs, const ConnectionEntry *rhs) {
+                const auto &a = lhs->second;
+                const auto &b = rhs->second;
+                return std::tie(a.to.index, a.from.node, a.from.index) <
+                       std::tie(b.to.index, b.from.node, b.from.index);
+            });
+        }
+        std::size_t total_channels = 0;
+        const auto max_channels = plan.samples.max_size() / frames;
+        for (const auto &item : nodes)
+        {
+            if (paused_nodes.count(item.first))
+            {
+                continue;
+            }
+            const auto &outputs = item.second->outputs;
+            if (outputs.empty() || std::any_of(outputs.begin(), outputs.end(), [](const PortSpec &port) {
+                    return port.is_pcm();
+                }))
+            {
+                const auto code = visit(item.first, incoming, plan, total_channels, max_channels);
+                if (!code)
+                {
+                    return code;
+                }
+            }
+        }
+        for (const auto &item : subscriptions)
+        {
+            if (paused_nodes.count(item.second.port.node))
+            {
+                if (driver && current->node_index.count(item.second.port.node))
+                {
+                    plan.paused_observers.push_back(item.second.delivery);
+                }
+                continue;
+            }
+            const auto code = visit(item.second.port.node, incoming, plan, total_channels, max_channels);
+            if (!code)
+            {
+                return code;
+            }
+        }
+
+        plan.samples.resize(total_channels * frames);
+        const std::vector<const ConnectionEntry *> no_inputs;
+        std::size_t offset = 0;
+        for (auto &node : plan.nodes)
+        {
+            const auto found = incoming.find(node.id);
+            const auto &inputs = found == incoming.end() ? no_inputs : found->second;
+            auto edge = inputs.begin();
+            node.first_connection = plan.connections.size();
+            node.connection_count = inputs.size();
+            const auto start = offset;
+            for (std::size_t port = 0; port < node.inputs.size(); ++port)
+            {
+                const auto &format = node.entry->inputs[port];
+                if (format.is_pcm())
+                {
+                    continue;
+                }
+                const auto channels = format.spec.channels;
+                const OBlock destination{plan.samples.data() + offset, channels, frames, frames};
+                node.inputs[port] = destination;
+                offset += channels * frames;
+                // visit() placed every source before this node, and incoming edges are sorted by port.
+                for (; edge != inputs.end() && (*edge)->second.to.index == port; ++edge)
+                {
+                    const auto &record = **edge;
+                    const auto &connection = record.second;
+                    const auto source = plan.nodes[plan.node_index.find(connection.from.node)->second]
+                                            .outputs[connection.from.index];
+                    auto previous = RenderPlan::no_connection;
+                    if (current)
+                    {
+                        const auto old = current->connection_index.find(record.first);
+                        if (old != current->connection_index.end())
+                        {
+                            previous = old->second;
+                        }
+                    }
+                    const auto gain = effective_gain(connection.options.gain, connection.options.muted);
+                    plan.connection_index.emplace(record.first, plan.connections.size());
+                    plan.connections.push_back({source, destination, connection.options.matrix, gain, gain, previous});
+                }
+            }
+            node.input_samples = {plan.samples.empty() ? nullptr : plan.samples.data() + start, offset - start};
+            for (std::size_t port = 0; port < node.outputs.size(); ++port)
+            {
+                const auto &format = node.entry->outputs[port];
+                if (format.is_pcm())
+                {
+                    continue;
+                }
+                const auto channels = format.spec.channels;
+                node.outputs[port] = {plan.samples.data() + offset, channels, frames, frames};
+                offset += channels * frames;
+            }
+        }
+        for (const auto &item : subscriptions)
+        {
+            const auto &observer = item.second;
+            const auto port = observer.port;
+            if (paused_nodes.count(port.node))
+            {
+                continue;
+            }
+            auto &node = plan.nodes[plan.node_index.find(port.node)->second];
+            const auto format = resolve_port_format(node.entry->ports(port.direction)[port.index]);
+            auto prepared = observer.delivery->prepare_format(format);
+            if (!prepared)
+            {
+                return prepared.ret_code();
+            }
+            const bool reattaching = driver && current->node_index.count(port.node) == 0;
+            if (prepared.value() || reattaching)
+            {
+                updates.push_back({observer.delivery.get(), std::move(prepared).value()});
+            }
+            const IBlock source = port.direction == PortDirection::Input ? node.inputs[port.index]
+                                                                          : IBlock(node.outputs[port.index]);
+            plan.observers.push_back({observer.delivery, source, format.is_pcm() ? node.entry->node.get() : nullptr,
+                                      port});
+        }
+        return {};
+    }
+
+    void activate(RenderPlan *next, bool smooth) noexcept
+    {
+        if (smooth)
+        {
+            for (auto &connection : next->connections)
+            {
+                if (connection.previous != RenderPlan::no_connection)
+                {
+                    connection.gain = active->connections[connection.previous].gain;
+                }
+            }
+            for (const auto &observer : next->paused_observers)
+            {
+                observer->request_stop();
+            }
+            next->start_observers();
+        }
+        active = next;
+        // The previous plan is no longer touched by the driver after this release.
+        applied.store(next->revision, std::memory_order_release);
+    }
+
+    std::unique_ptr<RenderPlan> collect() noexcept
+    {
+        if (pending && applied.load(std::memory_order_acquire) == pending->revision)
+        {
+            auto retired = std::move(current);
+            current = std::move(pending);
+            return retired;
+        }
+        return {};
+    }
+
+    void maintain()
+    {
+        const EngineExecutionScope scope(this);
+        std::unique_ptr<RenderPlan> retired;
+        {
+            const std::lock_guard<std::mutex> lock(plans_mutex);
+            retired = collect();
+            if (observer_workers)
+            {
+                for (const auto &observer : current->observers)
+                {
+                    observer_workers->schedule(observer.delivery, this);
+                }
+            }
+        }
+    }
+
+    void apply_commands(bool smooth) noexcept
+    {
+        const auto end = commands.published();
+        while (const auto *command = commands.read_slot(end))
+        {
+            if (command->plan)
+            {
+                activate(command->plan, smooth);
+            }
+            else
+            {
+                command->connection->target = command->gain;
+                if (!smooth)
+                {
+                    command->connection->gain = command->gain;
+                }
+            }
+            commands.consume();
+        }
+    }
+
+    static void tick(void *context) noexcept
+    {
+        auto &runtime = *static_cast<Runtime *>(context);
+        const EngineExecutionScope scope(context);
+        runtime.apply_commands(true);
+        const auto frame = runtime.position.load(std::memory_order_relaxed);
+        runtime.active->render(frame);
+        runtime.position.store(frame + runtime.spec.block_frames(), std::memory_order_release);
+    }
+
+    RetCode set_parameter(Connection &connection, ConnId id, float gain, bool muted) noexcept
+    {
+        std::unique_ptr<RenderPlan> retired;
+        const std::lock_guard<std::mutex> lock(plans_mutex);
+        retired = collect();
+        auto *plan = pending ? pending.get() : current.get();
+        if (plan)
+        {
+            const auto found = plan->connection_index.find(id);
+            if (found != plan->connection_index.end())
+            {
+                auto &live = plan->connections[found->second];
+                const auto target = effective_gain(gain, muted);
+                if (driver)
+                {
+                    auto *command = commands.write_slot();
+                    if (!command)
+                    {
+                        return ErrorCode::BufferFull;
+                    }
+                    *command = {nullptr, &live, target};
+                    commands.publish();
+                }
+                else
+                {
+                    live.gain = live.target = target;
+                }
+            }
+        }
+        connection.options.gain = gain;
+        connection.options.muted = muted;
+        return {};
+    }
+};
+
+Engine::Engine(SampleRate sample_rate, BlockPeriod block_period)
+    : runtime_(std::make_unique<Runtime>(EngineSpec{sample_rate, block_period}))
+{
+}
+
+Engine::~Engine()
+{
+    stop();
+}
+
+Result<NodeId> Engine::add_node(std::unique_ptr<Node> instance)
+{
+    if (runtime_->on_execution_thread())
+    {
+        return ErrorCode::Busy;
+    }
+    if (!instance)
+    {
+        return ErrorCode::InvalidArg;
+    }
+    auto entry = std::make_shared<GraphNode>(std::move(instance));
+    for (const auto *ports : {&entry->inputs, &entry->outputs})
+    {
+        if (std::any_of(ports->begin(), ports->end(), [](const PortSpec &port) {
+                return port.spec.channels == 0;
+            }))
+        {
+            return ErrorCode::InvalidArg;
+        }
+    }
+    const NodeId id{get_next_identifier()};
+    runtime_->nodes.emplace(id, std::move(entry));
+    runtime_->dirty = true;
+    return id;
+}
+
+RetCode Engine::remove_node(NodeId id) noexcept
+{
+    auto &runtime = *runtime_;
+    if (runtime.on_execution_thread())
+    {
+        return ErrorCode::Busy;
+    }
+    const auto found = runtime.nodes.find(id);
+    if (found == runtime.nodes.end())
+    {
+        return ErrorCode::UnknownNode;
+    }
+    for (const auto &item : runtime.subscriptions)
+    {
+        if (item.second.port.node == id)
+        {
+            return ErrorCode::Busy;
+        }
+    }
+    for (auto it = runtime.connections.begin(); it != runtime.connections.end();)
+    {
+        if (it->second.from.node == id || it->second.to.node == id)
+        {
+            it = runtime.connections.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    runtime.nodes.erase(found);
+    runtime.paused_nodes.erase(id);
+    runtime.dirty = true;
+    return {};
+}
+
+RetCode Engine::replace_node(NodeId id, std::unique_ptr<Node> replacement)
+{
+    auto &runtime = *runtime_;
+    if (runtime.on_execution_thread())
+    {
+        return ErrorCode::Busy;
+    }
+    const auto found = runtime.nodes.find(id);
+    if (found == runtime.nodes.end())
+    {
+        return ErrorCode::UnknownNode;
+    }
+    if (!replacement)
+    {
+        return ErrorCode::InvalidArg;
+    }
+    auto entry = std::make_shared<GraphNode>(std::move(replacement));
+    const auto compatible = [](const std::vector<PortSpec> &before, const std::vector<PortSpec> &after) {
+        return before.size() == after.size() &&
+               std::equal(before.begin(), before.end(), after.begin(), [](const PortSpec &a, const PortSpec &b) {
+                   return a.layout == b.layout && b.spec.channels > 0 &&
+                          (a.is_pcm() || a.spec.channels == b.spec.channels);
+               });
+    };
+    if (!compatible(found->second->inputs, entry->inputs) || !compatible(found->second->outputs, entry->outputs))
+    {
+        return ErrorCode::InvalidArg;
+    }
+    found->second = std::move(entry);
+    runtime.dirty = true;
+    return {};
+}
+
+RetCode Engine::set_paused(NodeId id, bool paused)
+{
+    auto &runtime = *runtime_;
+    if (runtime.on_execution_thread())
+    {
+        return ErrorCode::Busy;
+    }
+    if (runtime.nodes.count(id) == 0)
+    {
+        return ErrorCode::UnknownNode;
+    }
+    const bool changed = paused ? runtime.paused_nodes.insert(id).second : runtime.paused_nodes.erase(id) != 0;
+    runtime.dirty |= changed;
+    return {};
+}
+
+Result<Node *> Engine::node(NodeId id) noexcept
+{
+    const auto result = static_cast<const Engine &>(*this).node(id);
+    if (!result)
+    {
+        return result.ret_code();
+    }
+    return const_cast<Node *>(result.value());
+}
+
+Result<const Node *> Engine::node(NodeId id) const noexcept
+{
+    if (runtime_->on_execution_thread())
+    {
+        return ErrorCode::Busy;
+    }
+    const auto found = runtime_->nodes.find(id);
+    if (found == runtime_->nodes.end())
+    {
+        return ErrorCode::UnknownNode;
+    }
+    return found->second->node.get();
+}
+
+Result<ConnId> Engine::connect(OPort from, IPort to, const ConnOpts &options)
+{
+    auto &runtime = *runtime_;
+    if (runtime.on_execution_thread())
+    {
+        return ErrorCode::Busy;
+    }
+    const auto source = runtime.port_spec(from);
+    if (!source)
+    {
+        return source.ret_code();
+    }
+    const auto destination = runtime.port_spec(to);
+    if (!destination)
+    {
+        return destination.ret_code();
+    }
+    if (source.value().is_pcm() || destination.value().is_pcm())
+    {
+        return ErrorCode::InvalidPort;
+    }
+    const auto source_channels = source.value().spec.channels;
+    const auto destination_channels = destination.value().spec.channels;
+    if (!std::isfinite(options.gain))
+    {
+        return ErrorCode::InvalidArg;
+    }
+    const auto &matrix = options.matrix;
+    const bool match = matrix.empty() ? source_channels == destination_channels
+                                      : matrix.input_channels() == source_channels &&
+                                            matrix.output_channels() == destination_channels;
+    if (!match)
+    {
+        return ErrorCode::ChannelMismatch;
+    }
+    for (const auto &item : runtime.connections)
+    {
+        const auto &connection = item.second;
+        if (connection.from.node == from.node && connection.from.index == from.index &&
+            connection.to.node == to.node && connection.to.index == to.index)
+        {
+            return ErrorCode::DuplicateConn;
+        }
+    }
+    if (runtime.would_cycle(from.node, to.node))
+    {
+        return ErrorCode::Cycle;
+    }
+    const ConnId id{get_next_identifier()};
+    runtime.connections.emplace(id, Connection{from, to, options});
+    runtime.dirty = true;
+    return id;
+}
+
+RetCode Engine::disconnect(ConnId id) noexcept
+{
+    if (runtime_->on_execution_thread())
+    {
+        return ErrorCode::Busy;
+    }
+    if (!runtime_->connections.erase(id))
+    {
+        return ErrorCode::UnknownConn;
+    }
+    runtime_->dirty = true;
+    return {};
+}
+
+RetCode Engine::set_gain(ConnId id, float gain) noexcept
+{
+    auto &runtime = *runtime_;
+    if (runtime.on_execution_thread())
+    {
+        return ErrorCode::Busy;
+    }
+    if (!std::isfinite(gain))
+    {
+        return ErrorCode::InvalidArg;
+    }
+    const auto found = runtime.connections.find(id);
+    if (found == runtime.connections.end())
+    {
+        return ErrorCode::UnknownConn;
+    }
+    return runtime.set_parameter(found->second, id, gain, found->second.options.muted);
+}
+
+RetCode Engine::set_muted(ConnId id, bool muted) noexcept
+{
+    auto &runtime = *runtime_;
+    if (runtime.on_execution_thread())
+    {
+        return ErrorCode::Busy;
+    }
+    const auto found = runtime.connections.find(id);
+    if (found == runtime.connections.end())
+    {
+        return ErrorCode::UnknownConn;
+    }
+    return runtime.set_parameter(found->second, id, found->second.options.gain, muted);
+}
+
+Result<PlanRevision> Engine::prepare()
+{
+    auto &runtime = *runtime_;
+    if (runtime.on_execution_thread())
+    {
+        return ErrorCode::Busy;
+    }
+    std::unique_ptr<RenderPlan> retired;
+    std::unique_lock<std::mutex> lock(runtime.plans_mutex);
+    retired = runtime.collect();
+    if (!runtime.dirty)
+    {
+        return (runtime.pending ? runtime.pending : runtime.current)->revision;
+    }
+    if (runtime.pending)
+    {
+        return ErrorCode::BufferFull;
+    }
+    Command *slot = nullptr;
+    if (runtime.driver)
+    {
+        // Control is the only producer, so this slot stays available until publication.
+        slot = runtime.commands.write_slot();
+        if (!slot)
+        {
+            return ErrorCode::BufferFull;
+        }
+    }
+
+    auto plan = std::make_unique<RenderPlan>();
+    const EngineExecutionScope scope(&runtime);
+    std::vector<ObserverUpdate> updates;
+    const auto code = runtime.build_plan(*plan, updates);
+    if (!code)
+    {
+        return code;
+    }
+    if (slot && !plan->observers.empty() && !runtime.observer_workers)
+    {
+        runtime.observer_workers = std::make_unique<ObserverWorkers>();
+    }
+    if (!updates.empty())
+    {
+        // The previous plan has detached these writers or the driver is stopped.
+        // A user callback may still be finishing, so leave the shared scheduler free to run.
+        lock.unlock();
+        for (auto &update : updates)
+        {
+            update.delivery->wait_for_callback();
+            update.delivery->configure(std::move(update.format));
+        }
+        lock.lock();
+    }
+
+    const auto revision = runtime.current ? runtime.current->revision + 1 : 1;
+    plan->revision = revision;
+    if (slot)
+    {
+        runtime.pending = std::move(plan);
+        *slot = {runtime.pending.get(), nullptr, 0};
+        runtime.commands.publish();
+    }
+    else
+    {
+        runtime.activate(plan.get(), false);
+        runtime.current = std::move(plan);
+    }
+    runtime.dirty = false;
+    return revision;
+}
+
+RetCode Engine::start(std::unique_ptr<ClockDriver> driver)
+{
+    auto &runtime = *runtime_;
+    if (runtime.on_execution_thread() || runtime.driver)
+    {
+        return ErrorCode::Busy;
+    }
+    if (!runtime.current)
+    {
+        return ErrorCode::NotPrepared;
+    }
+    if (!runtime.lock_free())
+    {
+        return ErrorCode::Unsupported;
+    }
+    runtime.driver = driver ? std::move(driver) : make_timer_driver();
+    try
+    {
+        if (!runtime.current->observers.empty())
+        {
+            runtime.observer_workers = std::make_unique<ObserverWorkers>();
+            runtime.current->start_observers();
+        }
+        runtime.maintenance = start_background_task([&runtime] { runtime.maintain(); });
+        const auto code = runtime.driver->start(runtime.spec, &Runtime::tick, &runtime);
+        if (!code)
+        {
+            stop();
+        }
+        return code;
+    }
+    catch (...)
+    {
+        stop();
+        throw;
+    }
+}
+
+RetCode Engine::stop() noexcept
+{
+    auto &runtime = *runtime_;
+    if (runtime.on_execution_thread())
+    {
+        return ErrorCode::Busy;
+    }
+    if (runtime.driver)
+    {
+        runtime.driver->stop();
+        runtime.driver.reset();
+        for (const auto &item : runtime.subscriptions)
+        {
+            item.second.delivery->request_stop();
+        }
+        runtime.maintenance.reset();
+        runtime.observer_workers.reset();
+        runtime.apply_commands(false);
+        runtime.collect();
+        for (const auto &item : runtime.subscriptions)
+        {
+            item.second.delivery->clear_when_idle();
+        }
+    }
+    return {};
+}
+
+RetCode Engine::reset() noexcept
+{
+    auto &runtime = *runtime_;
+    if (runtime.on_execution_thread() || runtime.driver)
+    {
+        return ErrorCode::Busy;
+    }
+    // A discarded draft can still leave a node in the last published plan.
+    if (runtime.current)
+    {
+        for (const auto &item : runtime.current->nodes)
+        {
+            item.entry->node->reset();
+        }
+    }
+    for (const auto &item : runtime.nodes)
+    {
+        const auto index = runtime.current ? runtime.current->node_index.find(item.first)
+                                           : std::map<NodeId, std::size_t>::const_iterator{};
+        if (!runtime.current || index == runtime.current->node_index.end() ||
+            runtime.current->nodes[index->second].entry != item.second)
+        {
+            item.second->node->reset();
+        }
+    }
+    for (const auto &item : runtime.subscriptions)
+    {
+        item.second.delivery->reset_when_idle();
+    }
+    runtime.position.store(0, std::memory_order_release);
+    return {};
+}
+
+Result<ObserverId> Engine::subscribe(ObservationPort port, ObserverOptions options, ObserverCallback callback)
+{
+    auto &runtime = *runtime_;
+    if (runtime.on_execution_thread())
+    {
+        return ErrorCode::Busy;
+    }
+    if (!callback || options.queue_blocks == 0 || options.interval.count() < 0)
+    {
+        return ErrorCode::InvalidArg;
+    }
+    const auto found = runtime.port_spec(port);
+    if (!found)
+    {
+        return found.ret_code();
+    }
+    auto delivery = std::make_shared<ObserverDelivery>(runtime.spec, options, std::move(callback));
+    if (!delivery->lock_free())
+    {
+        return ErrorCode::Unsupported;
+    }
+    auto format = delivery->prepare_format(found.value());
+    if (!format)
+    {
+        return format.ret_code();
+    }
+    delivery->configure(std::move(format).value());
+    const auto id = get_next_identifier();
+    runtime.subscriptions.emplace(id, Subscription{port, std::move(delivery)});
+    runtime.dirty = true;
+    return id;
+}
+
+Result<PortSpec> Engine::port_spec(ObservationPort port) const noexcept
+{
+    return runtime_->on_execution_thread() ? Result<PortSpec>{ErrorCode::Busy} : runtime_->port_spec(port);
+}
+
+RetCode Engine::unsubscribe(ObserverId id) noexcept
+{
+    auto &runtime = *runtime_;
+    if (runtime.on_execution_thread())
+    {
+        return ErrorCode::Busy;
+    }
+    const auto found = runtime.subscriptions.find(id);
+    if (found == runtime.subscriptions.end())
+    {
+        return ErrorCode::UnknownObserver;
+    }
+    found->second.delivery->cancel();
+    runtime.subscriptions.erase(found);
+    runtime.dirty = true;
+    return {};
+}
+
+EngineSpec Engine::spec() const noexcept
+{
+    return runtime_->spec;
+}
+
+std::uint64_t Engine::frame_position() const noexcept
+{
+    return runtime_->position.load(std::memory_order_acquire);
+}
+
+PlanRevision Engine::applied_revision() const noexcept
+{
+    return runtime_->applied.load(std::memory_order_acquire);
+}
+
+} // namespace aereborn
+
+===== core/engine.h =====
+#ifndef AEREBORN_CORE_ENGINE_H
+#define AEREBORN_CORE_ENGINE_H
+
+#include "graph.h"
+#include <chrono>
+#include <functional>
+#include <memory>
+#include <utility>
+
+namespace aereborn
+{
+
+// A driver invokes one tick at a time. stop() is idempotent and safe before start()
+// or after a failed or throwing start(). It prevents new ticks and waits for any in-flight tick.
+class ClockDriver
+{
+  public:
+    using Tick = void (*)(void *);
+    virtual ~ClockDriver() = default;
+    virtual RetCode start(EngineSpec spec, Tick tick, void *context) = 0;
+    virtual void stop() noexcept = 0;
+};
+
+using PlanRevision = std::uint64_t;
+using ObserverId = std::uint64_t;
+
+struct ObservationPort
+{
+    ObservationPort(NodeId node, std::size_t index = 0) noexcept : ObservationPort(OPort{node, index}) {}
+    ObservationPort(OPort port) noexcept : ObservationPort(port.node, port.index, PortDirection::Output) {}
+    ObservationPort(IPort port) noexcept : ObservationPort(port.node, port.index, PortDirection::Input) {}
+
+    NodeId node;
+    std::size_t index;
+    PortDirection direction;
+
+  private:
+    ObservationPort(NodeId node, std::size_t index, PortDirection direction) noexcept
+        : node(node), index(index), direction(direction) {}
+};
+
+struct ObserverOptions
+{
+    std::chrono::nanoseconds interval{}; // Reserved. Delivery currently runs at 30 Hz.
+    std::size_t queue_blocks = 8;
+};
+
+struct Observation
+{
+    IBlock audio;
+    std::uint64_t frame_position; // Engine frames for both graph audio and PCM.
+    std::uint64_t dropped_frames; // Missing engine frames before this batch.
+    View<const std::uint8_t> pcm{nullptr, 0}; // Interleaved bytes for a PCM port.
+    PortSpec port{};
+};
+
+using ObserverCallback = std::function<void(const Observation &)>;
+
+// Serialize control calls. frame_position() and applied_revision() may be read concurrently.
+class Engine
+{
+  public:
+    Engine(SampleRate sample_rate, BlockPeriod block_period);
+    ~Engine();
+    Engine(const Engine &) = delete;
+    Engine &operator=(const Engine &) = delete;
+    Result<NodeId> add_node(std::unique_ptr<Node> instance);
+    template <class T, class... Args> Result<NodeId> emplace_node(Args &&...args)
+    {
+        return add_node(std::make_unique<T>(std::forward<Args>(args)...));
+    }
+    RetCode remove_node(NodeId node_id) noexcept;
+    // Stage a node with compatible graph ports. Existing connections and subscriptions follow its ID.
+    RetCode replace_node(NodeId node_id, std::unique_ptr<Node> replacement);
+    // Stage a local pause or resume. prepare() applies it with the graph at a block boundary.
+    RetCode set_paused(NodeId node_id, bool paused);
+    Result<Node *> node(NodeId node_id) noexcept;
+    Result<const Node *> node(NodeId node_id) const noexcept;
+    template <class T> Result<T *> node(NodeId node_id) noexcept
+    {
+        const auto result = node(node_id);
+        if (!result)
+        {
+            return result.ret_code();
+        }
+        auto *typed_node = dynamic_cast<T *>(result.value());
+        if (!typed_node)
+        {
+            return ErrorCode::InvalidType;
+        }
+        return typed_node;
+    }
+    Result<ConnId> connect(OPort from, IPort to, const ConnOpts &options = {});
+    RetCode disconnect(ConnId conn_id) noexcept;
+    RetCode set_gain(ConnId conn_id, float linear_gain) noexcept;
+    RetCode set_muted(ConnId conn_id, bool muted) noexcept;
+    // Prepare and submit the draft. Changing a running node's port format requires an applied pause first.
+    Result<PlanRevision> prepare();
+    RetCode start(std::unique_ptr<ClockDriver> driver = {});
+    RetCode stop() noexcept;
+    RetCode reset() noexcept;
+    // Describe a port in the draft graph. Running subscriptions report the format of their actual packet.
+    Result<PortSpec> port_spec(ObservationPort port) const noexcept;
+    // Views are borrowed for the callback, which receives the available contiguous port data in its original format.
+    // The subscription follows its port across a local pause and format change.
+    Result<ObserverId> subscribe(ObservationPort port, ObserverOptions options, ObserverCallback callback);
+    RetCode unsubscribe(ObserverId observer) noexcept;
+    EngineSpec spec() const noexcept;
+    std::uint64_t frame_position() const noexcept;
+    PlanRevision applied_revision() const noexcept;
+
+  private:
+    struct Runtime;
+    std::unique_ptr<Runtime> runtime_;
+};
+
+} // namespace aereborn
+
+#endif // AEREBORN_CORE_ENGINE_H
+
+===== core/graph.h =====
+#ifndef AEREBORN_CORE_GRAPH_H
+#define AEREBORN_CORE_GRAPH_H
+
+#include "types.h"
+#include <array>
+
+namespace aereborn
+{
+
+// Execution unit with immutable input and output layouts.
+class Node
+{
+  public:
+    virtual ~Node() = default;
+    Node(const Node &) = delete;
+    Node &operator=(const Node &) = delete;
+    virtual View<const PortSpec> inputs() const noexcept = 0;
+    virtual View<const PortSpec> outputs() const noexcept = 0;
+    // A PCM port owns or borrows its block through the end of the current tick.
+    virtual View<const std::uint8_t> pcm_block(PortDirection, std::size_t) const noexcept
+    {
+        return {nullptr, 0};
+    }
+    // Validate configuration and prepare resources. The engine may retry a failed preparation.
+    virtual RetCode prepare(const EngineSpec &)
+    {
+        return {};
+    }
+    // Use context's block views during this call and fill every output sample.
+    virtual void process(const ProcContext &context) noexcept = 0;
+    virtual void reset() noexcept
+    {
+    }
+
+  protected:
+    Node() = default;
+};
+
+// Port counts are compile-time constants. Descriptors are stored inline.
+template <std::size_t I, std::size_t O> class NodeT : public Node
+{
+    static_assert(I + O > 0, "Node needs at least one port");
+
+  public:
+    NodeT(std::array<PortSpec, I> inputs, std::array<PortSpec, O> outputs)
+        : inputs_(inputs), outputs_(outputs)
+    {
+    }
+    View<const PortSpec> inputs() const noexcept final
+    {
+        return {inputs_.data(), I};
+    }
+    View<const PortSpec> outputs() const noexcept final
+    {
+        return {outputs_.data(), O};
+    }
+
+  private:
+    const std::array<PortSpec, I> inputs_;
+    const std::array<PortSpec, O> outputs_;
+};
+
+} // namespace aereborn
+
+#endif // AEREBORN_CORE_GRAPH_H
+
+===== core/retcode.h =====
+#ifndef AEREBORN_CORE_RETCODE_H
+#define AEREBORN_CORE_RETCODE_H
+
+#include <cassert>
+#include <type_traits>
+#include <utility>
+
+namespace aereborn
+{
+
+enum class ErrorCode
+{
+    Ok = 0,
+    InvalidArg,
+    UnknownNode,
+    UnknownConn,
+    InvalidPort,
+    InvalidType,
+    ChannelMismatch,
+    DuplicateConn,
+    Cycle = 9, // Preserve existing error values.
+    NotPrepared,
+    BufferFull,
+    TooLarge,
+    Busy,
+    UnknownObserver,
+    Unsupported
+};
+
+class RetCode
+{
+  public:
+    constexpr RetCode(ErrorCode code = ErrorCode::Ok) noexcept : code_(code)
+    {
+    }
+    constexpr ErrorCode code() const noexcept
+    {
+        return code_;
+    }
+    constexpr explicit operator bool() const noexcept
+    {
+        return code_ == ErrorCode::Ok;
+    }
+    const char *message() const noexcept
+    {
+        switch (code_)
+        {
+        case ErrorCode::Ok:
+            return "Success";
+        case ErrorCode::InvalidArg:
+            return "Invalid argument";
+        case ErrorCode::UnknownNode:
+            return "Node does not belong to this engine or was removed";
+        case ErrorCode::UnknownConn:
+            return "Connection does not exist";
+        case ErrorCode::InvalidPort:
+            return "Port index is out of range";
+        case ErrorCode::InvalidType:
+            return "Node has a different type";
+        case ErrorCode::ChannelMismatch:
+            return "Channel counts or matrix dimensions do not match";
+        case ErrorCode::DuplicateConn:
+            return "These ports are already connected";
+        case ErrorCode::Cycle:
+            return "Connection would create a feedback cycle";
+        case ErrorCode::NotPrepared:
+            return "Preparation is required";
+        case ErrorCode::BufferFull:
+            return "A buffer is full or still in use";
+        case ErrorCode::TooLarge:
+            return "Requested capacity exceeds the supported size";
+        case ErrorCode::Busy:
+            return "The current execution context or state prevents this operation";
+        case ErrorCode::UnknownObserver:
+            return "Observer does not belong to this engine or was cancelled";
+        case ErrorCode::Unsupported:
+            return "The platform does not support the required lock-free atomics";
+        }
+        return "Unknown error code";
+    }
+
+  private:
+    ErrorCode code_;
+};
+
+// For graph results with default-constructible values. Check the status before reading the value.
+template <class T> class Result
+{
+  public:
+    Result(T value) noexcept(std::is_nothrow_move_constructible<T>::value) : value_(std::move(value))
+    {
+    }
+    Result(RetCode code) noexcept(std::is_nothrow_default_constructible<T>::value) : ret_code_(code)
+    {
+        assert(!code);
+    }
+    Result(ErrorCode code) noexcept(std::is_nothrow_default_constructible<T>::value) : Result(RetCode(code))
+    {
+    }
+    RetCode ret_code() const noexcept
+    {
+        return ret_code_;
+    }
+    explicit operator bool() const noexcept
+    {
+        return static_cast<bool>(ret_code_);
+    }
+    const T &value() const & noexcept
+    {
+        assert(ret_code_);
+        return value_;
+    }
+    T value() && noexcept(std::is_nothrow_move_constructible<T>::value)
+    {
+        assert(ret_code_);
+        return std::move(value_);
+    }
+
+  private:
+    RetCode ret_code_;
+    T value_{};
+};
+
+} // namespace aereborn
+
+#endif // AEREBORN_CORE_RETCODE_H
+
+===== core/runtime.cpp =====
+#include "runtime.h"
+
+#include <asio/io_context.hpp>
+#include <asio/post.hpp>
+#include <asio/thread_pool.hpp>
+#include <asio/steady_timer.hpp>
+#include <chrono>
+#include <cstring>
+#include <thread>
+
+namespace aereborn
+{
+
+thread_local const void *engine_execution_context = nullptr;
+
+namespace
+{
+// Scheduling and timer allocation are outside the Engine tick.
+class PeriodicTask final : public RuntimeTask
+{
+  public:
+    PeriodicTask(std::chrono::steady_clock::duration period, std::function<void()> run)
+        : period_(period),
+          deadline_(std::chrono::steady_clock::now() + period_), run_(std::move(run))
+    {
+        schedule();
+        thread_ = std::thread([this] { context_.run(); });
+    }
+    ~PeriodicTask() override
+    {
+        context_.stop();
+        thread_.join();
+    }
+
+  private:
+    void schedule()
+    {
+        timer_.expires_at(deadline_);
+        timer_.async_wait([this](const asio::error_code &error) {
+            if (error || context_.stopped())
+            {
+                return;
+            }
+            run_();
+            if (!context_.stopped())
+            {
+                const auto now = std::chrono::steady_clock::now();
+                const auto lateness = now - deadline_;
+                deadline_ += period_ * (lateness >= period_ ? lateness / period_ + 1 : 1);
+                schedule();
+            }
+        });
+    }
+
+    asio::io_context context_;
+    asio::steady_timer timer_{context_};
+    const std::chrono::steady_clock::duration period_;
+    std::chrono::steady_clock::time_point deadline_;
+    std::function<void()> run_;
+    std::thread thread_;
+};
+
+class TimerDriver final : public ClockDriver
+{
+  public:
+    RetCode start(EngineSpec spec, Tick tick, void *context) override
+    {
+        const auto period = std::chrono::milliseconds(static_cast<std::uint32_t>(spec.block_period()));
+        task_ = std::make_unique<PeriodicTask>(period, [tick, context] { tick(context); });
+        return {};
+    }
+    void stop() noexcept override
+    {
+        task_.reset();
+    }
+
+  private:
+    std::unique_ptr<RuntimeTask> task_;
+};
+} // namespace
+
+std::unique_ptr<ClockDriver> make_timer_driver()
+{
+    return std::make_unique<TimerDriver>();
+}
+
+std::unique_ptr<RuntimeTask> start_background_task(std::function<void()> run)
+{
+    const std::chrono::duration<double> period(1.0 / 30.0);
+    return std::make_unique<PeriodicTask>(std::chrono::duration_cast<std::chrono::steady_clock::duration>(period),
+                                          std::move(run));
+}
+
+class ObserverDelivery::PreparedFormat
+{
+  public:
+    struct BlockInfo
+    {
+        std::uint64_t frame;
+        std::size_t size;
+    };
+
+    PreparedFormat(PortSpec format, std::size_t block_frames, std::size_t block_units, std::size_t capacity)
+        : format(format), block_frames(block_frames), block_units(block_units), blocks(capacity)
+    {
+        // The first half holds the ring. The second half is a contiguous callback view.
+        const auto units = 2 * block_units * capacity;
+        if (format.is_pcm())
+        {
+            pcm.resize(units);
+        }
+        else
+        {
+            audio.resize(units);
+        }
+    }
+
+    void write(IBlock samples, View<const std::uint8_t> bytes, std::uint64_t frame) noexcept
+    {
+        const auto queued = count.load(std::memory_order_relaxed);
+        if (queued == blocks.size())
+        {
+            return;
+        }
+        const auto index = (head + queued) % blocks.size();
+        const auto offset = index * block_units;
+        blocks[index].frame = frame;
+        if (format.is_pcm())
+        {
+            std::memcpy(pcm.data() + offset, bytes.data(), bytes.size());
+            blocks[index].size = bytes.size();
+        }
+        else
+        {
+            for (std::size_t ch = 0; ch < samples.channels(); ++ch)
+            {
+                std::memcpy(audio.data() + offset + ch * block_frames, samples.channel(ch),
+                            block_frames * sizeof(float));
+            }
+        }
+        count.store(queued + 1, std::memory_order_relaxed);
+    }
+
+    bool has_data() const noexcept
+    {
+        return count.load(std::memory_order_relaxed) != 0;
+    }
+
+    void clear() noexcept
+    {
+        head = 0;
+        count.store(0, std::memory_order_relaxed);
+    }
+
+    std::size_t read(Observation &result) noexcept
+    {
+        const auto queued = count.load(std::memory_order_relaxed);
+        if (queued == 0)
+        {
+            return 0;
+        }
+        result.frame_position = blocks[head].frame;
+        result.port = format;
+
+        std::size_t batch = 1;
+        while (batch < queued && blocks[(head + batch) % blocks.size()].frame ==
+                                    result.frame_position + batch * block_frames)
+        {
+            ++batch;
+        }
+        const auto callback_offset = blocks.size() * block_units;
+        if (format.is_pcm())
+        {
+            auto *destination = pcm.data() + callback_offset;
+            std::size_t size = 0;
+            for (std::size_t i = 0; i < batch; ++i)
+            {
+                const auto index = (head + i) % blocks.size();
+                const auto bytes = blocks[index].size;
+                std::memcpy(destination + size, pcm.data() + index * block_units, bytes);
+                size += bytes;
+            }
+            result.pcm = {destination, size};
+        }
+        else
+        {
+            auto *destination = audio.data() + callback_offset;
+            const auto channels = format.spec.channels;
+            const auto frames = batch * block_frames;
+            for (std::size_t i = 0; i < batch; ++i)
+            {
+                const auto *source = audio.data() + ((head + i) % blocks.size()) * block_units;
+                for (std::size_t ch = 0; ch < channels; ++ch)
+                {
+                    std::memcpy(destination + ch * frames + i * block_frames, source + ch * block_frames,
+                                block_frames * sizeof(float));
+                }
+            }
+            result.audio = {destination, channels, frames, frames};
+        }
+        head = (head + batch) % blocks.size();
+        count.store(queued - batch, std::memory_order_relaxed);
+        return batch * block_frames;
+    }
+
+    const PortSpec format;
+    const std::size_t block_frames;
+    const std::size_t block_units;
+    std::vector<BlockInfo> blocks;
+    std::vector<float> audio;
+    std::vector<std::uint8_t> pcm;
+    std::size_t head = 0;
+    std::atomic<std::size_t> count{0}; // The scheduler checks this without taking the buffer lock.
+};
+
+void ObserverDelivery::DestroyFormat::operator()(PreparedFormat *format) const noexcept
+{
+    delete format;
+}
+
+ObserverDelivery::ObserverDelivery(EngineSpec spec, ObserverOptions options, ObserverCallback callback)
+    : spec_(spec), queue_blocks_(options.queue_blocks), callback_(std::move(callback))
+{
+}
+
+Result<ObserverDelivery::Format> ObserverDelivery::prepare_format(PortSpec format) const
+{
+    const auto &pcm = format.spec;
+    if (buffer_ && buffer_->format == format)
+    {
+        return Format{};
+    }
+    const auto block_frames = spec_.block_frames();
+    std::size_t frames = block_frames;
+    std::size_t units_per_sample = 1;
+    auto max_units = std::vector<float>().max_size();
+    if (format.is_pcm())
+    {
+        const auto period = static_cast<std::uint32_t>(spec_.block_period());
+        frames = (std::uint64_t{static_cast<std::uint32_t>(pcm.sample_rate)} * period + 999) / 1000;
+        units_per_sample = pcm_sample_bytes(pcm.format);
+        max_units = std::vector<std::uint8_t>().max_size();
+        if (!is_pcm_sample_rate(pcm.sample_rate) || units_per_sample == 0 || pcm.periods == 0)
+        {
+            return ErrorCode::InvalidArg;
+        }
+    }
+    if (queue_blocks_ > std::vector<PreparedFormat::BlockInfo>().max_size() ||
+        (frames && pcm.channels > max_units / 2 / queue_blocks_ / frames / units_per_sample))
+    {
+        return ErrorCode::TooLarge;
+    }
+
+    return Format{new PreparedFormat(format, block_frames, frames * pcm.channels * units_per_sample, queue_blocks_)};
+}
+
+void ObserverDelivery::configure(Format format) noexcept
+{
+    const std::lock_guard<std::mutex> lock(buffer_mutex_);
+    if (format)
+    {
+        buffer_.swap(format);
+    }
+    else
+    {
+        buffer_->clear();
+    }
+}
+
+void ObserverDelivery::write(IBlock samples, std::uint64_t frame) noexcept
+{
+    write(samples, {nullptr, 0}, frame);
+}
+
+void ObserverDelivery::write(View<const std::uint8_t> bytes, std::uint64_t frame) noexcept
+{
+    write({}, bytes, frame);
+}
+
+bool ObserverDelivery::lock_free() const noexcept
+{
+    return state_.is_lock_free() && first_frame_.is_lock_free();
+}
+
+void ObserverDelivery::start() noexcept
+{
+    auto idle = State::Idle;
+    state_.compare_exchange_strong(idle, State::Running);
+}
+
+void ObserverDelivery::request_stop() noexcept
+{
+    auto running = State::Running;
+    state_.compare_exchange_strong(running, State::Idle);
+}
+
+void ObserverDelivery::wait_for_callback() noexcept
+{
+    const std::lock_guard<std::mutex> lock(callback_mutex_);
+}
+
+void ObserverDelivery::clear_when_idle() noexcept
+{
+    buffer_->clear();
+}
+
+void ObserverDelivery::disable() noexcept
+{
+    const std::lock_guard<std::mutex> lock(buffer_mutex_);
+    state_.store(State::Disabled);
+}
+
+void ObserverDelivery::cancel() noexcept
+{
+    disable();
+    wait_for_callback();
+}
+
+void ObserverDelivery::reset_when_idle() noexcept
+{
+    first_frame_.store(no_frame, std::memory_order_relaxed);
+    delivered_end_ = no_frame;
+}
+
+void ObserverDelivery::write(IBlock samples, View<const std::uint8_t> bytes, std::uint64_t frame) noexcept
+{
+    if (first_frame_.load(std::memory_order_relaxed) == no_frame)
+    {
+        first_frame_.store(frame, std::memory_order_relaxed);
+    }
+    const std::unique_lock<std::mutex> lock(buffer_mutex_, std::try_to_lock);
+    if (!lock || state_.load(std::memory_order_relaxed) != State::Running)
+    {
+        return;
+    }
+    if (buffer_->format.is_pcm() && (bytes.empty() || bytes.size() > buffer_->block_units))
+    {
+        return;
+    }
+    buffer_->write(samples, bytes, frame);
+}
+
+void ObserverDelivery::deliver()
+{
+    Observation batch{};
+    std::size_t frames;
+    {
+        const std::lock_guard<std::mutex> lock(buffer_mutex_);
+        if (state_.load(std::memory_order_relaxed) != State::Running)
+        {
+            return;
+        }
+        frames = buffer_->read(batch);
+    }
+    if (frames == 0 || state_.load() != State::Running)
+    {
+        return;
+    }
+    const auto previous_end = delivered_end_ == no_frame ? first_frame_.load(std::memory_order_relaxed) : delivered_end_;
+    batch.dropped_frames = batch.frame_position - previous_end;
+    try
+    {
+        callback_(batch);
+        delivered_end_ = batch.frame_position + frames;
+    }
+    catch (...)
+    {
+        disable();
+    }
+}
+
+struct ObserverWorkers::Pool
+{
+    asio::thread_pool workers{2};
+};
+
+ObserverWorkers::ObserverWorkers() : pool_(std::make_unique<Pool>())
+{
+}
+
+ObserverWorkers::~ObserverWorkers()
+{
+    pool_->workers.join();
+}
+
+void ObserverWorkers::schedule(const std::shared_ptr<ObserverDelivery> &observer, const void *context) noexcept
+{
+    if (observer->state_.load() != ObserverDelivery::State::Running || !observer->buffer_->has_data() ||
+        observer->scheduled_.exchange(true))
+    {
+        return;
+    }
+    try
+    {
+        asio::post(pool_->workers, [observer, context] {
+            const EngineExecutionScope scope(context);
+            {
+                const std::lock_guard<std::mutex> lock(observer->callback_mutex_);
+                observer->deliver();
+            }
+            observer->scheduled_.store(false);
+        });
+    }
+    catch (...)
+    {
+        observer->scheduled_.store(false);
+    }
+}
+
+} // namespace aereborn
+
+===== core/runtime.h =====
+#ifndef AEREBORN_CORE_RUNTIME_H
+#define AEREBORN_CORE_RUNTIME_H
+
+#include "engine.h"
+#include <atomic>
+#include <limits>
+#include <mutex>
+#include <vector>
+
+namespace aereborn
+{
+
+// One producer and one consumer. The spare slot distinguishes full from empty.
+template <class T> class SpscRing
+{
+  public:
+    explicit SpscRing(std::size_t capacity) : slots_(capacity + 1)
+    {
+    }
+    bool lock_free() const noexcept
+    {
+        return head_.is_lock_free() && tail_.is_lock_free();
+    }
+    T *write_slot() noexcept
+    {
+        const auto head = head_.load(std::memory_order_relaxed);
+        return next(head) == tail_.load(std::memory_order_acquire) ? nullptr : &slots_[head];
+    }
+    void publish() noexcept
+    {
+        head_.store(next(head_.load(std::memory_order_relaxed)), std::memory_order_release);
+    }
+    std::size_t published() const noexcept
+    {
+        return head_.load(std::memory_order_acquire);
+    }
+    const T *read_slot(std::size_t end) const noexcept
+    {
+        const auto tail = tail_.load(std::memory_order_relaxed);
+        return tail == end ? nullptr : &slots_[tail];
+    }
+    void consume() noexcept
+    {
+        tail_.store(next(tail_.load(std::memory_order_relaxed)), std::memory_order_release);
+    }
+
+  private:
+    std::size_t next(std::size_t index) const noexcept
+    {
+        return index + 1 == slots_.size() ? 0 : index + 1;
+    }
+
+    std::vector<T> slots_;
+    std::atomic<std::size_t> head_{0};
+    std::atomic<std::size_t> tail_{0};
+};
+
+extern thread_local const void *engine_execution_context;
+
+class EngineExecutionScope
+{
+  public:
+    explicit EngineExecutionScope(const void *context) noexcept : previous_(engine_execution_context)
+    {
+        engine_execution_context = context;
+    }
+    ~EngineExecutionScope()
+    {
+        engine_execution_context = previous_;
+    }
+
+  private:
+    const void *previous_;
+};
+
+std::unique_ptr<ClockDriver> make_timer_driver();
+
+class RuntimeTask
+{
+  public:
+    virtual ~RuntimeTask() = default;
+};
+
+std::unique_ptr<RuntimeTask> start_background_task(std::function<void()> run);
+
+class ObserverWorkers;
+
+class ObserverDelivery
+{
+  public:
+    class PreparedFormat;
+    struct DestroyFormat
+    {
+        void operator()(PreparedFormat *format) const noexcept;
+    };
+    using Format = std::unique_ptr<PreparedFormat, DestroyFormat>;
+
+    ObserverDelivery(EngineSpec spec, ObserverOptions options, ObserverCallback callback);
+    Result<Format> prepare_format(PortSpec format) const;
+    // The engine detaches the subscription and waits for its callback before configuring it.
+    void configure(Format format) noexcept;
+    void write(IBlock samples, std::uint64_t frame) noexcept;
+    void write(View<const std::uint8_t> bytes, std::uint64_t frame) noexcept;
+    bool lock_free() const noexcept;
+    void start() noexcept;
+    void request_stop() noexcept;
+    void wait_for_callback() noexcept;
+    void clear_when_idle() noexcept;
+    void cancel() noexcept;
+    void reset_when_idle() noexcept;
+
+  private:
+    enum class State { Idle, Running, Disabled };
+
+    friend class ObserverWorkers;
+    void write(IBlock samples, View<const std::uint8_t> bytes, std::uint64_t frame) noexcept;
+    void disable() noexcept;
+    void deliver();
+
+    const EngineSpec spec_;
+    const std::size_t queue_blocks_;
+    ObserverCallback callback_;
+    Format buffer_;
+    std::mutex buffer_mutex_;
+    std::mutex callback_mutex_;
+    std::atomic<bool> scheduled_{false};
+    std::atomic<State> state_{State::Idle};
+    static constexpr auto no_frame = std::numeric_limits<std::uint64_t>::max();
+    std::atomic<std::uint64_t> first_frame_{no_frame};
+    std::uint64_t delivered_end_ = no_frame;
+};
+
+class ObserverWorkers
+{
+  public:
+    ObserverWorkers();
+    ~ObserverWorkers();
+    void schedule(const std::shared_ptr<ObserverDelivery> &observer, const void *context) noexcept;
+
+  private:
+    struct Pool;
+    std::unique_ptr<Pool> pool_;
+};
+
+} // namespace aereborn
+
+#endif // AEREBORN_CORE_RUNTIME_H
+
+===== core/types.cpp =====
+#include "types.h"
+
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
+
+namespace aereborn
+{
+
+RetCode Buffer::resize(std::size_t channels, std::size_t capacity_frames)
+{
+    if (channels == 0 || capacity_frames == 0)
+    {
+        return ErrorCode::InvalidArg;
+    }
+    if (channels > samples_.max_size() / capacity_frames)
+    {
+        return ErrorCode::TooLarge;
+    }
+    const auto sample_count = channels * capacity_frames;
+    const auto retained_samples = std::min(samples_.size(), sample_count);
+    samples_.resize(sample_count);
+    std::fill_n(samples_.begin(), retained_samples, 0.0f);
+    channels_ = channels;
+    capacity_frames_ = capacity_frames;
+    return {};
+}
+
+OBlock Buffer::block(std::size_t frames) noexcept
+{
+    return {samples_.data(), channels_, frames, capacity_frames_};
+}
+
+std::size_t Buffer::capacity_frames() const noexcept
+{
+    return capacity_frames_;
+}
+
+NodeId::operator bool() const noexcept
+{
+    return value != 0;
+}
+
+bool NodeId::operator==(NodeId other) const noexcept
+{
+    return value == other.value;
+}
+
+bool NodeId::operator!=(NodeId other) const noexcept
+{
+    return !(*this == other);
+}
+
+bool NodeId::operator<(NodeId other) const noexcept
+{
+    return value < other.value;
+}
+
+ConnId::operator bool() const noexcept
+{
+    return value != 0;
+}
+
+bool ConnId::operator==(ConnId other) const noexcept
+{
+    return value == other.value;
+}
+
+bool ConnId::operator!=(ConnId other) const noexcept
+{
+    return !(*this == other);
+}
+
+bool ConnId::operator<(ConnId other) const noexcept
+{
+    return value < other.value;
+}
+
+ChMatrix::ChMatrix(std::size_t output_channels, std::size_t input_channels, View<const float> coefficients)
+    : input_channels_(input_channels), output_channels_(output_channels)
+{
+    if (input_channels == 0 || output_channels == 0)
+    {
+        throw std::invalid_argument("Channel matrix dimensions must be positive");
+    }
+    if (output_channels > coefficients_.max_size() / input_channels)
+    {
+        throw std::length_error("Channel matrix exceeds the supported size");
+    }
+    if (coefficients.size() != output_channels * input_channels)
+    {
+        throw std::invalid_argument("Channel matrix coefficient count does not match its dimensions");
+    }
+    for (const auto coefficient : coefficients)
+    {
+        if (!std::isfinite(coefficient))
+        {
+            throw std::invalid_argument("Channel matrix coefficients must be finite");
+        }
+    }
+    coefficients_.assign(coefficients.begin(), coefficients.end());
+}
+
+ChMatrix::ChMatrix(std::size_t output_channels, std::size_t input_channels, std::initializer_list<float> coefficients)
+    : ChMatrix(output_channels, input_channels, View<const float>{coefficients.begin(), coefficients.size()})
+{
+}
+
+bool ChMatrix::empty() const noexcept
+{
+    return coefficients_.empty();
+}
+
+std::size_t ChMatrix::input_channels() const noexcept
+{
+    return input_channels_;
+}
+
+std::size_t ChMatrix::output_channels() const noexcept
+{
+    return output_channels_;
+}
+
+const std::vector<float> &ChMatrix::coefficients() const noexcept
+{
+    return coefficients_;
+}
+
+static void mix_channel(IBlock input, OBlock output, std::size_t src_ch, std::size_t dst_ch, float gain) noexcept
+{
+    if (gain == 0.0f)
+    {
+        return;
+    }
+    const auto *src = input.channel(src_ch);
+    auto *dst = output.channel(dst_ch);
+    for (std::size_t frame = 0; frame < output.frames(); ++frame)
+    {
+        dst[frame] += src[frame] * gain;
+    }
+}
+
+void ChMatrix::mix_add(IBlock input, OBlock output, float gain) const noexcept
+{
+    if (empty())
+    {
+        for (std::size_t ch = 0; ch < output.channels(); ++ch)
+        {
+            mix_channel(input, output, ch, ch, gain);
+        }
+        return;
+    }
+    for (std::size_t dst_ch = 0; dst_ch < output.channels(); ++dst_ch)
+    {
+        for (std::size_t src_ch = 0; src_ch < input.channels(); ++src_ch)
+        {
+            mix_channel(input, output, src_ch, dst_ch, coefficients_[dst_ch * input.channels() + src_ch] * gain);
+        }
+    }
+}
+
+static void mix_ramp_channel(const float *src, float *dst, std::size_t frames, float coefficient,
+                             float from, float to, double step) noexcept
+{
+    if (coefficient == 0.0f)
+    {
+        return;
+    }
+    const auto last_frame = frames - 1;
+    for (std::size_t frame = 0; frame < last_frame; ++frame)
+    {
+        const auto gain = static_cast<float>(from + step * (frame + 1));
+        const auto scaled_gain = coefficient * gain;
+        if (scaled_gain != 0.0f) // Silent contributions also skip non-finite input samples.
+        {
+            dst[frame] += src[frame] * scaled_gain;
+        }
+    }
+    const auto final_gain = coefficient * to;
+    if (final_gain != 0.0f)
+    {
+        dst[last_frame] += src[last_frame] * final_gain;
+    }
+}
+
+void ChMatrix::mix_ramp_add(IBlock input, OBlock output, float from, float to) const noexcept
+{
+    const auto frames = output.frames();
+    if (frames == 0)
+    {
+        return;
+    }
+    const auto step = (static_cast<double>(to) - from) / frames;
+    if (empty())
+    {
+        for (std::size_t ch = 0; ch < output.channels(); ++ch)
+        {
+            mix_ramp_channel(input.channel(ch), output.channel(ch), frames, 1.0f, from, to, step);
+        }
+        return;
+    }
+    for (std::size_t dst_ch = 0; dst_ch < output.channels(); ++dst_ch)
+    {
+        for (std::size_t src_ch = 0; src_ch < input.channels(); ++src_ch)
+        {
+            mix_ramp_channel(input.channel(src_ch), output.channel(dst_ch), frames,
+                             coefficients_[dst_ch * input.channels() + src_ch], from, to, step);
+        }
+    }
+}
+
+} // namespace aereborn
+
+===== core/types.h =====
+#ifndef AEREBORN_CORE_TYPES_H
+#define AEREBORN_CORE_TYPES_H
+
+#include "block.h"
+#include <cstddef>
+#include <cstdint>
+#include <initializer_list>
+#include <vector>
+
+namespace aereborn
+{
+
+enum class SampleRate : std::uint32_t
+{
+    Hz8000 = 8000,
+    Hz11025 = 11025,
+    Hz16000 = 16000,
+    Hz22050 = 22050,
+    Hz24000 = 24000,
+    Hz32000 = 32000,
+    Hz44100 = 44100,
+    Hz48000 = 48000,
+    Hz88200 = 88200,
+    Hz96000 = 96000
+};
+
+constexpr bool is_pcm_sample_rate(SampleRate rate) noexcept
+{
+    switch (rate)
+    {
+    case SampleRate::Hz8000:
+    case SampleRate::Hz11025:
+    case SampleRate::Hz16000:
+    case SampleRate::Hz22050:
+    case SampleRate::Hz24000:
+    case SampleRate::Hz32000:
+    case SampleRate::Hz44100:
+    case SampleRate::Hz48000:
+    case SampleRate::Hz88200:
+    case SampleRate::Hz96000:
+        return true;
+    }
+    return false;
+}
+
+enum class BlockPeriod : std::uint32_t
+{
+    Ms05 = 5,
+    Ms10 = 10,
+    Ms20 = 20,
+    Ms40 = 40
+};
+
+constexpr bool is_block_period(BlockPeriod period) noexcept
+{
+    return period == BlockPeriod::Ms05 || period == BlockPeriod::Ms10 || period == BlockPeriod::Ms20 ||
+           period == BlockPeriod::Ms40;
+}
+
+// A copyable graph timing specification. A zero frame count marks an invalid combination.
+class EngineSpec
+{
+  public:
+    constexpr EngineSpec(SampleRate sample_rate, BlockPeriod block_period) noexcept
+        : sample_rate_(sample_rate), block_period_(block_period)
+    {
+        if (sample_rate > SampleRate::Hz96000 || !is_block_period(block_period))
+        {
+            return;
+        }
+        const auto frames_x1000 = static_cast<std::uint32_t>(sample_rate) * static_cast<std::uint32_t>(block_period);
+        block_frames_ = frames_x1000 % 1000 == 0 ? frames_x1000 / 1000 : 0;
+    }
+    constexpr SampleRate sample_rate() const noexcept
+    {
+        return sample_rate_;
+    }
+    constexpr BlockPeriod block_period() const noexcept
+    {
+        return block_period_;
+    }
+    constexpr std::size_t block_frames() const noexcept
+    {
+        return block_frames_;
+    }
+    constexpr bool operator==(const EngineSpec &other) const noexcept
+    {
+        return sample_rate_ == other.sample_rate_ && block_period_ == other.block_period_;
+    }
+
+  private:
+    SampleRate sample_rate_;
+    BlockPeriod block_period_;
+    std::size_t block_frames_ = 0;
+};
+
+enum class PCMFormat
+{
+    S16LE,
+    S24_3LE, // Packed into three bytes.
+    S24LE,   // Low 24 bits of a four-byte sample.
+    S32LE,
+    F32LE
+};
+
+// Sample width before padding, or zero for an unknown format.
+constexpr unsigned int pcm_sample_bits(PCMFormat format) noexcept
+{
+    switch (format)
+    {
+    case PCMFormat::S16LE:
+        return 16;
+    case PCMFormat::S24_3LE:
+    case PCMFormat::S24LE:
+        return 24;
+    case PCMFormat::S32LE:
+    case PCMFormat::F32LE:
+        return 32;
+    }
+    return 0;
+}
+
+constexpr std::size_t pcm_sample_bytes(PCMFormat format) noexcept
+{
+    return format == PCMFormat::S24LE ? 4 : pcm_sample_bits(format) / 8;
+}
+
+struct PCMSpec
+{
+    SampleRate sample_rate;
+    PCMFormat format;
+    std::size_t channels;
+    std::size_t periods = 1; // Engine periods per PCM transfer, independent of the hardware period.
+};
+
+enum class PortDirection { Input, Output };
+
+struct PortSpec
+{
+    enum class Layout { PlanarFloat, InterleavedPCM };
+
+    PortSpec(std::size_t channels = 0) noexcept : spec{SampleRate{}, PCMFormat::F32LE, channels} {}
+    explicit PortSpec(PCMSpec pcm) noexcept : spec(pcm), layout(Layout::InterleavedPCM) {}
+    bool is_pcm() const noexcept { return layout == Layout::InterleavedPCM; }
+    bool operator==(const PortSpec &other) const noexcept
+    {
+        return layout == other.layout && spec.sample_rate == other.spec.sample_rate &&
+               spec.format == other.spec.format && spec.channels == other.spec.channels &&
+               spec.periods == other.spec.periods;
+    }
+
+    PCMSpec spec;
+    Layout layout = Layout::PlanarFloat;
+};
+
+// IDs are never reused, including across Engine instances in this process.
+struct NodeId
+{
+    std::uint64_t value = 0;
+    explicit operator bool() const noexcept;
+    bool operator==(NodeId other) const noexcept;
+    bool operator!=(NodeId other) const noexcept;
+    bool operator<(NodeId other) const noexcept;
+};
+
+struct ConnId
+{
+    std::uint64_t value = 0;
+    explicit operator bool() const noexcept;
+    bool operator==(ConnId other) const noexcept;
+    bool operator!=(ConnId other) const noexcept;
+    bool operator<(ConnId other) const noexcept;
+};
+
+struct IPort
+{
+    NodeId node;
+    std::size_t index = 0;
+};
+
+struct OPort
+{
+    NodeId node;
+    std::size_t index = 0;
+};
+
+// Rows are destination channels; columns are source channels.
+class ChMatrix
+{
+  public:
+    ChMatrix() = default; // Empty means identity, requiring equal channel counts.
+    ChMatrix(std::size_t output_channels, std::size_t input_channels, View<const float> coefficients);
+    ChMatrix(std::size_t output_channels, std::size_t input_channels, std::initializer_list<float> coefficients);
+    // Add mapped samples to output. The caller validates the block sizes and channel counts.
+    void mix_add(IBlock input, OBlock output, float gain = 1.0f) const noexcept;
+    void mix_ramp_add(IBlock input, OBlock output, float from, float to) const noexcept;
+    bool empty() const noexcept;
+    std::size_t input_channels() const noexcept;
+    std::size_t output_channels() const noexcept;
+    const std::vector<float> &coefficients() const noexcept;
+
+  private:
+    std::size_t input_channels_ = 0;
+    std::size_t output_channels_ = 0;
+    std::vector<float> coefficients_;
+};
+
+struct ConnOpts
+{
+    float gain = 1.0f; // Linear gain; float mixing is not clipped.
+    bool muted = false;
+    ChMatrix matrix;
+};
+
+struct ProcContext
+{
+    std::uint64_t frame_position;
+    View<const IBlock> inputs;
+    View<const OBlock> outputs;
+};
+
+} // namespace aereborn
+
+#endif // AEREBORN_CORE_TYPES_H
+
+===== plugins/adapter.cpp =====
+#include "adapter.h"
+
+#include <array>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <utility>
+
+namespace aereborn
+{
+namespace
+{
+
+constexpr std::size_t order = 48;
+constexpr std::size_t taps = 2 * order;
+constexpr std::uint32_t phase_steps = 100;
+constexpr double pi = 3.141592653589793;
+
+std::uint32_t read_le(const std::uint8_t *input, std::size_t bytes) noexcept
+{
+    std::uint32_t raw = 0;
+    for (std::size_t i = 0; i < bytes; ++i)
+    {
+        raw |= static_cast<std::uint32_t>(input[i]) << (8 * i);
+    }
+    return raw;
+}
+
+void write_le(std::uint32_t raw, std::uint8_t *output, std::size_t bytes) noexcept
+{
+    for (std::size_t i = 0; i < bytes; ++i)
+    {
+        output[i] = static_cast<std::uint8_t>(raw >> (8 * i));
+    }
+}
+
+float decode_integer(std::uint32_t raw, unsigned int bits) noexcept
+{
+    const auto scale = std::int64_t{1} << (bits - 1);
+    const auto value = std::int64_t{raw} & (2 * scale - 1);
+    return static_cast<float>(value >= scale ? value - 2 * scale : value) / static_cast<float>(scale);
+}
+
+std::uint32_t encode_integer(float sample, unsigned int bits) noexcept
+{
+    const auto scale = std::int64_t{1} << (bits - 1);
+    const auto normalized = std::isnan(sample) ? 0.0f : std::max(-1.0f, std::min(1.0f, sample));
+    const auto rounded = static_cast<std::int64_t>(std::round(static_cast<double>(normalized) * scale));
+    const auto value = std::min(scale - 1, rounded);
+    return static_cast<std::uint32_t>(value) & static_cast<std::uint32_t>(2 * scale - 1);
+}
+
+bool native_f32le() noexcept
+{
+    const float one = 1.0f;
+    constexpr std::uint8_t one_le[] = {0, 0, 0x80, 0x3f};
+    return std::memcmp(&one, one_le, sizeof(one)) == 0;
+}
+
+void copy_f32le(const std::uint8_t *pcm, OBlock output) noexcept
+{
+    if (output.channels() == 1 && native_f32le())
+    {
+        std::memcpy(output.channel(0), pcm, output.frames() * sizeof(float));
+        return;
+    }
+    for (std::size_t frame = 0; frame < output.frames(); ++frame)
+    {
+        for (std::size_t ch = 0; ch < output.channels(); ++ch, pcm += sizeof(float))
+        {
+            const auto raw = read_le(pcm, sizeof(float));
+            std::memcpy(output.channel(ch) + frame, &raw, sizeof(raw));
+        }
+    }
+}
+
+void copy_f32le(IBlock input, std::uint8_t *pcm) noexcept
+{
+    if (input.channels() == 1 && native_f32le())
+    {
+        std::memcpy(pcm, input.channel(0), input.frames() * sizeof(float));
+        return;
+    }
+    for (std::size_t frame = 0; frame < input.frames(); ++frame)
+    {
+        for (std::size_t ch = 0; ch < input.channels(); ++ch, pcm += sizeof(float))
+        {
+            std::uint32_t raw;
+            std::memcpy(&raw, input.channel(ch) + frame, sizeof(raw));
+            write_le(raw, pcm, sizeof(raw));
+        }
+    }
+}
+
+// Window and cutoff ported from AudioDriver's SincInterpolator.
+double sinc_kernel(double x, double cutoff) noexcept
+{
+    if (std::abs(x) >= order)
+    {
+        return 0.0;
+    }
+    const auto angle = (2.0 * pi * (x + 1.0 - order)) / (taps - 1);
+    const auto window =
+        0.3635819 - 0.4891775 * std::cos(angle) + 0.1365995 * std::cos(2 * angle) - 0.0106411 * std::cos(3 * angle);
+    const auto sinc_angle = pi * cutoff * x;
+    const auto sinc = sinc_angle == 0 ? 1.0 : std::sin(sinc_angle) / sinc_angle;
+    return sinc * window;
+}
+
+using Coefficients = std::array<float, taps>;
+
+void calc_coffs(const float *kernel, std::uint32_t dst_fs, std::uint64_t src_pos, Coefficients &coffs) noexcept
+{
+    const auto phase_pos = (src_pos % dst_fs) * phase_steps;
+    const auto phase_index = phase_pos / dst_fs;
+    const auto phase_frac = static_cast<float>(phase_pos % dst_fs) / static_cast<float>(dst_fs);
+    const auto *lo_coffs = kernel + phase_index * taps;
+    const auto *hi_coffs = lo_coffs + taps;
+    for (std::size_t i = 0; i < taps; ++i)
+    {
+        coffs[i] = lo_coffs[i] + (hi_coffs[i] - lo_coffs[i]) * phase_frac;
+    }
+}
+
+float interpolate(const float *history, const float *input, std::size_t history_taps,
+                  const Coefficients &coffs) noexcept
+{
+    double sum = 0;
+    for (std::size_t i = 0; i < history_taps; ++i)
+    {
+        sum += history[i] * coffs[i];
+    }
+    for (std::size_t i = history_taps; i < taps; ++i)
+    {
+        sum += input[i - history_taps] * coffs[i];
+    }
+    return static_cast<float>(sum);
+}
+
+} // namespace
+
+// Conversion state prepared from the device PCM and graph timing specifications.
+class PCMConverter
+{
+  public:
+    PCMConverter(PCMSpec spec, SampleRate src_fs, SampleRate dst_fs, BlockPeriod period, const ChMatrix &matrix);
+    RetCode prepare_pcm(std::size_t graph_frames);
+    void reset() noexcept;
+    std::size_t pcm_frames() const noexcept
+    {
+        return pcm_frames_;
+    }
+    std::size_t pcm_bytes() const noexcept
+    {
+        return pcm_frames_ * frame_bytes();
+    }
+    struct Period
+    {
+        View<std::uint8_t> bytes;
+        std::size_t frames;
+    };
+
+    Period next_period() noexcept;
+    void decode(const std::uint8_t *pcm, std::size_t frames, OBlock output) noexcept;
+    void encode(IBlock input, std::size_t frames, std::uint8_t *pcm) noexcept;
+    View<const std::uint8_t> block() const noexcept { return {bytes_.data(), valid_bytes_}; }
+    void clear_block() noexcept { valid_bytes_ = 0; }
+
+  private:
+    std::size_t frame_bytes() const noexcept { return spec_.channels * sample_bytes_; }
+    std::size_t frame_offset(std::size_t period_index) const noexcept;
+    void resample(IBlock input, OBlock output) noexcept;
+
+    const PCMSpec spec_;
+    const ChMatrix &matrix_;
+    const std::uint64_t period_frames_x1000_; // PCM frames per engine period in units of 1/1000 frame.
+    const std::size_t sample_bytes_;
+    const unsigned int sample_bits_;
+    const std::uint32_t src_fs_;
+    const std::uint32_t dst_fs_;
+    std::size_t pcm_frames_ = 0;
+    std::size_t period_index_ = 0;
+    Buffer pcm_samples_;
+    Buffer mapped_samples_; // Current-period workspace in device channels; never queues audio.
+    Buffer history_;
+    std::vector<float> kernel_;
+    std::vector<std::uint8_t> bytes_;
+    std::size_t valid_bytes_ = 0;
+    std::int64_t phase_ = 0; // Next output sample's source position, in units of 1 / dst_fs_.
+};
+
+PCMConverter::PCMConverter(PCMSpec spec, SampleRate src_fs, SampleRate dst_fs, BlockPeriod period,
+                           const ChMatrix &matrix)
+    : spec_(spec), matrix_(matrix), period_frames_x1000_(std::uint64_t{static_cast<std::uint32_t>(period)} *
+                                                         static_cast<std::uint32_t>(spec.sample_rate)),
+      sample_bytes_(pcm_sample_bytes(spec.format)), sample_bits_(pcm_sample_bits(spec.format)),
+      src_fs_(static_cast<std::uint32_t>(src_fs)), dst_fs_(static_cast<std::uint32_t>(dst_fs))
+{
+}
+
+RetCode PCMConverter::prepare_pcm(std::size_t graph_frames)
+{
+    if (sample_bytes_ == 0 || !is_pcm_sample_rate(spec_.sample_rate) || spec_.periods == 0)
+    {
+        return ErrorCode::InvalidArg;
+    }
+    if (spec_.periods > std::numeric_limits<std::uint64_t>::max() / period_frames_x1000_)
+    {
+        return ErrorCode::TooLarge;
+    }
+    const auto transfer_frames_x1000 = period_frames_x1000_ * spec_.periods;
+    if (transfer_frames_x1000 % 1000 != 0)
+    {
+        return ErrorCode::InvalidArg;
+    }
+    const auto transfer_frames = transfer_frames_x1000 / 1000;
+    if (spec_.channels > std::numeric_limits<std::size_t>::max() / sample_bytes_ / transfer_frames)
+    {
+        return ErrorCode::TooLarge;
+    }
+    const auto max_period_frames = frame_offset(1);
+    const auto port_bytes = max_period_frames * frame_bytes();
+    if (port_bytes > bytes_.max_size())
+    {
+        return ErrorCode::TooLarge;
+    }
+    if (!matrix_.empty())
+    {
+        const auto code = mapped_samples_.resize(spec_.channels, graph_frames);
+        if (!code)
+        {
+            return code;
+        }
+    }
+    if (src_fs_ != dst_fs_)
+    {
+        const auto samples_code = pcm_samples_.resize(spec_.channels, max_period_frames);
+        if (!samples_code)
+        {
+            return samples_code;
+        }
+        const auto history_code = history_.resize(spec_.channels, taps);
+        if (!history_code)
+        {
+            return history_code;
+        }
+        kernel_.resize((phase_steps + 1) * taps);
+        const auto cutoff = std::min(1.0, static_cast<double>(dst_fs_) / src_fs_) * 0.98;
+        for (std::uint32_t phase_index = 0; phase_index <= phase_steps; ++phase_index)
+        {
+            auto *coffs = kernel_.data() + phase_index * taps;
+            const auto phase_frac = static_cast<double>(phase_index) / phase_steps;
+            double scale = 0;
+            for (std::size_t i = 0; i < taps; ++i)
+            {
+                coffs[i] = static_cast<float>(sinc_kernel(phase_frac + order - 1 - i, cutoff));
+                scale += coffs[i];
+            }
+            for (std::size_t i = 0; i < taps; ++i)
+            {
+                coffs[i] = static_cast<float>(coffs[i] / scale);
+            }
+        }
+    }
+    bytes_.resize(port_bytes);
+    pcm_frames_ = static_cast<std::size_t>(transfer_frames);
+    return {};
+}
+
+std::size_t PCMConverter::frame_offset(std::size_t period_index) const noexcept
+{
+    // Round the cumulative frame position up, keeping fractional periods aligned.
+    const auto frames_x1000 = period_frames_x1000_ * period_index;
+    return static_cast<std::size_t>(frames_x1000 / 1000 + (frames_x1000 % 1000 != 0));
+}
+
+void PCMConverter::decode(const std::uint8_t *pcm, std::size_t frames, OBlock output) noexcept
+{
+    const bool resampling = src_fs_ != dst_fs_;
+    const auto mapped = matrix_.empty() ? output : mapped_samples_.block(output.frames());
+    const auto samples = resampling ? pcm_samples_.block(frames) : mapped;
+    if (spec_.format == PCMFormat::F32LE)
+    {
+        copy_f32le(pcm, samples);
+    }
+    else
+    {
+        for (std::size_t frame = 0; frame < samples.frames(); ++frame)
+        {
+            for (std::size_t ch = 0; ch < samples.channels(); ++ch, pcm += sample_bytes_)
+            {
+                samples.channel(ch)[frame] = decode_integer(read_le(pcm, sample_bytes_), sample_bits_);
+            }
+        }
+    }
+    if (resampling)
+    {
+        resample(samples, mapped);
+    }
+    if (!matrix_.empty())
+    {
+        output.clear();
+        matrix_.mix_add(mapped, output);
+    }
+}
+
+void PCMConverter::encode(IBlock input, std::size_t frames, std::uint8_t *pcm) noexcept
+{
+    if (!matrix_.empty())
+    {
+        const auto mapped = mapped_samples_.block(input.frames());
+        mapped.clear();
+        matrix_.mix_add(input, mapped);
+        input = mapped;
+    }
+    if (src_fs_ != dst_fs_)
+    {
+        const auto samples = pcm_samples_.block(frames);
+        resample(input, samples);
+        input = samples;
+    }
+    if (spec_.format == PCMFormat::F32LE)
+    {
+        copy_f32le(input, pcm);
+        return;
+    }
+    for (std::size_t frame = 0; frame < input.frames(); ++frame)
+    {
+        for (std::size_t ch = 0; ch < input.channels(); ++ch, pcm += sample_bytes_)
+        {
+            write_le(encode_integer(input.channel(ch)[frame], sample_bits_), pcm, sample_bytes_);
+        }
+    }
+}
+
+void PCMConverter::resample(IBlock input, OBlock output) noexcept
+{
+    const auto history = history_.block(taps);
+    // src_pos is in units of 1 / dst_fs_; the first taps frames address history.
+    auto src_pos = static_cast<std::uint64_t>(dst_fs_ + phase_);
+    Coefficients coffs;
+    for (std::size_t frame = 0; frame < output.frames(); ++frame, src_pos += src_fs_)
+    {
+        calc_coffs(kernel_.data(), dst_fs_, src_pos, coffs);
+        const auto frame_index = static_cast<std::size_t>(src_pos / dst_fs_);
+        const auto history_offset = std::min(frame_index, taps);
+        const auto input_offset = frame_index - history_offset;
+        for (std::size_t ch = 0; ch < output.channels(); ++ch)
+        {
+            output.channel(ch)[frame] = interpolate(history.channel(ch) + history_offset,
+                                                    input.channel(ch) + input_offset, taps - history_offset, coffs);
+        }
+    }
+
+    phase_ +=
+        static_cast<std::int64_t>(output.frames()) * src_fs_ - static_cast<std::int64_t>(input.frames()) * dst_fs_;
+    const auto copy_frames = std::min(input.frames(), taps);
+    const auto keep_frames = taps - copy_frames;
+    for (std::size_t ch = 0; ch < input.channels(); ++ch)
+    {
+        auto *history_samples = history.channel(ch);
+        std::memmove(history_samples, history_samples + copy_frames, keep_frames * sizeof(float));
+        std::copy_n(input.channel(ch) + input.frames() - copy_frames, copy_frames, history_samples + keep_frames);
+    }
+}
+
+void PCMConverter::reset() noexcept
+{
+    period_index_ = 0;
+    clear_block();
+    phase_ = 0;
+    history_.block(history_.capacity_frames()).clear();
+}
+
+PCMConverter::Period PCMConverter::next_period() noexcept
+{
+    const auto frames = frame_offset(period_index_ + 1) - frame_offset(period_index_);
+    if (++period_index_ == spec_.periods)
+    {
+        period_index_ = 0;
+    }
+    valid_bytes_ = frames * frame_bytes();
+    return {{bytes_.data(), valid_bytes_}, frames};
+}
+
+namespace
+{
+
+RetCode prepare_converter(std::unique_ptr<PCMConverter> &converter, EngineSpec expected, const EngineSpec &graph,
+                          const PortSpec &input, const PortSpec &output, const ChMatrix &matrix)
+{
+    const auto frames = graph.block_frames();
+    const auto input_channels = input.spec.channels;
+    const auto output_channels = output.spec.channels;
+    if (!(expected == graph) || frames == 0 || input_channels == 0 || output_channels == 0)
+    {
+        return ErrorCode::InvalidArg;
+    }
+    if (matrix.empty() ? input_channels != output_channels
+                       : matrix.input_channels() != input_channels || matrix.output_channels() != output_channels)
+    {
+        return ErrorCode::ChannelMismatch;
+    }
+
+    const auto &pcm = input.is_pcm() ? input.spec : output.spec;
+    const auto src_fs = input.is_pcm() ? input.spec.sample_rate : graph.sample_rate();
+    const auto dst_fs = output.is_pcm() ? output.spec.sample_rate : graph.sample_rate();
+    auto candidate = std::make_unique<PCMConverter>(pcm, src_fs, dst_fs, graph.block_period(), matrix);
+    const auto code = candidate->prepare_pcm(frames);
+    if (code)
+    {
+        converter = std::move(candidate);
+    }
+    return code;
+}
+
+RetCode check_pcm_binding(const PCMConverter *converter, std::size_t bytes, bool bound) noexcept
+{
+    if (!converter)
+    {
+        return ErrorCode::NotPrepared;
+    }
+    if (bytes != converter->pcm_bytes())
+    {
+        return ErrorCode::InvalidArg;
+    }
+    return bound ? ErrorCode::BufferFull : ErrorCode::Ok;
+}
+
+} // namespace
+
+IAdapter::IAdapter(std::size_t channels, EngineSpec graph_spec, PCMSpec pcm, ChMatrix matrix)
+    : NodeT<1, 1>({{PortSpec{pcm}}}, {{channels}}), graph_spec_(graph_spec), matrix_(std::move(matrix))
+{
+}
+
+IAdapter::~IAdapter() = default;
+
+std::size_t IAdapter::pcm_frames() const noexcept
+{
+    return converter_ ? converter_->pcm_frames() : 0;
+}
+
+std::size_t IAdapter::pcm_bytes() const noexcept
+{
+    return converter_ ? converter_->pcm_bytes() : 0;
+}
+
+RetCode IAdapter::bind_pcm(View<const std::uint8_t> bytes) noexcept
+{
+    const auto code = check_pcm_binding(converter_.get(), bytes.size(), !pcm_.empty());
+    if (code)
+    {
+        pcm_ = bytes;
+    }
+    return code;
+}
+
+View<const std::uint8_t> IAdapter::pcm_block(PortDirection direction, std::size_t index) const noexcept
+{
+    return direction == PortDirection::Input && index == 0 && converter_ ? converter_->block()
+                                                                         : View<const std::uint8_t>{nullptr, 0};
+}
+
+void IAdapter::process(const ProcContext &context) noexcept
+{
+    const auto output = context.outputs[0];
+    if (pcm_.empty())
+    {
+        converter_->clear_block();
+        output.clear();
+        return;
+    }
+    const auto period = converter_->next_period();
+    const auto size = period.bytes.size();
+    std::memcpy(period.bytes.data(), pcm_.data(), size);
+    converter_->decode(period.bytes.data(), period.frames, output);
+    pcm_ = {pcm_.data() + size, pcm_.size() - size};
+}
+
+void IAdapter::reset() noexcept
+{
+    pcm_ = {nullptr, 0};
+    if (converter_)
+    {
+        converter_->reset();
+    }
+}
+
+RetCode IAdapter::prepare(const EngineSpec &graph_spec)
+{
+    return prepare_converter(converter_, graph_spec_, graph_spec, inputs()[0], outputs()[0], matrix_);
+}
+
+OAdapter::OAdapter(std::size_t channels, EngineSpec graph_spec, PCMSpec pcm, ChMatrix matrix)
+    : NodeT<1, 1>({{channels}}, {{PortSpec{pcm}}}), graph_spec_(graph_spec), matrix_(std::move(matrix))
+{
+}
+
+OAdapter::~OAdapter() = default;
+
+std::size_t OAdapter::pcm_frames() const noexcept
+{
+    return converter_ ? converter_->pcm_frames() : 0;
+}
+
+std::size_t OAdapter::pcm_bytes() const noexcept
+{
+    return converter_ ? converter_->pcm_bytes() : 0;
+}
+
+RetCode OAdapter::bind_pcm(View<std::uint8_t> bytes) noexcept
+{
+    const auto code = check_pcm_binding(converter_.get(), bytes.size(), !pcm_.empty());
+    if (code)
+    {
+        pcm_ = bytes;
+    }
+    return code;
+}
+
+View<const std::uint8_t> OAdapter::pcm_block(PortDirection direction, std::size_t index) const noexcept
+{
+    return direction == PortDirection::Output && index == 0 && converter_ ? converter_->block()
+                                                                          : View<const std::uint8_t>{nullptr, 0};
+}
+
+void OAdapter::process(const ProcContext &context) noexcept
+{
+    const auto period = converter_->next_period();
+    converter_->encode(context.inputs[0], period.frames, period.bytes.data());
+    if (!pcm_.empty())
+    {
+        const auto size = period.bytes.size();
+        std::memcpy(pcm_.data(), period.bytes.data(), size);
+        pcm_ = {pcm_.data() + size, pcm_.size() - size};
+    }
+}
+
+void OAdapter::reset() noexcept
+{
+    pcm_ = {nullptr, 0};
+    if (converter_)
+    {
+        converter_->reset();
+    }
+}
+
+RetCode OAdapter::prepare(const EngineSpec &graph_spec)
+{
+    return prepare_converter(converter_, graph_spec_, graph_spec, inputs()[0], outputs()[0], matrix_);
+}
+
+} // namespace aereborn
+
+===== plugins/adapter.h =====
+#ifndef AEREBORN_PLUGINS_ADAPTER_H
+#define AEREBORN_PLUGINS_ADAPTER_H
+
+#include "core/graph.h"
+#include <memory>
+
+namespace aereborn
+{
+
+class PCMConverter;
+
+// Configuration is fixed for the lifetime of the node. Engine::prepare prepares the converter.
+// Device buffers are borrowed for a transfer. Serialize bind/reset with process().
+// Borrow interleaved PCM for spec.periods process calls. Device I/O and queues belong to the backend.
+class IAdapter final : public NodeT<1, 1>
+{
+  public:
+    IAdapter(std::size_t channels, EngineSpec graph_spec, PCMSpec pcm, ChMatrix matrix = {});
+    ~IAdapter() override;
+    std::size_t pcm_frames() const noexcept;
+    std::size_t pcm_bytes() const noexcept;
+    RetCode bind_pcm(View<const std::uint8_t> bytes) noexcept;
+
+    View<const std::uint8_t> pcm_block(PortDirection, std::size_t) const noexcept override;
+    void process(const ProcContext &context) noexcept override;
+    void reset() noexcept override;
+
+  private:
+    RetCode prepare(const EngineSpec &graph_spec) override;
+
+    const EngineSpec graph_spec_;
+    const ChMatrix matrix_;
+    std::unique_ptr<PCMConverter> converter_;
+    View<const std::uint8_t> pcm_{nullptr, 0};
+};
+
+class OAdapter final : public NodeT<1, 1>
+{
+  public:
+    OAdapter(std::size_t channels, EngineSpec graph_spec, PCMSpec pcm, ChMatrix matrix = {});
+    ~OAdapter() override;
+    std::size_t pcm_frames() const noexcept;
+    std::size_t pcm_bytes() const noexcept;
+    RetCode bind_pcm(View<std::uint8_t> bytes) noexcept;
+
+    View<const std::uint8_t> pcm_block(PortDirection, std::size_t) const noexcept override;
+    void process(const ProcContext &context) noexcept override;
+    void reset() noexcept override;
+
+  private:
+    RetCode prepare(const EngineSpec &graph_spec) override;
+
+    const EngineSpec graph_spec_;
+    const ChMatrix matrix_;
+    std::unique_ptr<PCMConverter> converter_;
+    View<std::uint8_t> pcm_{nullptr, 0};
+};
+
+} // namespace aereborn
+
+#endif // AEREBORN_PLUGINS_ADAPTER_H
+
+===== plugins/virtual.cpp =====
+#include "virtual.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+
+namespace aereborn
+{
+namespace
+{
+RetCode resize_pcm(PCMSpec spec, BlockPeriod period, std::vector<std::uint8_t> &pcm)
+{
+    if (!pcm.empty())
+    {
+        return {};
+    }
+    const auto period_ms = static_cast<std::uint32_t>(period);
+    const auto sample_bytes = pcm_sample_bytes(spec.format);
+    if (!is_pcm_sample_rate(spec.sample_rate) || sample_bytes == 0 || spec.channels == 0 || spec.periods == 0 ||
+        !is_block_period(period))
+    {
+        return ErrorCode::InvalidArg;
+    }
+    const auto period_frames_x1000 = std::uint64_t{static_cast<std::uint32_t>(spec.sample_rate)} * period_ms;
+    if (spec.periods > std::numeric_limits<std::uint64_t>::max() / period_frames_x1000)
+    {
+        return ErrorCode::TooLarge;
+    }
+    const auto frames_x1000 = period_frames_x1000 * spec.periods;
+    if (frames_x1000 % 1000 != 0)
+    {
+        return ErrorCode::InvalidArg;
+    }
+    const auto frames = frames_x1000 / 1000;
+    if (spec.channels > pcm.max_size() / sample_bytes / frames)
+    {
+        return ErrorCode::TooLarge;
+    }
+    pcm.resize(static_cast<std::size_t>(frames) * spec.channels * sample_bytes);
+    return {};
+}
+
+// Generate the requested wire representation directly, independently of Adapter's conversion code.
+void write_sample(float sample, PCMFormat format, std::uint8_t *output) noexcept
+{
+    std::uint32_t word;
+    if (format == PCMFormat::F32LE)
+    {
+        std::memcpy(&word, &sample, sizeof(word));
+    }
+    else
+    {
+        const auto bits = pcm_sample_bits(format);
+        const auto scale = std::ldexp(1.0, bits - 1);
+        const auto scaled = std::round(static_cast<double>(sample) * scale);
+        const auto clamped = std::max(-scale, std::min(scale - 1, scaled));
+        word = static_cast<std::uint32_t>(static_cast<std::int64_t>(clamped));
+        if (bits < 32)
+        {
+            word &= (std::uint32_t{1} << bits) - 1;
+        }
+    }
+    for (std::size_t byte = 0; byte < pcm_sample_bytes(format); ++byte)
+    {
+        output[byte] = static_cast<std::uint8_t>(word >> (8 * byte));
+    }
+}
+} // namespace
+
+VirtualSource::VirtualSource(PCMSpec spec, BlockPeriod period, double frequency_hz, float amplitude)
+    : spec_(spec), period_(period), frequency_hz_(frequency_hz), amplitude_(amplitude)
+{
+}
+
+RetCode VirtualSource::prepare()
+{
+    const auto sample_rate = static_cast<std::uint32_t>(spec_.sample_rate);
+    if (!(frequency_hz_ >= 0 && frequency_hz_ < sample_rate / 2.0) || !std::isfinite(amplitude_))
+    {
+        return ErrorCode::InvalidArg;
+    }
+    return resize_pcm(spec_, period_, pcm_);
+}
+
+RetCode VirtualSource::generate() noexcept
+{
+    if (pcm_.empty())
+    {
+        return ErrorCode::NotPrepared;
+    }
+    constexpr double two_pi = 6.28318530717958647692;
+    const auto step = two_pi * frequency_hz_ / static_cast<std::uint32_t>(spec_.sample_rate);
+    const auto phase = std::fmod(static_cast<double>(frame_position_) * step, two_pi);
+    const auto sample_bytes = pcm_sample_bytes(spec_.format);
+    const auto frames = pcm_frames();
+    auto *output = pcm_.data();
+    for (std::size_t frame = 0; frame < frames; ++frame)
+    {
+        const auto sample = amplitude_ * static_cast<float>(std::sin(phase + frame * step));
+        for (std::size_t ch = 0; ch < spec_.channels; ++ch)
+        {
+            write_sample(sample, spec_.format, output);
+            output += sample_bytes;
+        }
+    }
+    frame_position_ += frames;
+    generated_ = true;
+    return {};
+}
+
+std::size_t VirtualSource::pcm_frames() const noexcept
+{
+    return pcm_.empty() ? 0 : pcm_.size() / spec_.channels / pcm_sample_bytes(spec_.format);
+}
+
+void VirtualSource::reset() noexcept
+{
+    frame_position_ = 0;
+    generated_ = false;
+}
+
+View<const std::uint8_t> VirtualSource::pcm() const noexcept
+{
+    return {pcm_.data(), generated_ ? pcm_.size() : 0};
+}
+
+VirtualSink::VirtualSink(PCMSpec spec, BlockPeriod period) : spec_(spec), period_(period)
+{
+}
+
+RetCode VirtualSink::prepare()
+{
+    return resize_pcm(spec_, period_, pcm_);
+}
+
+RetCode VirtualSink::receive(View<const std::uint8_t> pcm) noexcept
+{
+    if (pcm_.empty())
+    {
+        return ErrorCode::NotPrepared;
+    }
+    if (pcm.size() != pcm_.size())
+    {
+        return ErrorCode::InvalidArg;
+    }
+    std::copy(pcm.begin(), pcm.end(), pcm_.begin());
+    received_ = true;
+    return {};
+}
+
+void VirtualSink::reset() noexcept
+{
+    received_ = false;
+}
+
+View<const std::uint8_t> VirtualSink::pcm() const noexcept
+{
+    return {pcm_.data(), received_ ? pcm_.size() : 0};
+}
+
+bool VirtualSink::matches(View<const std::uint8_t> expected) const noexcept
+{
+    return received_ && expected.size() == pcm_.size() && std::equal(expected.begin(), expected.end(), pcm_.begin());
+}
+
+} // namespace aereborn
+
+===== plugins/virtual.h =====
+#ifndef AEREBORN_PLUGINS_VIRTUAL_H
+#define AEREBORN_PLUGINS_VIRTUAL_H
+
+#include "core/types.h"
+#include <vector>
+
+namespace aereborn
+{
+
+// Graph-external PCM generator. Feed pcm() to IAdapter after each generate().
+class VirtualSource
+{
+  public:
+    VirtualSource(PCMSpec spec, BlockPeriod period, double frequency_hz = 440.0, float amplitude = 0.25f);
+    RetCode prepare();
+    RetCode generate() noexcept;
+    void reset() noexcept;
+    std::size_t pcm_frames() const noexcept;
+    // Borrowed until the next generate(), reset() or destruction.
+    View<const std::uint8_t> pcm() const noexcept;
+
+  private:
+    const PCMSpec spec_;
+    const BlockPeriod period_;
+    const double frequency_hz_;
+    const float amplitude_;
+    std::vector<std::uint8_t> pcm_;
+    std::uint64_t frame_position_ = 0;
+    bool generated_ = false;
+};
+
+// Graph-external PCM receiver. Copies a complete OAdapter transfer for inspection.
+class VirtualSink
+{
+  public:
+    VirtualSink(PCMSpec spec, BlockPeriod period);
+    RetCode prepare();
+    RetCode receive(View<const std::uint8_t> pcm) noexcept;
+    void reset() noexcept;
+    View<const std::uint8_t> pcm() const noexcept;
+    bool matches(View<const std::uint8_t> expected) const noexcept;
+
+  private:
+    const PCMSpec spec_;
+    const BlockPeriod period_;
+    std::vector<std::uint8_t> pcm_;
+    bool received_ = false;
+};
+
+} // namespace aereborn
+
+#endif // AEREBORN_PLUGINS_VIRTUAL_H
+
+===== examples/clocked_graph.cpp =====
+#include "core/engine.h"
+
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <iostream>
+#include <mutex>
+#include <stdexcept>
+
+namespace
+{
+using namespace aereborn;
+
+void checked(RetCode code)
+{
+    if (!code)
+    {
+        throw std::runtime_error(code.message());
+    }
+}
+
+template <class T> T checked(Result<T> result)
+{
+    checked(result.ret_code());
+    return std::move(result).value();
+}
+
+class Tone final : public NodeT<0, 1>
+{
+  public:
+    Tone() : NodeT({}, {{1}})
+    {
+    }
+    RetCode prepare(const EngineSpec &spec) override
+    {
+        step_ = 6.283185307179586 * 440 / static_cast<std::uint32_t>(spec.sample_rate());
+        return {};
+    }
+    void process(const ProcContext &context) noexcept override
+    {
+        const auto output = context.outputs[0];
+        for (std::size_t frame = 0; frame < output.frames(); ++frame)
+        {
+            output.channel(0)[frame] = 0.25f * static_cast<float>(std::sin((context.frame_position + frame) * step_));
+        }
+    }
+
+  private:
+    double step_ = 0;
+};
+
+class PassThrough final : public NodeT<1, 1>
+{
+  public:
+    PassThrough() : NodeT({{1}}, {{1}})
+    {
+    }
+    void process(const ProcContext &context) noexcept override
+    {
+        const auto input = context.inputs[0];
+        const auto output = context.outputs[0];
+        std::copy_n(input.channel(0), output.frames(), output.channel(0));
+    }
+};
+} // namespace
+
+int main()
+{
+    try
+    {
+        std::mutex mutex;
+        std::condition_variable received;
+        std::size_t packets = 0;
+        Engine engine(SampleRate::Hz48000, BlockPeriod::Ms05);
+        const auto tone = checked(engine.emplace_node<Tone>());
+        const auto bus = checked(engine.emplace_node<PassThrough>());
+        const auto conn = checked(engine.connect({tone}, {bus}));
+        const auto observer = checked(engine.subscribe({bus}, {},
+            [&](const Observation &packet) {
+                const std::lock_guard<std::mutex> lock(mutex);
+                std::cout << "frame=" << packet.frame_position << " frames=" << packet.audio.frames()
+                          << " dropped=" << packet.dropped_frames << '\n';
+                ++packets;
+                received.notify_one();
+            }));
+        checked(engine.prepare());
+        checked(engine.start());
+
+        const auto wait_for_packets = [&](std::size_t count) {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (!received.wait_for(lock, std::chrono::seconds(3), [&] { return packets >= count; }))
+            {
+                throw std::runtime_error("Timed out waiting for observer audio");
+            }
+        };
+        wait_for_packets(2);
+        checked(engine.set_gain(conn, 0.5f));
+        wait_for_packets(4);
+        checked(engine.unsubscribe(observer));
+        checked(engine.stop());
+        std::cout << "stopped at frame " << engine.frame_position() << '\n';
+    }
+    catch (const std::exception &error)
+    {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}
+
+===== examples/CMakeLists.txt =====
+add_executable(clocked_graph clocked_graph.cpp)
+target_link_libraries(clocked_graph PRIVATE aereborn::core)
+
+if(BUILD_TESTING)
+    add_test(NAME example.clocked_graph COMMAND clocked_graph)
+    set_tests_properties(example.clocked_graph PROPERTIES LABELS example TIMEOUT 20)
+endif()

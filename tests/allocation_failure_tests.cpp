@@ -2,6 +2,7 @@
 #include "support/test_harness.h"
 #include "support/pcm_reference.h"
 #include "core/engine.h"
+#include "core/observer.h"
 #include "plugins/adapter.h"
 #include <cmath>
 #include <cstdlib>
@@ -22,7 +23,7 @@ thread_local bool measure_heap = false;
 thread_local std::size_t heap_calls = 0;
 }
 
-// Fail each allocation in configure_pcm(), including failures after workspace preparation.
+// Fail each allocation in prepare(), including failures after workspace preparation.
 void *operator new(std::size_t size)
 {
     if (allocation_test::measure_heap)
@@ -110,12 +111,12 @@ void pcm_configuration_rollback()
         {
             Engine engine(rate, period);
             ManualClock clock(engine);
-            const auto input_id = checked(engine.emplace_node<IAdapter>(2, engine.spec()));
-            const auto output_id = checked(engine.emplace_node<OAdapter>(2, engine.spec()));
+            const PCMSpec capture_spec{SampleRate::Hz44100, PCMFormat::F32LE, 2, 2};
+            const PCMSpec playback_spec{rate, PCMFormat::F32LE, 2, 2};
+            const auto input_id = checked(engine.emplace_node<IAdapter>(2, capture_spec));
+            const auto output_id = checked(engine.emplace_node<OAdapter>(2, playback_spec));
             auto *input = checked(engine.node<IAdapter>(input_id));
             auto *output = checked(engine.node<OAdapter>(output_id));
-            checked(input->configure_pcm({SampleRate::Hz44100, PCMFormat::F32LE, 2, 2}));
-            checked(output->configure_pcm({rate, PCMFormat::F32LE, 2, 2}));
             checked(engine.connect({input_id}, {output_id}));
             checked(engine.prepare());
             std::vector<std::uint8_t> pcm(input->pcm_bytes());
@@ -130,13 +131,21 @@ void pcm_configuration_rollback()
             checked(output->bind_pcm({packet.data(), packet.size()}));
             checked(clock.tick());
             const auto previous = packet;
+            checked(clock.stop());
 
             const PCMSpec replacement{SampleRate::Hz16000, PCMFormat::S16LE, 1};
             RetCode code;
-            const bool failed = allocation_fails_after(failure, [&] {
-                code = replace_input ? input->configure_pcm(replacement, mono_to_stereo)
-                                     : output->configure_pcm(replacement, stereo_to_mono);
-            });
+            if (replace_input)
+            {
+                checked(engine.replace_node(input_id, std::make_unique<IAdapter>(2, replacement,
+                                                                                mono_to_stereo)));
+            }
+            else
+            {
+                checked(engine.replace_node(output_id, std::make_unique<OAdapter>(2, replacement,
+                                                                                 stereo_to_mono)));
+            }
+            const bool failed = allocation_fails_after(failure, [&] { code = engine.prepare().ret_code(); });
             if (!failed)
             {
                 checked(code);
@@ -163,17 +172,20 @@ void render_uses_prepared_buffers()
 {
     Engine engine(rate, period);
     ManualClock clock(engine);
-    const auto input_id = checked(engine.emplace_node<IAdapter>(1, engine.spec()));
-    const auto output_id = checked(engine.emplace_node<OAdapter>(1, engine.spec()));
+    const PCMSpec capture_spec{SampleRate::Hz16000, PCMFormat::F32LE, 1};
+    const PCMSpec playback_spec{rate, PCMFormat::F32LE, 1};
+    const auto input_id = checked(engine.emplace_node<IAdapter>(1, capture_spec));
+    const auto output_id = checked(engine.emplace_node<OAdapter>(1, playback_spec));
     auto *input = checked(engine.node<IAdapter>(input_id));
     auto *output = checked(engine.node<OAdapter>(output_id));
-    checked(input->configure_pcm({SampleRate::Hz16000, PCMFormat::F32LE, 1}));
-    checked(output->configure_pcm({rate, PCMFormat::F32LE, 1}));
     const auto connection = checked(engine.connect({input_id}, {output_id}));
     checked(engine.prepare());
     checked(clock.start());
 
-    checked(engine.subscribe({input_id}, {block_frames}, [](const Observation &) {}));
+    const auto observe = [](const Observation &) {};
+    checked(engine.add_observer(std::make_unique<Observer>(OPort{input_id}, observe)));
+    checked(engine.add_observer(std::make_unique<Observer>(IPort{input_id}, observe)));
+    checked(engine.add_observer(std::make_unique<Observer>(OPort{output_id}, observe)));
     const auto revision = checked(engine.prepare());
     checked(engine.set_gain(connection, 0.5f));
     std::vector<std::uint8_t> capture(input->pcm_bytes());

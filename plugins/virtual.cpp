@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <limits>
 
 namespace aereborn
 {
@@ -15,29 +14,21 @@ RetCode resize_pcm(PCMSpec spec, BlockPeriod period, std::vector<std::uint8_t> &
     {
         return {};
     }
-    const auto period_ms = static_cast<std::uint32_t>(period);
     const auto sample_bytes = pcm_sample_bytes(spec.format);
-    if (!is_pcm_sample_rate(spec.sample_rate) || sample_bytes == 0 || spec.channels == 0 || spec.periods == 0 ||
-        !is_block_period(period))
+    if (sample_bytes == 0 || spec.channels == 0)
     {
         return ErrorCode::InvalidArg;
     }
-    const auto period_frames_x1000 = std::uint64_t{static_cast<std::uint32_t>(spec.sample_rate)} * period_ms;
-    if (spec.periods > std::numeric_limits<std::uint64_t>::max() / period_frames_x1000)
+    const auto frames = spec.transfer_frames(period);
+    if (!frames)
+    {
+        return frames.ret_code();
+    }
+    if (spec.channels > pcm.max_size() / sample_bytes / frames.value())
     {
         return ErrorCode::TooLarge;
     }
-    const auto frames_x1000 = period_frames_x1000 * spec.periods;
-    if (frames_x1000 % 1000 != 0)
-    {
-        return ErrorCode::InvalidArg;
-    }
-    const auto frames = frames_x1000 / 1000;
-    if (spec.channels > pcm.max_size() / sample_bytes / frames)
-    {
-        return ErrorCode::TooLarge;
-    }
-    pcm.resize(static_cast<std::size_t>(frames) * spec.channels * sample_bytes);
+    pcm.resize(frames.value() * spec.channels * sample_bytes);
     return {};
 }
 

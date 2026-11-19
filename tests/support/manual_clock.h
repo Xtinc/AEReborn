@@ -1,6 +1,7 @@
 #ifndef AEREBORN_TESTS_MANUAL_CLOCK_H
 #define AEREBORN_TESTS_MANUAL_CLOCK_H
 
+#include "core/clock.h"
 #include "core/engine.h"
 
 namespace aereborn

@@ -23,10 +23,8 @@ std::vector<float> input_resample(SampleRate graph_rate, BlockPeriod graph_perio
     const auto graph_frames = engine.spec().block_frames();
     const auto source_hz = static_cast<std::uint32_t>(source_rate);
     const PCMSpec spec{source_rate, PCMFormat::F32LE, 2, periods_per_transfer};
-    const auto input_id = checked(engine.emplace_node<IAdapter>(spec.channels, engine.spec()));
-    checked(checked(engine.node<IAdapter>(input_id))->configure_pcm(spec));
-    const auto output_id = checked(engine.emplace_node<OAdapter>(2, engine.spec()));
-    checked(checked(engine.node<OAdapter>(output_id))->configure_pcm(PCMSpec{graph_rate, PCMFormat::F32LE, 2}));
+    const auto input_id = checked(engine.emplace_node<IAdapter>(spec.channels, spec));
+    const auto output_id = checked(engine.emplace_node<OAdapter>(2, PCMSpec{graph_rate, PCMFormat::F32LE, 2}));
     checked(engine.connect({input_id}, {output_id}));
     checked(engine.prepare());
     auto *input = checked(engine.node<IAdapter>(input_id));
@@ -89,10 +87,8 @@ std::vector<float> output_resample(SampleRate graph_rate, BlockPeriod graph_peri
     checked(source.prepare());
     Engine engine(graph_rate, graph_period);
     ManualClock clock(engine);
-    const auto input_id = checked(engine.emplace_node<IAdapter>(source_spec.channels, engine.spec()));
-    checked(checked(engine.node<IAdapter>(input_id))->configure_pcm(source_spec));
-    const auto output_id = checked(engine.emplace_node<OAdapter>(1, engine.spec()));
-    checked(checked(engine.node<OAdapter>(output_id))->configure_pcm(PCMSpec{target_rate, PCMFormat::F32LE, 1, periods_per_transfer}));
+    const auto input_id = checked(engine.emplace_node<IAdapter>(source_spec.channels, source_spec));
+    const auto output_id = checked(engine.emplace_node<OAdapter>(1, PCMSpec{target_rate, PCMFormat::F32LE, 1, periods_per_transfer}));
     checked(engine.connect({input_id}, {output_id}));
     checked(engine.prepare());
     auto *input = checked(engine.node<IAdapter>(input_id));

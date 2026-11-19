@@ -1,4 +1,5 @@
 #include "core/engine.h"
+#include "core/observer.h"
 
 #include <chrono>
 #include <cmath>
@@ -72,17 +73,17 @@ int main()
         std::condition_variable received;
         std::size_t packets = 0;
         Engine engine(SampleRate::Hz48000, BlockPeriod::Ms05);
-        const auto tone = checked(engine.emplace_node<Tone>());
-        const auto bus = checked(engine.emplace_node<PassThrough>());
+        const auto tone = checked(engine.add_node(std::make_unique<Tone>()));
+        const auto bus = checked(engine.add_node(std::make_unique<PassThrough>()));
         const auto conn = checked(engine.connect({tone}, {bus}));
-        const auto observer = checked(engine.subscribe({bus}, {2 * engine.spec().block_frames()},
-            [&](const Observation &packet) {
-                const std::lock_guard<std::mutex> lock(mutex);
-                std::cout << "frame=" << packet.frame_position << " frames=" << packet.audio.frames()
-                          << " dropped=" << packet.dropped_frames << '\n';
-                ++packets;
-                received.notify_one();
-            }));
+        auto observer = std::make_unique<Observer>(OPort{bus}, [&](const Observation &packet) {
+            const std::lock_guard<std::mutex> lock(mutex);
+            std::cout << "frame=" << packet.frame_position << " frames=" << packet.audio.frames()
+                      << " dropped=" << packet.dropped_frames << '\n';
+            ++packets;
+            received.notify_one();
+        });
+        const auto observer_id = checked(engine.add_observer(std::move(observer)));
         checked(engine.prepare());
         checked(engine.start());
 
@@ -96,7 +97,7 @@ int main()
         wait_for_packets(2);
         checked(engine.set_gain(conn, 0.5f));
         wait_for_packets(4);
-        checked(engine.unsubscribe(observer));
+        checked(engine.remove_observer(observer_id));
         checked(engine.stop());
         std::cout << "stopped at frame " << engine.frame_position() << '\n';
     }

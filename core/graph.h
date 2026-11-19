@@ -14,15 +14,21 @@ class Node
     virtual ~Node() = default;
     Node(const Node &) = delete;
     Node &operator=(const Node &) = delete;
-    // Each entry is the channel count of one port.
-    virtual View<const std::size_t> inputs() const noexcept = 0;
-    virtual View<const std::size_t> outputs() const noexcept = 0;
+    // The engine borrows these descriptors for as long as it owns the node.
+    virtual View<const PortSpec> inputs() const noexcept = 0;
+    virtual View<const PortSpec> outputs() const noexcept = 0;
+    // A PCM port owns or borrows its block through the end of the current tick.
+    virtual View<const std::uint8_t> pcm_block(PortDirection, std::size_t) const noexcept
+    {
+        return {nullptr, 0};
+    }
     // Validate configuration and prepare resources. The engine may retry a failed preparation.
     virtual RetCode prepare(const EngineSpec &)
     {
         return {};
     }
-    // Use context's block views during this call and fill every output sample.
+    // Context views are valid during this call. PCM ports have empty views at their indices.
+    // Fill every sample of each planar output and expose PCM data through pcm_block().
     virtual void process(const ProcContext &context) noexcept = 0;
     virtual void reset() noexcept
     {
@@ -32,28 +38,27 @@ class Node
     Node() = default;
 };
 
-// Port counts are compile-time constants. Channel counts are stored inline.
+// Port counts are compile-time constants. Descriptors are stored inline.
 template <std::size_t I, std::size_t O> class NodeT : public Node
 {
     static_assert(I + O > 0, "Node needs at least one port");
 
   public:
-    NodeT(std::array<std::size_t, I> input_channels, std::array<std::size_t, O> output_channels)
-        : input_channels_(input_channels), output_channels_(output_channels)
+    NodeT(std::array<PortSpec, I> inputs, std::array<PortSpec, O> outputs) : inputs_(inputs), outputs_(outputs)
     {
     }
-    View<const std::size_t> inputs() const noexcept final
+    View<const PortSpec> inputs() const noexcept final
     {
-        return {input_channels_.data(), I};
+        return {inputs_.data(), I};
     }
-    View<const std::size_t> outputs() const noexcept final
+    View<const PortSpec> outputs() const noexcept final
     {
-        return {output_channels_.data(), O};
+        return {outputs_.data(), O};
     }
 
   private:
-    std::array<std::size_t, I> input_channels_;
-    std::array<std::size_t, O> output_channels_;
+    const std::array<PortSpec, I> inputs_;
+    const std::array<PortSpec, O> outputs_;
 };
 
 } // namespace aereborn

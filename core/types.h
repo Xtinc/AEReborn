@@ -131,6 +131,29 @@ struct PCMSpec
     PCMFormat format;
     std::size_t channels;
     std::size_t periods = 1; // Engine periods per PCM transfer, independent of the hardware period.
+
+    // Validate the timing and return the number of device frames in a complete transfer.
+    Result<std::size_t> transfer_frames(BlockPeriod period) const noexcept;
+};
+
+enum class PortDirection { Input, Output };
+
+struct PortSpec
+{
+    enum class Layout { PlanarFloat, InterleavedPCM };
+
+    PortSpec(std::size_t channels = 0) noexcept : spec{SampleRate{}, PCMFormat::F32LE, channels} {}
+    explicit PortSpec(PCMSpec pcm) noexcept : spec(pcm), layout(Layout::InterleavedPCM) {}
+    bool is_pcm() const noexcept { return layout == Layout::InterleavedPCM; }
+    bool operator==(const PortSpec &other) const noexcept
+    {
+        return layout == other.layout && spec.sample_rate == other.spec.sample_rate &&
+               spec.format == other.spec.format && spec.channels == other.spec.channels &&
+               spec.periods == other.spec.periods;
+    }
+
+    PCMSpec spec; // For planar ports the engine resolves sample_rate; periods applies only to PCM.
+    Layout layout = Layout::PlanarFloat;
 };
 
 // IDs are never reused, including across Engine instances in this process.
@@ -152,6 +175,8 @@ struct ConnId
     bool operator<(ConnId other) const noexcept;
 };
 
+using ObserverId = std::uint64_t;
+
 struct IPort
 {
     NodeId node;
@@ -164,6 +189,20 @@ struct OPort
     std::size_t index = 0;
 };
 
+struct ObservationPort
+{
+    ObservationPort(IPort port) noexcept : node(port.node), index(port.index), direction(PortDirection::Input)
+    {
+    }
+    ObservationPort(OPort port) noexcept : node(port.node), index(port.index), direction(PortDirection::Output)
+    {
+    }
+
+    NodeId node;
+    std::size_t index;
+    PortDirection direction;
+};
+
 // Rows are destination channels; columns are source channels.
 class ChMatrix
 {
@@ -174,6 +213,7 @@ class ChMatrix
     // Add mapped samples to output. The caller validates the block sizes and channel counts.
     void mix_add(IBlock input, OBlock output, float gain = 1.0f) const noexcept;
     void mix_ramp_add(IBlock input, OBlock output, float from, float to) const noexcept;
+    bool matches(std::size_t input_channels, std::size_t output_channels) const noexcept;
     bool empty() const noexcept;
     std::size_t input_channels() const noexcept;
     std::size_t output_channels() const noexcept;

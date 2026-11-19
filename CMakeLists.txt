@@ -14,6 +14,7 @@ find_package(Threads REQUIRED)
 
 add_library(aereborn_core STATIC
     core/engine.cpp
+    core/observer.cpp
     core/runtime.cpp
     core/types.cpp
 )

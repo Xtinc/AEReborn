@@ -9,49 +9,51 @@ namespace aereborn
 
 class PCMConverter;
 
-// Fixed graph channels; configure on a non-audio thread, serialized with bind/reset/process.
-// Borrow interleaved PCM for spec.periods process calls. Device I/O and queues belong to the backend.
-class IAdapter final : public NodeT<0, 1>
+// Adapter configuration is fixed for the lifetime of each node. Engine::prepare prepares the converter.
+// Borrow interleaved PCM for spec.periods ticks, through the end of the final tick.
+// Serialize bind/reset with the tick. Device I/O and queues belong to the backend.
+class IAdapter final : public NodeT<1, 1>
 {
   public:
-    IAdapter(std::size_t channels, EngineSpec graph_spec);
+    IAdapter(std::size_t channels, PCMSpec pcm, ChMatrix matrix = {});
     ~IAdapter() override;
     std::size_t pcm_frames() const noexcept;
     std::size_t pcm_bytes() const noexcept;
     RetCode bind_pcm(View<const std::uint8_t> bytes) noexcept;
 
-    // A failed configuration preserves the active converter and borrowed PCM.
-    RetCode configure_pcm(PCMSpec spec, const ChMatrix &matrix = {});
+    View<const std::uint8_t> pcm_block(PortDirection, std::size_t) const noexcept override;
     void process(const ProcContext &context) noexcept override;
     void reset() noexcept override;
 
   private:
-    RetCode prepare(const EngineSpec &graph_spec) noexcept override;
+    RetCode prepare(const EngineSpec &graph_spec) override;
 
-    const EngineSpec graph_spec_;
+    const ChMatrix matrix_;
     std::unique_ptr<PCMConverter> converter_;
-    const std::uint8_t *pcm_ = nullptr;
+    View<const std::uint8_t> pcm_{nullptr, 0};
+    View<const std::uint8_t> last_slice_{nullptr, 0};
 };
 
-class OAdapter final : public NodeT<1, 0>
+class OAdapter final : public NodeT<1, 1>
 {
   public:
-    OAdapter(std::size_t channels, EngineSpec graph_spec);
+    OAdapter(std::size_t channels, PCMSpec pcm, ChMatrix matrix = {});
     ~OAdapter() override;
     std::size_t pcm_frames() const noexcept;
     std::size_t pcm_bytes() const noexcept;
     RetCode bind_pcm(View<std::uint8_t> bytes) noexcept;
 
-    RetCode configure_pcm(PCMSpec spec, const ChMatrix &matrix = {});
+    View<const std::uint8_t> pcm_block(PortDirection, std::size_t) const noexcept override;
     void process(const ProcContext &context) noexcept override;
     void reset() noexcept override;
 
   private:
-    RetCode prepare(const EngineSpec &graph_spec) noexcept override;
+    RetCode prepare(const EngineSpec &graph_spec) override;
 
-    const EngineSpec graph_spec_;
+    const ChMatrix matrix_;
     std::unique_ptr<PCMConverter> converter_;
-    std::uint8_t *pcm_ = nullptr;
+    View<std::uint8_t> pcm_{nullptr, 0};
+    View<const std::uint8_t> last_slice_{nullptr, 0};
 };
 
 } // namespace aereborn

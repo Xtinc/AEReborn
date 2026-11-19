@@ -1,9 +1,9 @@
 #ifndef AEREBORN_CORE_RUNTIME_H
 #define AEREBORN_CORE_RUNTIME_H
 
-#include "engine.h"
 #include <atomic>
-#include <limits>
+#include <functional>
+#include <memory>
 #include <vector>
 
 namespace aereborn
@@ -15,10 +15,6 @@ template <class T> class SpscRing
   public:
     explicit SpscRing(std::size_t capacity) : slots_(capacity + 1)
     {
-    }
-    std::vector<T> &slots() noexcept
-    {
-        return slots_;
     }
     bool lock_free() const noexcept
     {
@@ -45,10 +41,6 @@ template <class T> class SpscRing
     void consume() noexcept
     {
         tail_.store(next(tail_.load(std::memory_order_relaxed)), std::memory_order_release);
-    }
-    void clear_when_idle() noexcept
-    {
-        tail_.store(head_.load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
 
   private:
@@ -80,6 +72,7 @@ class EngineExecutionScope
     const void *previous_;
 };
 
+class ClockDriver;
 std::unique_ptr<ClockDriver> make_timer_driver();
 
 class RuntimeTask
@@ -88,46 +81,20 @@ class RuntimeTask
     virtual ~RuntimeTask() = default;
 };
 
-std::unique_ptr<RuntimeTask> start_runtime_task(EngineSpec spec, std::function<void()> run);
+std::unique_ptr<RuntimeTask> start_background_task(std::function<void()> run);
 
-class ObserverDelivery
+class Observer;
+
+class ObserverWorkers
 {
   public:
-    ObserverDelivery(EngineSpec spec, std::size_t channels, ObserverOptions options, ObserverCallback callback);
-    ~ObserverDelivery();
-    static bool fits(std::size_t channels, std::size_t block_frames, ObserverOptions options);
-    bool lock_free() const noexcept;
-    void start(const void *context);
-    void request_stop() noexcept;
-    void stop() noexcept;
-    void disable() noexcept;
-    void reset_when_idle() noexcept;
-    void publish(IBlock block, std::uint64_t frame) noexcept;
+    ObserverWorkers();
+    ~ObserverWorkers();
+    void schedule(const std::shared_ptr<Observer> &observer, const void *context) noexcept;
 
   private:
-    struct Packet
-    {
-        std::uint64_t frame = 0;
-        std::vector<float> samples;
-    };
-    void deliver();
-
-    const EngineSpec spec_;
-    const std::size_t channels_;
-    const std::size_t frames_;
-    ObserverCallback callback_;
-    SpscRing<Packet> queue_;
-    std::vector<float> scratch_;
-    std::vector<float> delivery_;
-    std::unique_ptr<RuntimeTask> worker_;
-    std::atomic<bool> enabled_{true};
-    std::atomic<bool> running_{false};
-    static constexpr auto no_frame = std::numeric_limits<std::uint64_t>::max();
-    std::atomic<std::uint64_t> first_frame_{no_frame};
-    std::uint64_t delivered_end_ = no_frame;
-    std::uint64_t expected_frame_ = no_frame;
-    std::uint64_t delivery_start_ = 0;
-    std::size_t filled_ = 0;
+    struct Pool;
+    std::unique_ptr<Pool> pool_;
 };
 
 } // namespace aereborn
