@@ -2,13 +2,19 @@
 #include <stdexcept>
 namespace aereborn
 {
-Mixer::Mixer(SampleRate rate, std::size_t channels, std::size_t inputs)
-    : output_(rate, channels), inputs_(inputs, output_), muted_(new std::atomic<bool>[inputs]), gains_(inputs, 1)
+namespace
 {
-    if (!output_.valid() || inputs == 0)
+PortSpec mixer_output(SampleRate rate, std::size_t channels, std::size_t inputs)
+{
+    const PortSpec spec(rate, channels);
+    if (!spec.valid() || inputs == 0)
         throw std::invalid_argument("Mixer needs valid ports and at least one input");
-    for (std::size_t i = 0; i < inputs; ++i)
-        muted_[i].store(false, std::memory_order_relaxed);
+    return spec;
+}
+} // namespace
+Mixer::Mixer(SampleRate rate, std::size_t channels, std::size_t inputs)
+    : output_(mixer_output(rate, channels, inputs)), inputs_(inputs, output_), states_(inputs)
+{
 }
 View<const PortSpec> Mixer::inputs() const noexcept
 {
@@ -20,44 +26,61 @@ View<const PortSpec> Mixer::outputs() const noexcept
 }
 RetCode Mixer::set_muted(std::size_t input, bool muted) noexcept
 {
-    if (input >= inputs_.size())
+    if (input >= states_.size())
         return ErrorCode::InvalidPort;
-    muted_[input].store(muted, std::memory_order_release);
+    states_[input].target.store(muted, std::memory_order_release);
     return {};
 }
 RetCode Mixer::prepare(BlockPeriod period)
 {
     if (!is_block_period(period))
         return ErrorCode::InvalidArg;
-    if (!muted_[0].is_lock_free())
+    if (!states_.front().target.is_lock_free())
         return ErrorCode::Unsupported;
     reset();
     return {};
 }
 void Mixer::reset() noexcept
 {
-    for (std::size_t i = 0; i < inputs_.size(); ++i)
-        gains_[i] = muted_[i].load(std::memory_order_acquire) ? 0.0f : 1.0f;
+    for (auto &state : states_)
+        state.muted = state.target.load(std::memory_order_acquire);
 }
 void Mixer::process(const ProcContext &context) noexcept
 {
     const auto output = context.outputs[0].audio();
+    const auto frames = output.frames();
+    if (frames == 0)
+        return;
     output.clear();
-    for (std::size_t i = 0; i < inputs_.size(); ++i)
+    for (std::size_t i = 0; i < states_.size(); ++i)
     {
+        auto &state = states_[i];
+        const bool target = state.target.load(std::memory_order_acquire);
+        const bool ramping = state.muted != target;
+        if (target && !ramping)
+            continue;
         const auto input = context.inputs[i].audio();
-        const auto target = muted_[i].load(std::memory_order_acquire) ? 0.0f : 1.0f;
-        const auto step = output.frames() ? static_cast<double>(target - gains_[i]) / output.frames() : 0;
-        for (std::size_t frame = 0; frame < output.frames(); ++frame)
+        const auto gain = state.muted ? 0.0 : 1.0;
+        const auto step = ramping ? (target ? -1.0 : 1.0) / frames : 0.0;
+        const auto last = frames - 1;
+        for (std::size_t ch = 0; ch < output.channels(); ++ch)
         {
-            const auto gain =
-                frame + 1 == output.frames() ? target : static_cast<float>(gains_[i] + step * (frame + 1));
-            if (gain == 0)
-                continue;
-            for (std::size_t ch = 0; ch < output.channels(); ++ch)
-                output.channel(ch)[frame] += input.channel(ch)[frame] * gain;
+            auto *dst = output.channel(ch);
+            const auto *src = input.channel(ch);
+            if (ramping)
+            {
+                for (std::size_t frame = 0; frame < last; ++frame)
+                    dst[frame] += src[frame] * static_cast<float>(gain + step * (frame + 1));
+                if (!target)
+                    dst[last] += src[last];
+            }
+            else
+            {
+                for (std::size_t frame = 0; frame < frames; ++frame)
+                    dst[frame] += src[frame];
+            }
         }
-        gains_[i] = target;
+        state.muted = target;
     }
 }
 } // namespace aereborn

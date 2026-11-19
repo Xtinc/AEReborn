@@ -16,16 +16,15 @@ enum class ErrorCode
     UnknownConn,
     InvalidPort,
     InvalidType,
-    ChannelMismatch,
+    FormatMismatch = 7,
     DuplicateConn,
-    Cycle = 9, // Preserve existing error values.
+    InputConnected,
+    Cycle,
     NotPrepared,
-    BufferFull,
-    TooLarge,
     Busy,
     Unsupported,
-    FormatMismatch,
-    InputConnected
+    BufferFull,
+    TooLarge
 };
 
 class RetCode
@@ -58,26 +57,24 @@ class RetCode
             return "Port index is out of range";
         case ErrorCode::InvalidType:
             return "Node has a different type";
-        case ErrorCode::ChannelMismatch:
-            return "Channel counts or matrix dimensions do not match";
+        case ErrorCode::FormatMismatch:
+            return "Port formats do not match; connect a converter";
         case ErrorCode::DuplicateConn:
             return "These ports are already connected";
+        case ErrorCode::InputConnected:
+            return "Input already has a source; use a mixer for multiple sources";
         case ErrorCode::Cycle:
             return "Connection would create a feedback cycle";
         case ErrorCode::NotPrepared:
             return "Preparation is required";
+        case ErrorCode::Busy:
+            return "The current execution context or state prevents this operation";
+        case ErrorCode::Unsupported:
+            return "The platform does not support the required lock-free atomics";
         case ErrorCode::BufferFull:
             return "A buffer is full or still in use";
         case ErrorCode::TooLarge:
             return "Requested capacity exceeds the supported size";
-        case ErrorCode::Busy:
-            return "The current execution context or state prevents this operation";
-        case ErrorCode::FormatMismatch:
-            return "Port formats do not match; connect a converter";
-        case ErrorCode::InputConnected:
-            return "Input already has a source; use a mixer for multiple sources";
-        case ErrorCode::Unsupported:
-            return "The platform does not support the required lock-free atomics";
         }
         return "Unknown error code";
     }

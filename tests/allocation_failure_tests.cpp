@@ -87,7 +87,8 @@ void buffer_resize_rollback()
     checked(buffer.resize(1, 8));
     buffer.block(8).channel(0)[7] = 1.0f;
     const bool failed = allocation_fails_after(0, [&] { buffer.resize(2, 32); });
-    check(failed && buffer.capacity_frames() == 8 && buffer.block(8).channel(0)[7] == 1.0f,
+    const auto retained = buffer.block(8);
+    check(failed && retained.channels() == 1 && retained.channel(0)[7] == 1.0f,
           "A failed growth preserves the buffer's layout and contents");
     checked(buffer.resize(2, 32));
     check(buffer.block(32).channel(0)[7] == 0.0f, "A successful resize clears existing samples");

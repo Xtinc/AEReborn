@@ -219,7 +219,7 @@ void live_graph_edits()
     const auto source = checked(engine.emplace_node<Signal>(1, false));
     const auto bus = checked(engine.emplace_node<VirtualNode<>>());
     const auto output = checked(engine.node<VirtualNode<>>(bus));
-    const auto conn = checked(engine.connect({source}, {bus}));
+    checked(engine.connect({source}, {bus}));
     const auto endpoint = checked(engine.emplace_node<Meter>());
     checked(engine.connect({bus}, {endpoint}));
     auto revision = checked(engine.prepare());
@@ -230,7 +230,7 @@ void live_graph_edits()
     NodeId sink;
     for (int i = 0; i < 12; ++i)
     {
-        if (sink)
+        if (sink != NodeId{})
         {
             checked(engine.remove_node(sink));
         }

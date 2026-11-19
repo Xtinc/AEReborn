@@ -57,6 +57,36 @@ void future_binding()
     check(out->bytes()[0] == 0, "A future binding is not consumed early");
     checked(clock.tick());
     check(out->bytes()[0] == 0x21, "The bound tick selects the correct data");
+    checked(capture->bind({bytes.data(), bytes.size()}, 1));
+    checked(clock.tick());
+    check(out->bytes()[0] == 0, "An expired binding is discarded instead of copied");
+    checked(capture->bind({bytes.data(), bytes.size()}, engine.tick_position()));
+    checked(clock.tick());
+    check(out->bytes()[0] == 0x21, "Discarding a binding releases the slot for the next tick");
+}
+void binding_period_change()
+{
+    const PortSpec spec(rate, 1, Format::S16LE);
+    Capture capture(spec);
+    Playback playback(spec);
+    std::uint8_t bytes[960]{};
+    checked(capture.prepare(period));
+    checked(playback.prepare(period));
+    checked(capture.bind({bytes, 480}, 0));
+    checked(playback.bind({bytes, 480}, 0));
+
+    const auto invalid_period = static_cast<BlockPeriod>(0);
+    expect_error(ErrorCode::InvalidArg, capture.prepare(invalid_period));
+    expect_error(ErrorCode::InvalidArg, playback.prepare(invalid_period));
+    expect_error(ErrorCode::BufferFull, capture.bind({bytes, 480}, 0));
+    expect_error(ErrorCode::BufferFull, playback.bind({bytes, 480}, 0));
+
+    checked(capture.prepare(BlockPeriod::Ms10));
+    checked(playback.prepare(BlockPeriod::Ms10));
+    expect_error(ErrorCode::InvalidArg, capture.bind({bytes, 480}, 0));
+    expect_error(ErrorCode::InvalidArg, playback.bind({bytes, 480}, 0));
+    checked(capture.bind({bytes, 960}, 0));
+    checked(playback.bind({bytes, 960}, 0));
 }
 void topology_format_switch()
 {
@@ -97,5 +127,6 @@ int main(int argc, char **argv)
     return run_tests(argc, argv,
                      {{"buffer_binding", buffer_binding},
                       {"future_binding", future_binding},
+                      {"binding_period_change", binding_period_change},
                       {"topology_format_switch", topology_format_switch}});
 }

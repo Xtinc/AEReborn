@@ -41,6 +41,19 @@ template <class T> void expect_error(ErrorCode expected, const Result<T> &result
     expect_error(expected, result.ret_code());
 }
 
+template <class Exception, class Operation> void expect_exception(Operation operation)
+{
+    try
+    {
+        operation();
+    }
+    catch (const Exception &)
+    {
+        return;
+    }
+    check(false, "Expected exception was not thrown");
+}
+
 struct TestCase
 {
     const char *name;

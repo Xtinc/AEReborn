@@ -96,11 +96,11 @@ void unaligned_pcm()
 void converter_validation()
 {
     const PortSpec mono(rate, 1), stereo(rate, 2);
-    Convert invalid(mono, stereo);
-    expect_error(ErrorCode::ChannelMismatch, invalid.prepare(period));
-    expect_error(ErrorCode::InvalidArg, invalid.prepare(static_cast<BlockPeriod>(0)));
-    Convert bad(PortSpec(rate, 1, static_cast<Format>(99)), mono);
-    expect_error(ErrorCode::InvalidArg, bad.prepare(period));
+    expect_exception<std::invalid_argument>([&] { Convert invalid(mono, stereo); });
+    expect_exception<std::invalid_argument>([&] { Convert invalid(PortSpec(rate, 1, static_cast<Format>(99)), mono); });
+    expect_exception<std::invalid_argument>([&] { Convert invalid(mono, PortSpec(static_cast<SampleRate>(1), 1)); });
+    Convert valid(mono, mono);
+    expect_error(ErrorCode::InvalidArg, valid.prepare(static_cast<BlockPeriod>(0)));
 }
 void integer_limits()
 {
@@ -119,24 +119,15 @@ void integer_limits()
 }
 void empty_blocks()
 {
-    const PortSpec input(static_cast<SampleRate>(1), 1);
-    const PortSpec output(static_cast<SampleRate>(1), 1, Format::S16LE);
-    Conversion conversion(input, output);
+    const PortSpec input(rate, 1), output(rate, 1, Format::S16LE);
+    Convert convert(input, output);
+    checked(convert.prepare(period));
     const float value = 0.5f;
-    std::uint8_t bytes[sizeof(value)];
-    std::memcpy(bytes, &value, sizeof(value));
-    std::size_t total = 0;
-    for (std::uint64_t tick = 0; tick < 201; ++tick)
-    {
-        const auto frames = input.frames(period, tick);
-        conversion.run({bytes, frames * sizeof(value)});
-        check(conversion.sink->frames == frames, "An empty fractional block remains empty through conversion");
-        if (frames)
-            check(conversion.sink->bytes()[0] == 0 && conversion.sink->bytes()[1] == 0x40,
-                  "Sparse sample blocks retain their value");
-        total += frames;
-    }
-    check(total == 2, "Fractional accounting includes zero-frame periods");
+    std::uint8_t bytes[]{0xcd, 0xcd};
+    const IPortBlock empty_input{reinterpret_cast<const std::uint8_t *>(&value), input, 0};
+    const OPortBlock empty_output{bytes, output, 0};
+    convert.process({period, 0, {&empty_input, 1}, {&empty_output, 1}});
+    check(bytes[0] == 0xcd && bytes[1] == 0xcd, "An empty block writes no PCM samples");
 }
 } // namespace
 int main(int argc, char **argv)

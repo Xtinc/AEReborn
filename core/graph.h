@@ -18,12 +18,13 @@ class Node
     virtual View<const PortSpec> inputs() const noexcept = 0;
     virtual View<const PortSpec> outputs() const noexcept = 0;
     // Validate configuration and prepare resources. The engine may retry a failed preparation.
-    virtual RetCode prepare(BlockPeriod)
+    virtual RetCode prepare(BlockPeriod period)
     {
-        return {};
+        return is_block_period(period) ? ErrorCode::Ok : ErrorCode::InvalidArg;
     }
     // Context views are valid during this call. Fill every sample of each output using its declared format.
     virtual void process(const ProcContext &context) noexcept = 0;
+    // Must be serialized with process().
     virtual void reset() noexcept
     {
     }

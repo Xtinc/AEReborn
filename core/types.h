@@ -20,6 +20,24 @@ enum class SampleRate : std::uint32_t
     Hz88200 = 88200,
     Hz96000 = 96000
 };
+constexpr bool is_sample_rate(SampleRate rate) noexcept
+{
+    switch (rate)
+    {
+    case SampleRate::Hz8000:
+    case SampleRate::Hz11025:
+    case SampleRate::Hz16000:
+    case SampleRate::Hz22050:
+    case SampleRate::Hz24000:
+    case SampleRate::Hz32000:
+    case SampleRate::Hz44100:
+    case SampleRate::Hz48000:
+    case SampleRate::Hz88200:
+    case SampleRate::Hz96000:
+        return true;
+    }
+    return false;
+}
 
 enum class BlockPeriod : std::uint32_t
 {
@@ -74,8 +92,7 @@ struct PortSpec
     }
     constexpr bool valid() const noexcept
     {
-        return static_cast<std::uint32_t>(sample_rate) > 0 && sample_rate <= SampleRate::Hz96000 && channels > 0 &&
-               sample_bytes(format) != 0;
+        return is_sample_rate(sample_rate) && channels > 0 && sample_bytes(format) != 0;
     }
     constexpr bool operator==(const PortSpec &other) const noexcept
     {
@@ -93,6 +110,7 @@ struct PortSpec
 
 // A read-only or writable view of one port's current block. Storage is owned by Engine.
 // audio() is for plugins whose declared ports are F32P; bytes() exposes any declared format.
+// F32P is packed with a channel stride of frames(), which can vary from tick to tick.
 template <class T> class PortBlock
 {
     template <class> friend class PortBlock;
@@ -125,18 +143,16 @@ using OPortBlock = PortBlock<std::uint8_t>;
 struct NodeId
 {
     std::uint64_t value = 0;
-    explicit operator bool() const noexcept;
-    bool operator==(NodeId other) const noexcept;
-    bool operator!=(NodeId other) const noexcept;
-    bool operator<(NodeId other) const noexcept;
+    constexpr bool operator==(NodeId other) const noexcept { return value == other.value; }
+    constexpr bool operator!=(NodeId other) const noexcept { return !(*this == other); }
+    constexpr bool operator<(NodeId other) const noexcept { return value < other.value; }
 };
 struct ConnId
 {
     std::uint64_t value = 0;
-    explicit operator bool() const noexcept;
-    bool operator==(ConnId other) const noexcept;
-    bool operator!=(ConnId other) const noexcept;
-    bool operator<(ConnId other) const noexcept;
+    constexpr bool operator==(ConnId other) const noexcept { return value == other.value; }
+    constexpr bool operator!=(ConnId other) const noexcept { return !(*this == other); }
+    constexpr bool operator<(ConnId other) const noexcept { return value < other.value; }
 };
 struct IPort
 {
@@ -151,6 +167,7 @@ struct OPort
 
 struct ProcContext
 {
+    BlockPeriod block_period;
     std::uint64_t tick_position;
     View<const IPortBlock> inputs;
     View<const OPortBlock> outputs;

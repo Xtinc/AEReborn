@@ -51,27 +51,77 @@ void Matrix::reset() noexcept
 }
 void Matrix::process(const ProcContext &context) noexcept
 {
-    const auto input = context.inputs[0].audio();
     const auto output = context.outputs[0].audio();
-    output.clear();
-    const auto target = target_.load(std::memory_order_acquire);
     const auto frames = output.frames();
-    const auto step = frames ? (static_cast<double>(target) - gain_) / frames : 0;
-    for (std::size_t dst = 0; dst < output.channels(); ++dst)
+    if (frames == 0)
+        return;
+    const auto target = target_.load(std::memory_order_acquire);
+    const bool steady = gain_ == target;
+    if (steady && target == 0)
     {
-        const auto first = coefficients_.empty() ? dst : 0;
-        const auto last = coefficients_.empty() ? dst + 1 : input.channels();
-        for (std::size_t src = first; src < last; ++src)
+        output.clear();
+        return;
+    }
+    const auto input = context.inputs[0].audio();
+    const auto last = frames - 1;
+    const auto scale = steady ? 0.0 : 1.0 / frames;
+    const auto ramp_gain = [start = static_cast<double>(gain_), end = static_cast<double>(target), last,
+                            scale](std::size_t frame) noexcept {
+        // Scale after adding the weighted endpoints so exact crossings stay zero with fused multiply-add.
+        return static_cast<float>((start * (last - frame) + end * (frame + 1)) * scale);
+    };
+    if (coefficients_.empty())
+    {
+        for (std::size_t ch = 0; ch < output.channels(); ++ch)
         {
-            const auto coefficient = coefficients_.empty() ? 1.0f : coefficients_[dst * input.channels() + src];
+            auto *dst = output.channel(ch);
+            const auto *src = input.channel(ch);
+            if (steady)
+            {
+                for (std::size_t frame = 0; frame < frames; ++frame)
+                    dst[frame] = src[frame] * target;
+            }
+            else
+            {
+                for (std::size_t frame = 0; frame < last; ++frame)
+                {
+                    const auto gain = ramp_gain(frame);
+                    dst[frame] = gain == 0 ? 0.0f : src[frame] * gain;
+                }
+                dst[last] = target == 0 ? 0.0f : src[last] * target;
+            }
+        }
+        gain_ = target;
+        return;
+    }
+    output.clear();
+    for (std::size_t dst_ch = 0; dst_ch < output.channels(); ++dst_ch)
+    {
+        auto *dst = output.channel(dst_ch);
+        for (std::size_t src_ch = 0; src_ch < input.channels(); ++src_ch)
+        {
+            const auto coefficient = coefficients_[dst_ch * input.channels() + src_ch];
             if (coefficient == 0)
                 continue;
-            for (std::size_t frame = 0; frame < frames; ++frame)
+            const auto scaled_target = coefficient * target;
+            const auto *src = input.channel(src_ch);
+            if (steady)
             {
-                const auto gain = frame + 1 == frames ? target : static_cast<float>(gain_ + step * (frame + 1));
-                const auto scaled = coefficient * gain;
-                if (scaled != 0)
-                    output.channel(dst)[frame] += input.channel(src)[frame] * scaled;
+                if (scaled_target == 0)
+                    continue;
+                for (std::size_t frame = 0; frame < frames; ++frame)
+                    dst[frame] += src[frame] * scaled_target;
+            }
+            else
+            {
+                for (std::size_t frame = 0; frame < last; ++frame)
+                {
+                    const auto scaled = coefficient * ramp_gain(frame);
+                    if (scaled != 0)
+                        dst[frame] += src[frame] * scaled;
+                }
+                if (scaled_target != 0)
+                    dst[last] += src[last] * scaled_target;
             }
         }
     }

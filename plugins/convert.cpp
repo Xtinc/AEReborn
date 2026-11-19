@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 namespace aereborn
@@ -141,12 +142,12 @@ float interpolate(const float *history, const float *input, std::size_t history_
 
 struct Convert::State
 {
-    State(PortSpec input, PortSpec output, BlockPeriod period)
-        : input(input), output(output), period(period), src_fs(static_cast<std::uint32_t>(input.sample_rate)),
+    State(PortSpec input, PortSpec output)
+        : input(input), output(output), src_fs(static_cast<std::uint32_t>(input.sample_rate)),
           dst_fs(static_cast<std::uint32_t>(output.sample_rate))
     {
     }
-    RetCode prepare()
+    RetCode prepare(BlockPeriod period)
     {
         if (input.format != Format::F32P && (src_fs != dst_fs || output.format != Format::F32P))
         {
@@ -183,10 +184,9 @@ struct Convert::State
         }
         return {};
     }
-    void resample(IBlock input, OBlock output, std::uint64_t tick) noexcept;
+    void resample(IBlock input, OBlock output, BlockPeriod period, std::uint64_t tick) noexcept;
     const PortSpec input;
     const PortSpec output;
-    const BlockPeriod period;
     const std::uint32_t src_fs;
     const std::uint32_t dst_fs;
     Buffer decoded;
@@ -195,11 +195,11 @@ struct Convert::State
     std::vector<float> kernel;
 };
 
-void Convert::State::resample(IBlock input, OBlock output, std::uint64_t tick) noexcept
+void Convert::State::resample(IBlock input, OBlock output, BlockPeriod period, std::uint64_t tick) noexcept
 {
     const auto past = history.block(taps);
     // src_pos is in units of 1 / dst_fs; the first taps frames address history.
-    const auto rounding = [this, tick](std::uint32_t rate)
+    const auto rounding = [period, tick](std::uint32_t rate)
     {
         const auto remainder =
             (tick % 1000) * ((std::uint64_t{rate} * static_cast<std::uint32_t>(period)) % 1000) % 1000;
@@ -231,19 +231,23 @@ void Convert::State::resample(IBlock input, OBlock output, std::uint64_t tick) n
     }
 }
 
-Convert::Convert(PortSpec input, PortSpec output) : NodeT({{input}}, {{output}}) {}
+Convert::Convert(PortSpec input, PortSpec output) : NodeT({{input}}, {{output}})
+{
+    if (!input.valid() || !output.valid())
+        throw std::invalid_argument("Invalid converter port specification");
+    if (input.channels != output.channels)
+        throw std::invalid_argument("Converter input and output channel counts must match");
+}
 Convert::~Convert() = default;
 RetCode Convert::prepare(BlockPeriod period)
 {
     const auto input = inputs()[0], output = outputs()[0];
-    if (!is_block_period(period) || !input.valid() || !output.valid())
+    if (!is_block_period(period))
         return ErrorCode::InvalidArg;
-    if (input.channels != output.channels)
-        return ErrorCode::ChannelMismatch;
     if (input == output)
         return {};
-    auto next = std::make_unique<State>(input, output, period);
-    const auto code = next->prepare();
+    auto next = std::make_unique<State>(input, output);
+    const auto code = next->prepare(period);
     if (code)
         state_.swap(next);
     return code;
@@ -251,7 +255,7 @@ RetCode Convert::prepare(BlockPeriod period)
 void Convert::reset() noexcept
 {
     if (state_)
-        state_->history.block(state_->history.capacity_frames()).clear();
+        state_->history.clear();
 }
 void Convert::process(const ProcContext &context) noexcept
 {
@@ -288,7 +292,7 @@ void Convert::process(const ProcContext &context) noexcept
     {
         const auto converted =
             state.output.format == Format::F32P ? output.audio() : state.converted.block(output.frames());
-        state.resample(samples, converted, context.tick_position);
+        state.resample(samples, converted, context.block_period, context.tick_position);
         samples = converted;
     }
     if (state.output.format == Format::F32P)

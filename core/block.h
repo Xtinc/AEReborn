@@ -104,13 +104,13 @@ template <class T> class Block
 using IBlock = Block<const float>;
 using OBlock = Block<float>;
 
-// Allocation belongs to construction/preparation, never to block processing.
+// Planar float workspace for plugins to allocate in prepare() and reuse during processing.
 class Buffer
 {
   public:
     RetCode resize(std::size_t channels, std::size_t capacity_frames);
     OBlock block(std::size_t frames) noexcept;
-    std::size_t capacity_frames() const noexcept;
+    void clear() noexcept;
 
   private:
     std::vector<float> samples_;

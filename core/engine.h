@@ -29,8 +29,8 @@ class Engine
     RetCode replace_node(NodeId node_id, std::unique_ptr<Node> replacement);
     // Stage a local pause or resume. prepare() applies it with the graph at a block boundary.
     RetCode set_paused(NodeId node_id, bool paused);
+    // Borrow the draft node until it is removed or replaced, or until Engine destruction.
     Result<Node *> node(NodeId node_id) noexcept;
-    Result<const Node *> node(NodeId node_id) const noexcept;
     template <class T> Result<T *> node(NodeId node_id) noexcept
     {
         const auto result = node(node_id);
@@ -52,7 +52,6 @@ class Engine
     RetCode start(std::unique_ptr<ClockDriver> driver = {});
     RetCode stop() noexcept;
     RetCode reset() noexcept;
-    BlockPeriod block_period() const noexcept;
     std::uint64_t tick_position() const noexcept;
     PlanRevision applied_revision() const noexcept;
 

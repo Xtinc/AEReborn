@@ -120,12 +120,53 @@ void silence_and_pruning()
     checked(clock.tick());
     check(input->calls == 1 && output->sample(0) == 0, "Disconnecting removes the source and exposes a silent buffer");
 }
+void shared_silence()
+{
+    Engine engine(period);
+    ManualClock clock(engine);
+    const PortSpec planar(rate, 1), pcm(rate, 1, Format::S16LE);
+    const PortSpec wide_planar(SampleRate::Hz44100, 2), wide_pcm(SampleRate::Hz44100, 3, Format::S24_3LE);
+    const auto source =
+        checked(engine.emplace_node<FloatSource>(wide_planar.sample_rate, 2,
+                                                 [](std::uint64_t, std::size_t ch) { return static_cast<float>(ch + 1); }));
+    auto add_sink = [&](PortSpec spec) {
+        return checked(engine.node<PacketSink>(checked(engine.emplace_node<PacketSink>(spec))));
+    };
+    const auto *a = add_sink(planar), *b = add_sink(wide_planar), *c = add_sink(pcm), *d = add_sink(wide_pcm);
+    const auto connected = checked(engine.emplace_node<PacketSink>(wide_planar));
+    const auto *output = checked(engine.node<PacketSink>(connected));
+    checked(engine.connect({source}, {connected}));
+    checked(engine.prepare());
+    for (std::uint64_t tick = 0; tick < 2; ++tick)
+    {
+        checked(clock.tick());
+        check(a->address == b->address && c->address == d->address,
+              "Unconnected inputs share one zero region per storage type");
+        check(a->address != c->address && b->address != output->address,
+              "The two storage types and the writable output have disjoint buffers");
+        for (const auto *sink : {a, b, c, d})
+        {
+            const auto spec = sink->inputs()[0];
+            const auto bytes = sink->bytes();
+            check(bytes.size() == spec.frames(period, tick) * spec.channels * sample_bytes(spec.format) &&
+                      std::all_of(bytes.begin(), bytes.end(), [](std::uint8_t byte) { return byte == 0; }),
+                  "Shared silence exposes each input's own tick size and format");
+        }
+        check(output->sample(0, 0) == 1 && output->sample(0, 1) == 2,
+              "A fractional planar output packs both channels for each tick");
+    }
+}
 void format_validation()
 {
     Engine engine(period);
-    for (const auto spec : {PortSpec(static_cast<SampleRate>(0), 1), PortSpec(static_cast<SampleRate>(96001), 1),
+    for (const auto spec : {PortSpec(static_cast<SampleRate>(0), 1), PortSpec(static_cast<SampleRate>(48001), 1),
+                            PortSpec(static_cast<SampleRate>(96001), 1),
                             PortSpec(rate, 0), PortSpec(rate, 1, static_cast<Format>(99))})
-        expect_error(ErrorCode::InvalidArg, engine.emplace_node<Capture>(spec));
+    {
+        expect_exception<std::invalid_argument>([&] { engine.emplace_node<Capture>(spec); });
+        expect_exception<std::invalid_argument>([&] { engine.emplace_node<Playback>(spec); });
+        expect_error(ErrorCode::InvalidArg, engine.emplace_node<PacketSink>(spec));
+    }
     const auto source =
         checked(engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 0.0f; }));
     for (const auto spec : {PortSpec(rate, 2), PortSpec(SampleRate::Hz16000, 1), PortSpec(rate, 1, Format::F32LE),
@@ -174,7 +215,7 @@ void channel_split_same_tick()
     for (std::size_t tick = 0; tick < 8; ++tick)
     {
         checked(clock.tick());
-        const auto frames = tick % 2 ? 220 : 221;
+        const std::size_t frames = tick % 2 ? 220 : 221;
         check(out_a->frames == frames && out_b->frames == frames && input->calls == tick + 1,
               "Shared upstream views keep fractional block sizes and render once per tick");
         for (std::size_t frame = 0; frame < frames; ++frame)
@@ -196,6 +237,7 @@ int main(int argc, char **argv)
                      {{"explicit_mix_and_fanout", explicit_mix_and_fanout},
                       {"algorithm_chain", algorithm_chain},
                       {"silence_and_pruning", silence_and_pruning},
+                      {"shared_silence", shared_silence},
                       {"format_validation", format_validation},
                       {"channel_split_same_tick", channel_split_same_tick}});
 }

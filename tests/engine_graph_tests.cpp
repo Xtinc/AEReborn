@@ -9,6 +9,7 @@
 #include <new>
 #include <stdexcept>
 #include <type_traits>
+#include <vector>
 
 namespace
 {
@@ -18,19 +19,6 @@ static_assert(std::is_convertible<OBlock, IBlock>::value, "Writable blocks becom
 static_assert(!std::is_convertible<IBlock, OBlock>::value, "Read-only blocks cannot become writable");
 static_assert(std::is_convertible<OPortBlock, IPortBlock>::value, "Port outputs become read-only inputs");
 static_assert(!std::is_convertible<IPortBlock, OPortBlock>::value, "An input cannot become a writable port output");
-
-template <class Exception, class Operation> void expect_exception(Operation operation)
-{
-    try
-    {
-        operation();
-    }
-    catch (const Exception &)
-    {
-        return;
-    }
-    check(false, "Expected exception was not thrown");
-}
 
 void audio_block_layout()
 {
@@ -52,7 +40,8 @@ void audio_block_layout()
     expect_error(ErrorCode::InvalidArg, buffer.resize(0, 8));
     expect_error(ErrorCode::InvalidArg, buffer.resize(1, 0));
     expect_error(ErrorCode::TooLarge, buffer.resize(std::numeric_limits<std::size_t>::max(), 8));
-    check(buffer.capacity_frames() == 8 && buffer.block(8).channel(1)[7] == 2,
+    const auto retained = buffer.block(8);
+    check(retained.channel(1) - retained.channel(0) == 8 && retained.channel(1)[7] == 2,
           "Rejected resize preserves storage and layout");
     const View<const float> empty(nullptr, 0);
     check(empty.begin() == empty.end(), "An empty view supports iteration without pointer arithmetic on null");
@@ -108,8 +97,6 @@ void connection_validation()
     checked(clock.tick()); // Rejected graph edits must not invalidate the prepared graph.
     checked(engine.remove_node(source));
     expect_error(ErrorCode::UnknownNode, engine.node(source));
-    const auto &read_only = engine;
-    expect_error(ErrorCode::UnknownNode, read_only.node(source));
     expect_error(ErrorCode::UnknownConn, engine.disconnect(connection));
     expect_error(ErrorCode::UnknownNode, engine.remove_node(source));
 }
@@ -128,6 +115,9 @@ void feedback_rejection()
     checked(engine.prepare());
     expect_error(ErrorCode::Cycle, engine.connect({c}, {a, 1}));
     expect_error(ErrorCode::Cycle, engine.connect({a, 1}, {a, 1}));
+    checked(engine.set_paused(b, true));
+    expect_error(ErrorCode::Cycle, engine.connect({c}, {a, 1}));
+    checked(engine.set_paused(b, false));
     checked(clock.tick());
     check(checked(engine.node<VirtualNode<2, 2>>(a))->calls == 1,
           "Rejected feedback leaves the valid graph executable");
@@ -167,6 +157,18 @@ void prepare_retry()
     check(node->prepares == 2 && node->calls == 3, "Capacity failure preserves previously prepared DSP state");
     checked(clock.reset());
     check(engine.tick_position() == 0 && node->resets == 1, "Reset reaches nodes and restarts the graph clock");
+}
+
+void buffer_pool_capacity()
+{
+    Engine engine(render_period);
+    const auto channels = std::vector<float>{}.max_size() / (2 * render_frames) + 1;
+    const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>(channels));
+    const auto sink = checked(engine.emplace_node<VirtualNode<2, 0>>(channels));
+    checked(engine.connect({source}, {sink, 0}));
+    expect_error(ErrorCode::TooLarge, engine.prepare());
+    checked(engine.remove_node(sink));
+    checked(engine.prepare());
 }
 
 class ThrowingNode : public VirtualNode<>
@@ -249,6 +251,12 @@ void node_replacement()
               checked(engine.node<VirtualNode<1, 0>>(sink))->calls == 3,
           "A compatible replacement takes over existing connections at the next block boundary");
 
+    checked(engine.replace_node(sink, std::make_unique<VirtualNode<1, 0>>()));
+    checked(engine.prepare());
+    checked(clock.tick());
+    check(replacement->calls == 2 && checked(engine.node<VirtualNode<1, 0>>(sink))->calls == 1,
+          "Replacing an input node keeps it connected to its upstream source");
+
     checked(clock.stop());
     auto *old_sink = checked(engine.node<VirtualNode<1, 0>>(sink));
     checked(engine.replace_node(source, std::make_unique<VirtualNode<0, 1>>()));
@@ -292,7 +300,8 @@ int main(int argc, char **argv)
                                       {"engine_timing_validation", engine_timing_validation},
                                       {"connection_validation", connection_validation},
                                       {"feedback_rejection", feedback_rejection},
-                                      {"prepare_retry", prepare_retry},
+                      {"prepare_retry", prepare_retry},
+                      {"buffer_pool_capacity", buffer_pool_capacity},
                                       {"node_exception_propagation", node_exception_propagation},
                                       {"handle_uniqueness", handle_uniqueness},
                                       {"node_replacement", node_replacement}});

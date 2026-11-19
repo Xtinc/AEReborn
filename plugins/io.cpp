@@ -1,94 +1,101 @@
 #include "io.h"
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 namespace aereborn
 {
-namespace
+namespace detail
 {
-RetCode check_binding(PortSpec spec, BlockPeriod period, std::size_t bytes, std::uint64_t tick, bool bound) noexcept
+template <class Byte> RetCode TickBuffer<Byte>::prepare(BlockPeriod period) noexcept
 {
     if (!is_block_period(period))
-        return ErrorCode::NotPrepared;
-    if (bound)
-        return ErrorCode::BufferFull;
-    const auto frames = spec.frames(period, tick);
-    const auto width = sample_bytes(spec.format);
-    if (frames && spec.channels > std::numeric_limits<std::size_t>::max() / frames / width)
-        return ErrorCode::TooLarge;
-    if (bytes != frames * spec.channels * width)
         return ErrorCode::InvalidArg;
-    return {};
-}
-} // namespace
-RetCode Capture::prepare(BlockPeriod period)
-{
-    if (!is_block_period(period) || !outputs()[0].valid())
-        return ErrorCode::InvalidArg;
+    if (period_ != period)
+        reset();
     period_ = period;
     return {};
 }
+
+template <class Byte>
+RetCode TickBuffer<Byte>::bind(PortSpec spec, View<Byte> bytes, std::uint64_t tick) noexcept
+{
+    if (!bytes.empty() && !bytes.data())
+        return ErrorCode::InvalidArg;
+    if (period_ == BlockPeriod{})
+        return ErrorCode::NotPrepared;
+    if (!bytes_.empty())
+        return ErrorCode::BufferFull;
+    const auto bytes_per_channel = spec.frames(period_, tick) * sample_bytes(spec.format);
+    // Every supported rate and period produces a nonempty block.
+    if (spec.channels > std::numeric_limits<std::size_t>::max() / bytes_per_channel)
+        return ErrorCode::TooLarge;
+    if (bytes.size() != spec.channels * bytes_per_channel)
+        return ErrorCode::InvalidArg;
+    bytes_ = bytes;
+    tick_ = tick;
+    return {};
+}
+
+template <class Byte> View<Byte> TickBuffer<Byte>::take(std::uint64_t tick) noexcept
+{
+    if (bytes_.empty() || tick < tick_)
+        return {nullptr, 0};
+    const auto bytes = bytes_;
+    reset();
+    return tick == tick_ ? bytes : View<Byte>{nullptr, 0};
+}
+} // namespace detail
+
+Capture::Capture(PortSpec spec) : NodeT({}, {{spec}})
+{
+    if (!spec.valid())
+        throw std::invalid_argument("Invalid capture port specification");
+}
+RetCode Capture::prepare(BlockPeriod period)
+{
+    return buffer_.prepare(period);
+}
 RetCode Capture::bind(View<const std::uint8_t> bytes, std::uint64_t tick) noexcept
 {
-    if (bytes.size() && !bytes.data())
-        return ErrorCode::InvalidArg;
-    const auto code = check_binding(outputs()[0], period_, bytes.size(), tick, bound_);
-    if (code)
-    {
-        bytes_ = bytes;
-        tick_ = tick;
-        bound_ = true;
-    }
-    return code;
+    return buffer_.bind(outputs()[0], bytes, tick);
 }
 void Capture::process(const ProcContext &context) noexcept
 {
     const auto output = context.outputs[0].bytes();
-    if (bound_ && tick_ == context.tick_position)
-    {
-        if (output.size())
-            std::memcpy(output.data(), bytes_.data(), output.size());
-    }
-    else if (output.size())
+    const auto bytes = buffer_.take(context.tick_position);
+    if (output.empty())
+        return;
+    if (bytes.empty())
         std::memset(output.data(), 0, output.size());
-    if (bound_ && tick_ <= context.tick_position)
-        reset();
+    else
+        std::memcpy(output.data(), bytes.data(), output.size());
 }
 void Capture::reset() noexcept
 {
-    bytes_ = {nullptr, 0};
-    bound_ = false;
+    buffer_.reset();
+}
+Playback::Playback(PortSpec spec) : NodeT({{spec}}, {})
+{
+    if (!spec.valid())
+        throw std::invalid_argument("Invalid playback port specification");
 }
 RetCode Playback::prepare(BlockPeriod period)
 {
-    if (!is_block_period(period) || !inputs()[0].valid())
-        return ErrorCode::InvalidArg;
-    period_ = period;
-    return {};
+    return buffer_.prepare(period);
 }
 RetCode Playback::bind(View<std::uint8_t> bytes, std::uint64_t tick) noexcept
 {
-    if (bytes.size() && !bytes.data())
-        return ErrorCode::InvalidArg;
-    const auto code = check_binding(inputs()[0], period_, bytes.size(), tick, bound_);
-    if (code)
-    {
-        bytes_ = bytes;
-        tick_ = tick;
-        bound_ = true;
-    }
-    return code;
+    return buffer_.bind(inputs()[0], bytes, tick);
 }
 void Playback::process(const ProcContext &context) noexcept
 {
     const auto input = context.inputs[0].bytes();
-    if (bound_ && tick_ == context.tick_position && input.size())
-        std::memcpy(bytes_.data(), input.data(), input.size());
-    if (bound_ && tick_ <= context.tick_position)
-        reset();
+    const auto bytes = buffer_.take(context.tick_position);
+    if (!bytes.empty() && !input.empty())
+        std::memcpy(bytes.data(), input.data(), input.size());
 }
 void Playback::reset() noexcept
 {
-    bytes_ = {nullptr, 0};
-    bound_ = false;
+    buffer_.reset();
 }
 } // namespace aereborn

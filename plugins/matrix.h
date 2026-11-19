@@ -15,6 +15,7 @@ class Matrix final : public NodeT<1, 1>
            float gain = 1.0f);
     Matrix(SampleRate rate, std::size_t input_channels, std::size_t output_channels,
            std::initializer_list<float> coefficients, float gain = 1.0f);
+    // Thread-safe with process().
     RetCode set_gain(float gain) noexcept;
     RetCode prepare(BlockPeriod period) override;
     void process(const ProcContext &context) noexcept override;

@@ -12,7 +12,7 @@ constexpr auto render_rate = SampleRate::Hz48000;
 constexpr auto render_period = BlockPeriod::Ms05;
 constexpr std::size_t render_frames = 240;
 
-// Stateless test processor. Fan-in at a port is performed by Engine; this node sums its input ports.
+// Stateless test processor that sums its input ports.
 template <std::size_t I = 1, std::size_t O = 1>
 class VirtualNode : public NodeT<I, O>
 {

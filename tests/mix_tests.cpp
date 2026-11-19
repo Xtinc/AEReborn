@@ -6,18 +6,6 @@ namespace
 {
 using namespace aereborn;
 using namespace aereborn::test;
-template <class Exception, class F> void throws(F f)
-{
-    try
-    {
-        f();
-    }
-    catch (const Exception &)
-    {
-        return;
-    }
-    check(false, "Expected exception");
-}
 void matrix_mapping()
 {
     Engine engine(period);
@@ -38,10 +26,10 @@ void matrix_mapping()
 void matrix_validation()
 {
     const auto nan = std::numeric_limits<float>::quiet_NaN();
-    throws<std::invalid_argument>([] { Matrix(rate, 0); });
-    throws<std::invalid_argument>([] { Matrix(rate, 2, 1, {1}); });
-    throws<std::invalid_argument>([&] { Matrix(rate, 1, 1, {nan}); });
-    throws<std::length_error>(
+    expect_exception<std::invalid_argument>([] { Matrix(rate, 0); });
+    expect_exception<std::invalid_argument>([] { Matrix(rate, 2, 1, {1}); });
+    expect_exception<std::invalid_argument>([&] { Matrix(rate, 1, 1, {nan}); });
+    expect_exception<std::length_error>(
         []
         {
             const auto n = std::numeric_limits<std::size_t>::max();
@@ -81,6 +69,7 @@ void gain_ramp_and_zero()
 }
 void mixer_mute()
 {
+    expect_exception<std::invalid_argument>([] { Mixer(rate, 1, 0); });
     Engine engine(period);
     ManualClock clock(engine);
     const auto a = checked(engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 1.0f; }));
@@ -106,6 +95,35 @@ void mixer_mute()
     checked(clock.tick());
     check(out->sample(239) == 3, "Unmute restores the selected source");
 }
+void empty_block_ramps()
+{
+    const PortSpec spec(rate, 2);
+    Matrix gain(rate, 2);
+    Matrix mapped(rate, 2, 2, {1, 0, 0, 1});
+    Mixer mixer(rate, 2, 1);
+    checked(gain.prepare(period));
+    checked(mapped.prepare(period));
+    checked(mixer.prepare(period));
+    checked(gain.set_gain(0));
+    checked(mapped.set_gain(0));
+    checked(mixer.set_muted(0, true));
+
+    Node *plugins[]{&gain, &mapped, &mixer};
+    const auto nan = std::numeric_limits<float>::quiet_NaN();
+    const float samples[]{1.0f, nan, 2.0f, nan};
+    float result[4]{};
+    for (auto *plugin : plugins)
+    {
+        const IPortBlock empty_input{reinterpret_cast<const std::uint8_t *>(samples), spec, 0};
+        const OPortBlock empty_output{reinterpret_cast<std::uint8_t *>(result), spec, 0};
+        plugin->process({period, 0, {&empty_input, 1}, {&empty_output, 1}});
+        const IPortBlock input{reinterpret_cast<const std::uint8_t *>(samples), spec, 2};
+        const OPortBlock output{reinterpret_cast<std::uint8_t *>(result), spec, 2};
+        plugin->process({period, 1, {&input, 1}, {&output, 1}});
+        check(result[0] == 0.5f && result[1] == 0 && result[2] == 1.0f && result[3] == 0,
+              "An empty block preserves both channels' ramp and the mute endpoint suppresses NaN");
+    }
+}
 } // namespace
 int main(int argc, char **argv)
 {
@@ -113,5 +131,6 @@ int main(int argc, char **argv)
                      {{"matrix_mapping", matrix_mapping},
                       {"matrix_validation", matrix_validation},
                       {"gain_ramp_and_zero", gain_ramp_and_zero},
-                      {"mixer_mute", mixer_mute}});
+                      {"mixer_mute", mixer_mute},
+                      {"empty_block_ramps", empty_block_ramps}});
 }

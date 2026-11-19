@@ -72,18 +72,19 @@ void antialias_filter()
 }
 void late_join()
 {
-    Engine engine(period);
+    Engine engine(BlockPeriod::Ms10);
     ManualClock clock(engine);
+    constexpr auto input_rate = SampleRate::Hz11025;
     const auto source = checked(
-        engine.emplace_node<FloatSource>(SampleRate::Hz44100, 1, [](std::uint64_t frame, std::size_t)
-                                         { return static_cast<float>(std::sin(two_pi * 997 * frame / 44100)); }));
-    const auto original = checked(engine.emplace_node<Convert>(PortSpec(SampleRate::Hz44100, 1), PortSpec(rate, 1)));
+        engine.emplace_node<FloatSource>(input_rate, 1, [](std::uint64_t frame, std::size_t)
+                                         { return static_cast<float>(std::sin(two_pi * 997 * frame / 11025)); }));
+    const auto original = checked(engine.emplace_node<Convert>(PortSpec(input_rate, 1), PortSpec(rate, 1)));
     const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1)));
     checked(engine.connect({source}, {original}));
     checked(engine.connect({original}, {sink}));
     checked(engine.prepare());
-    checked(clock.tick()); // Join on the short half of a fractional 44.1 kHz block pair.
-    const auto added = checked(engine.emplace_node<Convert>(PortSpec(SampleRate::Hz44100, 1), PortSpec(rate, 1)));
+    checked(clock.tick()); // Join after the first (longer) fractional input block.
+    const auto added = checked(engine.emplace_node<Convert>(PortSpec(input_rate, 1), PortSpec(rate, 1)));
     const auto monitor = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1)));
     checked(engine.connect({source}, {added}));
     checked(engine.connect({added}, {monitor}));
@@ -92,7 +93,8 @@ void late_join()
     auto *b = checked(engine.node<PacketSink>(monitor));
     checked(clock.tick());
     checked(clock.tick());
-    for (std::size_t frame = 0; frame < 240; ++frame)
+    check(a->frames == 480 && b->frames == 480, "Resamplers use the configured 10 ms block period");
+    for (std::size_t frame = 0; frame < a->frames; ++frame)
         check(a->sample(frame) == b->sample(frame),
               "New converters align fractional phase to the existing graph timeline");
 }

@@ -29,9 +29,9 @@ OBlock Buffer::block(std::size_t frames) noexcept
     return {samples_.data(), channels_, frames, capacity_frames_};
 }
 
-std::size_t Buffer::capacity_frames() const noexcept
+void Buffer::clear() noexcept
 {
-    return capacity_frames_;
+    std::fill(samples_.begin(), samples_.end(), 0.0f);
 }
 
 std::size_t PortSpec::max_frames(BlockPeriod period) const noexcept
@@ -53,46 +53,6 @@ std::uint64_t PortSpec::frame_position(BlockPeriod period, std::uint64_t tick) c
     const auto units = std::uint64_t{static_cast<std::uint32_t>(sample_rate)} * static_cast<std::uint32_t>(period);
     // Split whole seconds from the remainder to avoid multiplying tick by the sample rate.
     return (tick / 1000) * units + ((tick % 1000) * units + 999) / 1000;
-}
-
-NodeId::operator bool() const noexcept
-{
-    return value != 0;
-}
-
-bool NodeId::operator==(NodeId other) const noexcept
-{
-    return value == other.value;
-}
-
-bool NodeId::operator!=(NodeId other) const noexcept
-{
-    return !(*this == other);
-}
-
-bool NodeId::operator<(NodeId other) const noexcept
-{
-    return value < other.value;
-}
-
-ConnId::operator bool() const noexcept
-{
-    return value != 0;
-}
-
-bool ConnId::operator==(ConnId other) const noexcept
-{
-    return value == other.value;
-}
-
-bool ConnId::operator!=(ConnId other) const noexcept
-{
-    return !(*this == other);
-}
-
-bool ConnId::operator<(ConnId other) const noexcept
-{
-    return value < other.value;
 }
 
 } // namespace aereborn

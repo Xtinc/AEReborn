@@ -25,9 +25,8 @@ class FloatSource : public NodeT<0, 1>
         : NodeT({}, {{PortSpec(rate, channels)}}), generate_(std::move(generate))
     {
     }
-    RetCode prepare(BlockPeriod period) override
+    RetCode prepare(BlockPeriod) override
     {
-        period_ = period;
         ++prepares;
         return {};
     }
@@ -35,7 +34,7 @@ class FloatSource : public NodeT<0, 1>
     {
         ++calls;
         const auto output = context.outputs[0].audio();
-        const auto start = outputs()[0].frame_position(period_, context.tick_position);
+        const auto start = outputs()[0].frame_position(context.block_period, context.tick_position);
         for (std::size_t ch = 0; ch < output.channels(); ++ch)
             for (std::size_t frame = 0; frame < output.frames(); ++frame)
                 output.channel(ch)[frame] = generate_(start + frame, ch);
@@ -44,7 +43,6 @@ class FloatSource : public NodeT<0, 1>
 
   private:
     const Generator generate_;
-    BlockPeriod period_{};
 };
 
 class PacketSink final : public NodeT<1, 0>
@@ -64,7 +62,6 @@ class PacketSink final : public NodeT<1, 0>
         size_ = input.bytes().size();
         address = input.bytes().data();
         std::copy(input.bytes().begin(), input.bytes().end(), bytes_.begin());
-        ++calls;
     }
     View<const std::uint8_t> bytes() const noexcept { return {bytes_.data(), size_}; }
     float sample(std::size_t frame, std::size_t ch = 0) const noexcept
@@ -77,7 +74,7 @@ class PacketSink final : public NodeT<1, 0>
         std::memcpy(&value, bytes_.data() + (ch * frames + frame) * 4, 4);
         return value;
     }
-    std::size_t frames = 0, calls = 0;
+    std::size_t frames = 0;
     const void *address = nullptr;
 
   private:
@@ -88,11 +85,11 @@ class PacketSink final : public NodeT<1, 0>
 struct Conversion
 {
     Conversion(PortSpec input, PortSpec output, BlockPeriod period = test::period)
-        : engine(period), clock(engine), input_spec(input)
+        : engine(period), clock(engine)
     {
-        input_id = checked(engine.emplace_node<Capture>(input));
+        const auto input_id = checked(engine.emplace_node<Capture>(input));
         convert_id = checked(engine.emplace_node<Convert>(input, output));
-        sink_id = checked(engine.emplace_node<PacketSink>(output));
+        const auto sink_id = checked(engine.emplace_node<PacketSink>(output));
         checked(engine.connect({input_id}, {convert_id}));
         checked(engine.connect({convert_id}, {sink_id}));
         checked(engine.prepare());
@@ -106,8 +103,7 @@ struct Conversion
     }
     Engine engine;
     ManualClock clock;
-    const PortSpec input_spec;
-    NodeId input_id, convert_id, sink_id;
+    NodeId convert_id;
     Capture *capture;
     PacketSink *sink;
 };
