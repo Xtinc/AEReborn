@@ -2,12 +2,9 @@
 #define AEREBORN_CORE_TYPES_H
 
 #include "block.h"
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
-#include <new>
-#include <utility>
 #include <vector>
 
 namespace aereborn
@@ -54,18 +51,48 @@ enum class BlockPeriod : std::uint32_t
     Ms40 = 40
 };
 
-template <SampleRate Rate, BlockPeriod Period> constexpr std::size_t calc_block_frames() noexcept
+constexpr bool is_block_period(BlockPeriod period) noexcept
 {
-    constexpr auto sample_rate_hz = static_cast<std::uint32_t>(Rate);
-    constexpr auto period_ms = static_cast<std::uint32_t>(Period);
-    static_assert(sample_rate_hz > 0 && Rate <= SampleRate::Hz96000, "Sample rate must be positive and at most 96 kHz");
-    static_assert(Period == BlockPeriod::Ms05 || Period == BlockPeriod::Ms10 || Period == BlockPeriod::Ms20 ||
-                      Period == BlockPeriod::Ms40,
-                  "Unsupported block period");
-    constexpr auto frames_x1000 = static_cast<std::uint64_t>(sample_rate_hz) * period_ms;
-    static_assert(frames_x1000 % 1000 == 0, "Sample rate and block period must produce an integer frame count");
-    return static_cast<std::size_t>(frames_x1000 / 1000);
+    return period == BlockPeriod::Ms05 || period == BlockPeriod::Ms10 || period == BlockPeriod::Ms20 ||
+           period == BlockPeriod::Ms40;
 }
+
+// A copyable graph timing specification. A zero frame count marks an invalid combination.
+class EngineSpec
+{
+  public:
+    constexpr EngineSpec(SampleRate sample_rate, BlockPeriod block_period) noexcept
+        : sample_rate_(sample_rate), block_period_(block_period)
+    {
+        if (sample_rate > SampleRate::Hz96000 || !is_block_period(block_period))
+        {
+            return;
+        }
+        const auto frames_x1000 = static_cast<std::uint32_t>(sample_rate) * static_cast<std::uint32_t>(block_period);
+        block_frames_ = frames_x1000 % 1000 == 0 ? frames_x1000 / 1000 : 0;
+    }
+    constexpr SampleRate sample_rate() const noexcept
+    {
+        return sample_rate_;
+    }
+    constexpr BlockPeriod block_period() const noexcept
+    {
+        return block_period_;
+    }
+    constexpr std::size_t block_frames() const noexcept
+    {
+        return block_frames_;
+    }
+    constexpr bool operator==(const EngineSpec &other) const noexcept
+    {
+        return sample_rate_ == other.sample_rate_ && block_period_ == other.block_period_;
+    }
+
+  private:
+    SampleRate sample_rate_;
+    BlockPeriod block_period_;
+    std::size_t block_frames_ = 0;
+};
 
 enum class PCMFormat
 {
@@ -110,43 +137,19 @@ struct PCMSpec
 struct NodeId
 {
     std::uint64_t value = 0;
-    explicit operator bool() const noexcept
-    {
-        return value != 0;
-    }
-    bool operator==(NodeId other) const noexcept
-    {
-        return value == other.value;
-    }
-    bool operator!=(NodeId other) const noexcept
-    {
-        return !(*this == other);
-    }
-    bool operator<(NodeId other) const noexcept
-    {
-        return value < other.value;
-    }
+    explicit operator bool() const noexcept;
+    bool operator==(NodeId other) const noexcept;
+    bool operator!=(NodeId other) const noexcept;
+    bool operator<(NodeId other) const noexcept;
 };
 
 struct ConnId
 {
     std::uint64_t value = 0;
-    explicit operator bool() const noexcept
-    {
-        return value != 0;
-    }
-    bool operator==(ConnId other) const noexcept
-    {
-        return value == other.value;
-    }
-    bool operator!=(ConnId other) const noexcept
-    {
-        return !(*this == other);
-    }
-    bool operator<(ConnId other) const noexcept
-    {
-        return value < other.value;
-    }
+    explicit operator bool() const noexcept;
+    bool operator==(ConnId other) const noexcept;
+    bool operator!=(ConnId other) const noexcept;
+    bool operator<(ConnId other) const noexcept;
 };
 
 struct IPort
@@ -166,63 +169,16 @@ class ChMatrix
 {
   public:
     ChMatrix() = default; // Empty means identity, requiring equal channel counts.
-    static Result<ChMatrix> create(std::size_t output_channels, std::size_t input_channels,
-                                   View<const float> coefficients) noexcept
-    try
-    {
-        if (input_channels == 0 || output_channels == 0)
-        {
-            return ErrorCode::InvalidArg;
-        }
-        if (output_channels > std::vector<float>().max_size() / input_channels)
-        {
-            return ErrorCode::TooLarge;
-        }
-        if (coefficients.size() != output_channels * input_channels)
-        {
-            return ErrorCode::InvalidArg;
-        }
-        for (const auto coefficient : coefficients)
-        {
-            if (!std::isfinite(coefficient))
-            {
-                return ErrorCode::InvalidArg;
-            }
-        }
-        return ChMatrix(output_channels, input_channels, std::vector<float>(coefficients.begin(), coefficients.end()));
-    }
-    catch (const std::bad_alloc &)
-    {
-        return ErrorCode::NoMemory;
-    }
-
-    static Result<ChMatrix> create(std::size_t output_channels, std::size_t input_channels,
-                                   std::initializer_list<float> coefficients) noexcept
-    {
-        return create(output_channels, input_channels, View<const float>{coefficients.begin(), coefficients.size()});
-    }
-    bool empty() const noexcept
-    {
-        return coefficients_.empty();
-    }
-    std::size_t input_channels() const noexcept
-    {
-        return input_channels_;
-    }
-    std::size_t output_channels() const noexcept
-    {
-        return output_channels_;
-    }
-    const std::vector<float> &coefficients() const noexcept
-    {
-        return coefficients_;
-    }
+    ChMatrix(std::size_t output_channels, std::size_t input_channels, View<const float> coefficients);
+    ChMatrix(std::size_t output_channels, std::size_t input_channels, std::initializer_list<float> coefficients);
+    // Add mapped samples to output. The caller validates the block sizes and channel counts.
+    void mix_add(IBlock input, OBlock output, float gain = 1.0f) const noexcept;
+    bool empty() const noexcept;
+    std::size_t input_channels() const noexcept;
+    std::size_t output_channels() const noexcept;
+    const std::vector<float> &coefficients() const noexcept;
 
   private:
-    ChMatrix(std::size_t output_channels, std::size_t input_channels, std::vector<float> coefficients) noexcept
-        : input_channels_(input_channels), output_channels_(output_channels), coefficients_(std::move(coefficients))
-    {
-    }
     std::size_t input_channels_ = 0;
     std::size_t output_channels_ = 0;
     std::vector<float> coefficients_;
@@ -234,42 +190,6 @@ struct ConnOpts
     bool muted = false;
     ChMatrix matrix;
 };
-
-namespace detail
-{
-// Add into a prepared destination. Port and matrix dimensions are validated by the caller.
-inline void mix(IBlock input, OBlock output, const ChMatrix &matrix, float gain = 1.0f) noexcept
-{
-    auto add_channel = [&](std::size_t src_ch, std::size_t dst_ch, float channel_gain) {
-        if (channel_gain == 0.0f)
-        {
-            return;
-        }
-        const auto *src = input.channel(src_ch);
-        auto *dst = output.channel(dst_ch);
-        for (std::size_t frame = 0; frame < output.frames(); ++frame)
-        {
-            dst[frame] += src[frame] * channel_gain;
-        }
-    };
-    if (matrix.empty())
-    {
-        for (std::size_t ch = 0; ch < output.channels(); ++ch)
-        {
-            add_channel(ch, ch, gain);
-        }
-        return;
-    }
-    const auto &coefficients = matrix.coefficients();
-    for (std::size_t dst_ch = 0; dst_ch < output.channels(); ++dst_ch)
-    {
-        for (std::size_t src_ch = 0; src_ch < input.channels(); ++src_ch)
-        {
-            add_channel(src_ch, dst_ch, coefficients[dst_ch * input.channels() + src_ch] * gain);
-        }
-    }
-}
-} // namespace detail
 
 struct ProcContext
 {

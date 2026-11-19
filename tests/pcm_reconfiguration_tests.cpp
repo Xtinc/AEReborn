@@ -1,5 +1,5 @@
-#include "checked.h"
-#include "pcm.h"
+#include "support/test_harness.h"
+#include "support/pcm_reference.h"
 #include "core/engine.h"
 #include "plugins/adapter.h"
 #include "plugins/virtual.h"
@@ -13,19 +13,16 @@ using namespace aereborn;
 using namespace aereborn::test;
 constexpr auto rate = SampleRate::Hz48000;
 constexpr auto period = BlockPeriod::Ms05;
-using TestEngine = Engine<rate, period>;
-using Input = IAdapter<rate, period>;
-using Output = OAdapter<rate, period>;
-constexpr auto block_frames = TestEngine::block_frames();
+constexpr std::size_t block_frames = 240;
 constexpr double two_pi = 6.283185307179586;
 
-void capture_switch()
+void capture_format_switch()
 {
-    TestEngine engine;
-    const auto input_id = checked(engine.emplace_node<Input>(2));
-    const auto output_id = checked(engine.emplace_node<Output>(2));
-    auto *input = checked(engine.node<Input>(input_id));
-    auto *output = checked(engine.node<Output>(output_id));
+    Engine engine(rate, period);
+    const auto input_id = checked(engine.emplace_node<IAdapter>(2, engine.spec()));
+    const auto output_id = checked(engine.emplace_node<OAdapter>(2, engine.spec()));
+    auto *input = checked(engine.node<IAdapter>(input_id));
+    auto *output = checked(engine.node<OAdapter>(output_id));
     checked(engine.connect({input_id}, {output_id}, {0.5f, false, {}}));
     checked(engine.prepare());
     checked(input->configure_pcm({rate, PCMFormat::S16LE, 2, 2}));
@@ -48,7 +45,7 @@ void capture_switch()
     check(std::all_of(packet.begin(), packet.end(), [](std::uint8_t byte) { return byte == 0; }),
           "Unplugged capture produces silence while the graph clock continues");
 
-    const auto matrix = checked(ChMatrix::create(2, 1, {1, -0.5f}));
+    const ChMatrix matrix(2, 1, {1, -0.5f});
     const PCMSpec new_spec{SampleRate::Hz16000, PCMFormat::S16LE, 1};
     checked(input->configure_pcm(new_spec, matrix));
     VirtualSource device(new_spec, period, 1000, 0.5f);
@@ -83,22 +80,22 @@ void capture_switch()
     bind_output();
     checked(engine.process());
     check(std::all_of(packet.begin(), packet.end(), [](std::uint8_t byte) { return byte == 0; }) &&
-              checked(engine.node<Input>(input_id)) == input && input->outputs()[0] == 2 &&
+              checked(engine.node<IAdapter>(input_id)) == input && input->outputs()[0] == 2 &&
               engine.frame_position() == 13 * block_frames,
           "Reconfiguration starts with fresh history while preserving node, channels and graph time");
 }
 
-void playback_switch()
+void playback_format_switch()
 {
-    TestEngine engine;
-    const auto input_id = checked(engine.emplace_node<Input>(2));
-    const auto output_id = checked(engine.emplace_node<Output>(2));
-    auto *input = checked(engine.node<Input>(input_id));
-    auto *output = checked(engine.node<Output>(output_id));
+    Engine engine(rate, period);
+    const auto input_id = checked(engine.emplace_node<IAdapter>(2, engine.spec()));
+    const auto output_id = checked(engine.emplace_node<OAdapter>(2, engine.spec()));
+    auto *input = checked(engine.node<IAdapter>(input_id));
+    auto *output = checked(engine.node<OAdapter>(output_id));
     checked(engine.connect({input_id}, {output_id}, {0.5f, false, {}}));
     checked(engine.prepare());
     const PCMSpec source_spec{rate, PCMFormat::F32LE, 1};
-    checked(input->configure_pcm(source_spec, checked(ChMatrix::create(2, 1, {1, 0.5f}))));
+    checked(input->configure_pcm(source_spec, ChMatrix(2, 1, {1, 0.5f})));
     VirtualSource source(source_spec, period, 1000, 1);
     checked(source.prepare());
     checked(output->configure_pcm({rate, PCMFormat::F32LE, 2, 2}));
@@ -112,7 +109,7 @@ void playback_switch()
     checked(engine.process());
     const auto previous = old_packet;
 
-    const auto matrix = checked(ChMatrix::create(1, 2, {0.25f, 0.75f}));
+    const ChMatrix matrix(1, 2, {0.25f, 0.75f});
     checked(output->configure_pcm({SampleRate::Hz16000, PCMFormat::S16LE, 1}, matrix));
     feed(); // No new buffer yet: drop this output period and do not write the old device.
     checked(engine.process());
@@ -150,7 +147,7 @@ void playback_switch()
     checked(output->bind_pcm({stereo.data(), stereo.size()}));
     checked(engine.process()); // Missing source is silence.
     check(std::all_of(stereo.begin(), stereo.end(), [](std::uint8_t byte) { return byte == 0; }) &&
-              old_packet == previous && checked(engine.node<Output>(output_id)) == output &&
+              old_packet == previous && checked(engine.node<OAdapter>(output_id)) == output &&
               output->inputs()[0] == 2 && engine.frame_position() == 13 * block_frames,
           "Playback reconfiguration preserves logical identity and time, without old-device writes or history");
 }
@@ -159,7 +156,7 @@ void playback_switch()
 int main(int argc, char **argv)
 {
     return aereborn::test::run_tests(argc, argv, {
-        {"capture_switch", capture_switch},
-        {"playback_switch", playback_switch}
+        {"capture_format_switch", capture_format_switch},
+        {"playback_format_switch", playback_format_switch}
     });
 }

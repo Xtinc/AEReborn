@@ -1,5 +1,5 @@
-#ifndef AEREBORN_TESTS_PCM_H
-#define AEREBORN_TESTS_PCM_H
+#ifndef AEREBORN_TESTS_PCM_REFERENCE_H
+#define AEREBORN_TESTS_PCM_REFERENCE_H
 
 #include <cstdint>
 #include <cstring>
@@ -29,4 +29,4 @@ inline float read_f32le(const std::uint8_t *input)
 } // namespace test
 } // namespace aereborn
 
-#endif // AEREBORN_TESTS_PCM_H
+#endif // AEREBORN_TESTS_PCM_REFERENCE_H

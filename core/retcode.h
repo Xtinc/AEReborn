@@ -21,9 +21,7 @@ enum class ErrorCode
     Cycle = 9, // Preserve existing error values.
     NotPrepared,
     BufferFull,
-    TooLarge,
-    NoMemory,
-    NodeFailed
+    TooLarge
 };
 
 class RetCode
@@ -68,10 +66,6 @@ class RetCode
             return "An audio block is still in use";
         case ErrorCode::TooLarge:
             return "Requested capacity exceeds the supported size";
-        case ErrorCode::NoMemory:
-            return "Memory allocation failed";
-        case ErrorCode::NodeFailed:
-            return "Node construction or preparation failed";
         }
         return "Unknown error code";
     }

@@ -38,14 +38,14 @@ int main()
         checked(capture.prepare());
         checked(playback.prepare());
 
-        Engine<rate, period> engine;
+        Engine engine(rate, period);
         constexpr std::size_t channels = 2; // Logical layout stays fixed when the device format changes.
-        const auto input_id = checked(engine.emplace_node<IAdapter<rate, period>>(channels));
-        const auto output_id = checked(engine.emplace_node<OAdapter<rate, period>>(channels));
+        const auto input_id = checked(engine.emplace_node<IAdapter>(channels, engine.spec()));
+        const auto output_id = checked(engine.emplace_node<OAdapter>(channels, engine.spec()));
         const auto connection = checked(engine.connect({input_id}, {output_id}));
         checked(engine.prepare());
-        auto *input = checked(engine.node<IAdapter<rate, period>>(input_id));
-        auto *output = checked(engine.node<OAdapter<rate, period>>(output_id));
+        auto *input = checked(engine.node<IAdapter>(input_id));
+        auto *output = checked(engine.node<OAdapter>(output_id));
         checked(input->configure_pcm(capture_spec));
         checked(output->configure_pcm(playback_spec));
         std::vector<std::uint8_t> output_pcm(output->pcm_bytes());

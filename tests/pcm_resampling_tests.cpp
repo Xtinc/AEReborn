@@ -1,5 +1,5 @@
-#include "checked.h"
-#include "pcm.h"
+#include "support/test_harness.h"
+#include "support/pcm_reference.h"
 #include "core/engine.h"
 #include "plugins/adapter.h"
 #include "plugins/virtual.h"
@@ -13,29 +13,22 @@ using namespace aereborn;
 using namespace aereborn::test;
 constexpr auto rate = SampleRate::Hz48000;
 constexpr auto period = BlockPeriod::Ms05;
-using TestEngine = Engine<rate, period>;
-using Input = IAdapter<rate, period>;
-using Output = OAdapter<rate, period>;
-constexpr auto block_frames = TestEngine::block_frames();
 constexpr double two_pi = 6.283185307179586;
-template <SampleRate EngineRate, BlockPeriod EnginePeriod = period>
-std::vector<float> input_resample(SampleRate source_rate, std::size_t pcm_frames, std::size_t periods_per_transfer)
+std::vector<float> input_resample(SampleRate graph_rate, BlockPeriod graph_period, SampleRate source_rate,
+                                  std::size_t pcm_frames, std::size_t periods_per_transfer)
 {
-    using InputType = IAdapter<EngineRate, EnginePeriod>;
-    using OutputType = OAdapter<EngineRate, EnginePeriod>;
-    using EngineType = Engine<EngineRate, EnginePeriod>;
-    EngineType engine;
-    constexpr auto graph_frames = EngineType::block_frames();
+    Engine engine(graph_rate, graph_period);
+    const auto graph_frames = engine.spec().block_frames();
     const auto source_hz = static_cast<std::uint32_t>(source_rate);
     const PCMSpec spec{source_rate, PCMFormat::F32LE, 2, periods_per_transfer};
-    const auto input_id = checked(engine.template emplace_node<InputType>(spec.channels));
-    checked(checked(engine.template node<InputType>(input_id))->configure_pcm(spec));
-    const auto output_id = checked(engine.template emplace_node<OutputType>(2));
-    checked(checked(engine.template node<OutputType>(output_id))->configure_pcm(PCMSpec{EngineRate, PCMFormat::F32LE, 2}));
+    const auto input_id = checked(engine.emplace_node<IAdapter>(spec.channels, engine.spec()));
+    checked(checked(engine.node<IAdapter>(input_id))->configure_pcm(spec));
+    const auto output_id = checked(engine.emplace_node<OAdapter>(2, engine.spec()));
+    checked(checked(engine.node<OAdapter>(output_id))->configure_pcm(PCMSpec{graph_rate, PCMFormat::F32LE, 2}));
     checked(engine.connect({input_id}, {output_id}));
     checked(engine.prepare());
-    auto *input = checked(engine.template node<InputType>(input_id));
-    auto *output = checked(engine.template node<OutputType>(output_id));
+    auto *input = checked(engine.node<IAdapter>(input_id));
+    auto *output = checked(engine.node<OAdapter>(output_id));
     check(input->pcm_frames() == pcm_frames, "Input requests a fixed integer-period transfer");
     std::vector<std::uint8_t> pcm(pcm_frames * 8);
     std::vector<std::uint8_t> captured(graph_frames * 8);
@@ -86,25 +79,21 @@ std::vector<float> input_resample(SampleRate source_rate, std::size_t pcm_frames
     return converted;
 }
 
-template <SampleRate EngineRate = rate, BlockPeriod EnginePeriod = period>
-std::vector<float> output_resample(SampleRate target_rate, double frequency, std::size_t pcm_frames,
-                                   std::size_t periods_per_transfer)
+std::vector<float> output_resample(SampleRate graph_rate, BlockPeriod graph_period, SampleRate target_rate,
+                                   double frequency, std::size_t pcm_frames, std::size_t periods_per_transfer)
 {
-    using InputType = IAdapter<EngineRate, EnginePeriod>;
-    using OutputType = OAdapter<EngineRate, EnginePeriod>;
-    using EngineType = Engine<EngineRate, EnginePeriod>;
-    const PCMSpec source_spec{EngineRate, PCMFormat::F32LE, 1};
-    VirtualSource source(source_spec, EnginePeriod, frequency, 1.0f);
+    const PCMSpec source_spec{graph_rate, PCMFormat::F32LE, 1};
+    VirtualSource source(source_spec, graph_period, frequency, 1.0f);
     checked(source.prepare());
-    EngineType engine;
-    const auto input_id = checked(engine.template emplace_node<InputType>(source_spec.channels));
-    checked(checked(engine.template node<InputType>(input_id))->configure_pcm(source_spec));
-    const auto output_id = checked(engine.template emplace_node<OutputType>(1));
-    checked(checked(engine.template node<OutputType>(output_id))->configure_pcm(PCMSpec{target_rate, PCMFormat::F32LE, 1, periods_per_transfer}));
+    Engine engine(graph_rate, graph_period);
+    const auto input_id = checked(engine.emplace_node<IAdapter>(source_spec.channels, engine.spec()));
+    checked(checked(engine.node<IAdapter>(input_id))->configure_pcm(source_spec));
+    const auto output_id = checked(engine.emplace_node<OAdapter>(1, engine.spec()));
+    checked(checked(engine.node<OAdapter>(output_id))->configure_pcm(PCMSpec{target_rate, PCMFormat::F32LE, 1, periods_per_transfer}));
     checked(engine.connect({input_id}, {output_id}));
     checked(engine.prepare());
-    auto *input = checked(engine.template node<InputType>(input_id));
-    auto *output = checked(engine.template node<OutputType>(output_id));
+    auto *input = checked(engine.node<IAdapter>(input_id));
+    auto *output = checked(engine.node<OAdapter>(output_id));
     check(output->pcm_frames() == pcm_frames, "Output advertises the configured device frame count");
     std::vector<float> converted;
     std::vector<std::uint8_t> pcm(4 * pcm_frames);
@@ -151,25 +140,25 @@ void check_continuity(const std::vector<float> &samples, std::uint32_t source_ra
     }
 }
 
-void continuity()
+void rate_and_period_continuity()
 {
-    check_continuity(input_resample<rate>(SampleRate::Hz44100, 441, 2), 44100, 48000);
-    check_continuity(output_resample(SampleRate::Hz44100, 1000, 441, 2), 48000, 44100);
+    check_continuity(input_resample(rate, period, SampleRate::Hz44100, 441, 2), 44100, 48000);
+    check_continuity(output_resample(rate, period, SampleRate::Hz44100, 1000, 441, 2), 48000, 44100);
 
     constexpr auto reverse_rate = SampleRate::Hz44100;
     constexpr auto reverse_period = BlockPeriod::Ms10;
-    check_continuity(input_resample<reverse_rate, reverse_period>(rate, 480, 1), 48000, 44100);
-    check_continuity(output_resample<reverse_rate, reverse_period>(rate, 1000, 480, 1), 44100, 48000);
+    check_continuity(input_resample(reverse_rate, reverse_period, rate, 480, 1), 48000, 44100);
+    check_continuity(output_resample(reverse_rate, reverse_period, rate, 1000, 480, 1), 44100, 48000);
 
-    check_continuity(input_resample<rate>(SampleRate::Hz11025, 441, 8), 11025, 48000);
-    check_continuity(input_resample<SampleRate::Hz96000>(SampleRate::Hz8000, 40, 1), 8000, 96000);
-    check_continuity(input_resample<SampleRate::Hz8000>(SampleRate::Hz96000, 480, 1), 96000, 8000);
+    check_continuity(input_resample(rate, period, SampleRate::Hz11025, 441, 8), 11025, 48000);
+    check_continuity(input_resample(SampleRate::Hz96000, period, SampleRate::Hz8000, 40, 1), 8000, 96000);
+    check_continuity(input_resample(SampleRate::Hz8000, period, SampleRate::Hz96000, 480, 1), 96000, 8000);
 }
 
-void antialias()
+void antialias_filter()
 {
-    const auto passband = output_resample(SampleRate::Hz16000, 1000, 80, 1);
-    const auto stopband = output_resample(SampleRate::Hz16000, 12000, 80, 1);
+    const auto passband = output_resample(rate, period, SampleRate::Hz16000, 1000, 80, 1);
+    const auto stopband = output_resample(rate, period, SampleRate::Hz16000, 12000, 80, 1);
     check(rms(passband) > 0.69 && rms(stopband) < 0.01 * rms(passband), "Downsampling must suppress aliasing");
 }
 
@@ -178,6 +167,6 @@ void antialias()
 int main(int argc, char **argv)
 {
     return aereborn::test::run_tests(argc, argv, {
-        {"continuity", continuity}, {"antialias", antialias}
+        {"rate_and_period_continuity", rate_and_period_continuity}, {"antialias_filter", antialias_filter}
     });
 }

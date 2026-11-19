@@ -44,7 +44,7 @@ Source、Processor、Mixer、Sink 是具体节点的用途。`plugins/` 中的 `
 | Mixer | 将输入端口的混音结果转发到一个可供下游复用的输出 | 后续插件；当前输入端口已支持多连接求和 |
 | Sink | 消费图内音频 | `OAdapter` |
 
-PCM 适配器和固定端口数量的自定义节点通常继承 `NodeT<I, O, Rate, Period>`，由它保存端口声道数和块视图。自定义节点可以是普通类，基类的 `Rate` 和 `Period` 与所用引擎一致。需要在构造时决定端口数量的节点可以直接继承 `Node<Rate, Period>`，自行提供 `inputs()/outputs()` 和 `iblocks()/oblocks()` 所需的稳定存储，端口布局在加入引擎后保持固定。
+PCM 适配器和固定端口数量的自定义节点通常继承 `NodeT<I, O>`，由它保存端口声道数和块视图。节点在 `prepare(const EngineSpec &)` 中取得引擎规格。端口数量由运行时决定的节点可以直接继承 `Node`，自行提供 `inputs()/outputs()` 和 `iblocks()/oblocks()` 所需的稳定存储，端口布局在加入引擎后保持固定。
 后续设备、文件、网络、滤波等节点遵循同一边界。Bus 表示 Mixer 与效果节点构成的应用层总线，不是新的核心基类。
 
 ### 从输出创建输入：直接复用端口
@@ -60,31 +60,30 @@ PCM 适配器和固定端口数量的自定义节点通常继承 `NodeT<I, O, Ra
 
 ```text
 core/
-├── types.h                    采样率、周期、PCM 格式、句柄、声道矩阵和处理上下文
-├── graph.h                    Node、NodeT 与共享 ID 分配
-├── block.h                    非持有块视图与持有采样内存的 Buffer
-├── retcode.h                  错误码、错误消息与带值结果
-└── engine.h                   Engine 模板：图编辑、校验、准备、执行与生命周期
+├── types.h / types.cpp        公共规格、图句柄、声道矩阵和基础类型实现
+├── block.h                    块视图与 Buffer 接口
+├── retcode.h                  错误码与带值结果接口
+├── graph.h                    Node、节点默认行为和固定端口数的 NodeT
+└── engine.h / engine.cpp      图编辑、准备与执行
 plugins/
 ├── adapter.h / adapter.cpp    PCM 输入和输出适配
 └── virtual.h / virtual.cpp    图外正弦 PCM 发端与原始 PCM 收端
 tests/
-├── core_tests.cpp             块、矩阵、图校验、生命周期和 ID
-├── routing_tests.cpp          使用虚拟设备与处理节点搭建路由场景
-├── adapter_tests.cpp          PCM 格式、缓冲绑定、声道映射和无额外帧延迟
-├── resampling_tests.cpp       连续性、极端采样率比例和抗混叠
-├── device_tests.cpp           虚拟设备拔插、格式切换与稳定逻辑端口
-├── virtual_tests.cpp          图外虚拟端点的格式、独立时间线和收发状态
-├── allocation_tests.cpp       配置分配失败后的状态保留
-├── template_link.cpp          跨翻译单元模板与 ID 验证
-└── checked.h / pcm.h / virtual_nodes.h  统一用例入口、独立 PCM 参照和虚拟路由构件
+├── engine_graph_tests.cpp        块、矩阵、图校验、准备重试和句柄
+├── graph_routing_tests.cpp       使用虚拟端点和测试节点验证离线路由
+├── pcm_adapter_tests.cpp         PCM 格式、绑定、配置校验与声道映射
+├── pcm_resampling_tests.cpp      相位连续性、采样率比例和抗混叠
+├── pcm_reconfiguration_tests.cpp  虚拟设备切换和逻辑端口稳定性
+├── virtual_pcm_tests.cpp         虚拟 PCM 发端与收端的独立行为
+├── allocation_failure_tests.cpp  缓冲扩容和 PCM 配置的分配失败恢复
+└── support/                      用例入口、独立 PCM 参照和路由夹具
 examples/
 └── virtual_routing.cpp        虚拟设备通过 Adapter 接入引擎
 ```
 
-`core/types.h` 集中定义调用方配置音频和建立连接所用的类型。`core/graph.h` 提供 `Node` 和 `NodeT`。`aereborn::core` 是纯头文件的 CMake 接口目标，传递头文件路径和 C++14 要求。`aereborn::plugins` 提供 PCM 适配器和图外虚拟收发端点，依赖核心接口。
+`core/types.cpp` 集中实现缓冲、错误消息、图句柄和声道矩阵。`core/engine.cpp` 实现引擎生命周期。节点的默认行为、模板和 `constexpr` 函数定义放在头文件中。`aereborn::core` 是 CMake 静态库目标，提供核心实现和头文件路径。`aereborn::plugins` 提供 PCM 适配器和图外虚拟收发端点，并链接核心库。
 Engine 直接拥有 Node、Connection 和图缓冲池。`prepare()` 完成依赖排序、预分配缓冲和端口绑定；执行计划只保存排好顺序的节点记录指针，块视图和连接区间直接保存在节点记录中，`process()` 直接遍历这些记录。
-固定端口数量通过 `NodeT<I, O, Rate, Period>` 确定，端口声道数和块视图使用 `std::array`。采样数据集中在图缓冲池，节点执行顺序和连接索引使用可复用的连续数组。
+固定端口数量通过 `NodeT<I, O>` 确定，端口声道数和块视图使用 `std::array`。采样数据集中在图缓冲池，节点执行顺序和连接索引使用可复用的连续数组。
 `IBlock/OBlock` 分别是 `Block<const float>/Block<float>`，共享布局与寻址实现，只允许可写块转换为只读块。`ProcContext` 通过 `View` 传入块数组，端口数量直接从视图取得。
 `iblocks()/oblocks()` 供 Engine 准备缓冲时绑定块视图。`NodeT` 已实现这两个接口，节点处理音频统一通过 `ProcContext`。
 `Connection` 是 Engine 的内部记录，持有端口引用、参数和由 `prepare()` 写入的缓冲绑定。编辑与执行共享这些记录，节点通过按输入端口排序的指针索引访问它们。
@@ -123,10 +122,10 @@ Engine 直接拥有 Node、Connection 和图缓冲池。`prepare()` 完成依赖
 主设备能提供基础节拍时，可以直接在其回调或设备线程执行渲染。
 主驱动切换须先确认旧驱动退出，再接管执行权；帧序号继续递增，并报告时钟切换或数据不连续。
 
-内部统一使用 planar float32。`Engine<Rate, Period>` 显式接收两个枚举模板参数，同一引擎内的节点采用相同模板参数，端口声道数可以不同。PCM 适配器模板的默认规格为 `SampleRate::Hz48000` 和 `BlockPeriod::Ms10`，例如 `IAdapter<>`。
-`SampleRate` 提供 8000、11025、16000、22050、24000、32000、44100、48000、88200、96000 Hz，最高 96 kHz；`BlockPeriod` 提供 `Ms05`、`Ms10`、`Ms20`、`Ms40`。
-每周期帧数精确计算为 `采样率 × 周期毫秒 / 1000`，由内部 constexpr 函数统一计算；不能组成整数帧的组合在实例化时编译失败，不进行四舍五入。例如 44.1 kHz/5 ms 不允许，44.1 kHz/10 ms 为 441 帧。11.025 kHz 仅允许 40 ms，22.05 kHz 允许 20/40 ms，44.1 kHz 允许 10/20/40 ms，其余列出的采样率允许四种周期。
-`block_frames()` 可用于常量表达式；不再提供配置结构体、运行时配置构造参数或 `config()`。节点 `prepare()` 直接使用模板规格，`ProcContext` 仅传递帧位置和输入输出块视图，不重复携带采样率与帧数。
+内部统一使用 planar float32。`Engine(sample_rate, block_period)` 构造时固定图规格，通过 `spec()` 按值返回 `EngineSpec`。创建 PCM 适配器时传入这份规格和图内端口声道数。
+`SampleRate` 提供 8000、11025、16000、22050、24000、32000、44100、48000、88200、96000 Hz 的枚举值。图采样率范围为 1 至 96000 Hz，`BlockPeriod` 支持 `Ms05`、`Ms10`、`Ms20` 和 `Ms40`。
+每周期帧数按 `采样率 × 周期毫秒 / 1000` 精确计算，通过 `engine.spec().block_frames()` 查询。例如 44.1 kHz / 10 ms 为 441 帧。44.1 kHz / 5 ms 无法得到整数帧，规格中的帧数为零，`Engine::prepare()` 返回 `InvalidArg`。
+引擎将规格传给节点的 `prepare(const EngineSpec &)`，节点可以据此准备算法资源。`ProcContext` 提供当前帧位置及输入输出块视图，块视图提供实际帧数。
 `RetCode process() noexcept` 是唯一处理入口，每次固定处理一周期；短输入在源节点补零，输出和时间推进仍为完整周期。图尚未准备时返回 `ErrorCode::NotPrepared`，不执行节点、不消费输入、不推进时间；准备成功的空图返回 `ErrorCode::Ok` 并推进一周期。
 当前原型由调用方推进。`IAdapter` 和 `OAdapter` 在每个引擎周期处理已绑定设备缓冲的一段 PCM。设备驱动接入后提供实际的设备周期及收发缓冲。
 
@@ -208,13 +207,13 @@ VirtualSink sink(spec, period);
 checked(source.prepare());
 checked(sink.prepare());
 
-Engine<rate, period> engine;
-const auto input_id = checked(engine.emplace_node<IAdapter<rate, period>>(2));
-const auto output_id = checked(engine.emplace_node<OAdapter<rate, period>>(2));
+Engine engine(rate, period);
+const auto input_id = checked(engine.emplace_node<IAdapter>(2, engine.spec()));
+const auto output_id = checked(engine.emplace_node<OAdapter>(2, engine.spec()));
 checked(engine.connect({input_id}, {output_id}));
 checked(engine.prepare());
-auto *input = checked(engine.node<IAdapter<rate, period>>(input_id));
-auto *output = checked(engine.node<OAdapter<rate, period>>(output_id));
+auto *input = checked(engine.node<IAdapter>(input_id));
+auto *output = checked(engine.node<OAdapter>(output_id));
 checked(input->configure_pcm(spec));
 checked(output->configure_pcm(spec));
 std::vector<std::uint8_t> pcm(output->pcm_bytes());
@@ -232,31 +231,31 @@ checked(sink.receive({pcm.data(), pcm.size()}));
 
 ### 错误处理
 
-可能失败的操作返回 `RetCode`，同时返回节点指针、句柄或矩阵时用 `Result<T>`。两者都可用 `if (!result)` 判断失败。`Result<T>::ret_code()` 返回 `RetCode`，调用方按 `code()` 分支，可在控制侧用 `message()` 读取固定错误文本。检查成功后才调用 `value()`。
+参数、状态和容量校验等可预期的操作失败通过 `RetCode` 返回，同时返回节点指针或句柄时用 `Result<T>`。两者都可用 `if (!result)` 判断失败。`Result<T>::ret_code()` 返回 `RetCode`，调用方按 `code()` 分支，可在控制侧用 `message()` 读取固定错误文本。检查成功后才调用 `value()`。
 
-引擎在加入节点时检查端口声道数。一般节点在 `prepare()` 校验自身配置并准备处理资源，失败时可以重试，已准备成功的节点保留状态。Adapter 的设备资源由独立的 `configure_pcm()` 准备，图可以先准备和运行，再接入设备。`Node::process()` 是 `void noexcept`，引擎未准备好时 `Engine::process()` 返回 `NotPrepared`。
+引擎在加入节点时检查端口声道数，在 `prepare()` 校验图的采样率与周期。节点通过 `prepare(const EngineSpec &)` 校验自身配置并准备处理资源，失败时可以重试，已准备成功的节点保留状态。Adapter 的设备资源由独立的 `configure_pcm()` 准备，图可以先准备和运行，再接入设备。`Node::process()` 是 `void noexcept`，引擎未准备好时 `Engine::process()` 返回 `NotPrepared`。
 
-需要分配的接口将分配失败映射为 `NoMemory`，容量超限返回 `TooLarge`。自定义节点构造或准备期间抛出的其他异常转换为 `NodeFailed`。低层块视图的索引和跨度由调用者保证。
+控制侧分配失败以及自定义节点在构造或准备时抛出的异常会传给调用方。`ChMatrix` 直接构造，参数非法时抛 `std::invalid_argument`，尺寸超出存储容量时抛 `std::length_error`。低层块视图的索引和跨度由调用者保证。
 
 ### 当前原型的运行约定
 
 - `prepare()` 从所有无输出端口的 Sink 反向收集依赖。节点首次进入执行计划时准备资源，并在计划中按依赖顺序处理。
 - 拓扑改变后 `process()` 返回 `NotPrepared`，直到重新准备成功。已准备的节点保留暂存音频和 DSP 状态。
 - 连接的增益和静音参数同步修改，下一块生效。
-- 自定义节点通过 `context.inputs[i]`、`context.outputs[i]` 访问块，通过 `.size()` 查询端口数量；引擎清零输入，节点必须写满本次处理跨度内的全部输出。`ProcContext` 提供块起始帧位置；节点算法直接使用对应模板规格的固定帧数。
+- 自定义节点通过 `context.inputs[i]`、`context.outputs[i]` 访问块，通过 `.size()` 查询端口数量。引擎清零输入，节点必须写满块视图 `frames()` 指定的输出跨度。`ProcContext` 提供块的起始帧位置。
 
 ### 外部 PCM 输入和输出
 
-`plugins/adapter.h` 提供两个独立的节点 `IAdapter<Rate, Period>` 和 `OAdapter<Rate, Period>`，构造时只接收固定的图内端口声道数。通过 `configure_pcm(PCMSpec spec, const ChMatrix &matrix = {})` 配置或替换设备侧转换状态。`PCMSpec{sample_rate, format, channels, periods}` 全部描述设备侧 PCM，设备声道数可以与图内声道数不同。`periods` 是一块 PCM 覆盖的引擎周期数，默认为 1。当前虚拟设备的收发周期与该交付块一致。
+`plugins/adapter.h` 提供两个独立的节点 `IAdapter` 和 `OAdapter`，构造时接收固定的图内端口声道数和 `EngineSpec`。通过 `configure_pcm(PCMSpec spec, const ChMatrix &matrix = {})` 配置或替换设备侧转换状态。`PCMSpec{sample_rate, format, channels, periods}` 全部描述设备侧 PCM，设备声道数可以与图内声道数不同。`periods` 是一块 PCM 覆盖的引擎周期数，默认为 1。当前虚拟设备的收发周期与该交付块一致。
 
 外部使用交错 PCM，格式包括 `S16LE`、`S24_3LE`、`S24LE`、`S32LE` 和 `F32LE`。`pcm_sample_bits()` 查询样本位深，`pcm_sample_bytes()` 查询存储字节数。`S24_3LE` 每样本占三字节，`S24LE` 每样本占四字节，低 24 位有效，写出的高字节为零。
 
-- 图内端口声道数在加入引擎时校验，Adapter 沿用 Node 的默认 `prepare()`，不重复校验已固定的布局，不要求已有设备配置，也不重置现有转换状态。未配置的输入产生静音，输出丢弃数据，图照常推进；此时 `bind_pcm()` 返回 `NotPrepared`。独立配置时也会校验逻辑声道数。
-- `configure_pcm()` 在临时转换器中完成校验、缓冲分配及滤波准备，成功后替换旧转换器、解除旧缓冲绑定并从新流的第一个周期开始。失败返回错误码，旧配置、缓冲绑定、周期索引和滤波历史保持不变。配置可以在图准备前或准备后进行，无需再次调用 `Engine::prepare()`，节点身份、图内端口、连接及引擎帧位置保持不变。
+- 图内端口声道数在加入引擎时校验。Adapter 在首次进入执行计划时核对其构造规格与当前图一致。未配置设备时输入产生静音，输出丢弃数据，图照常推进，此时 `bind_pcm()` 返回 `NotPrepared`。独立配置时也会校验图规格和逻辑声道数。
+- `configure_pcm()` 在临时转换器中完成校验、缓冲分配及滤波准备，成功后替换旧转换器、解除旧缓冲绑定并从新流的第一个周期开始。无论返回错误码还是抛出异常，旧配置、缓冲绑定、周期索引和滤波历史都保持有效。配置可以在图准备前或准备后进行，无需再次调用 `Engine::prepare()`，节点身份、图内端口、连接及引擎帧位置保持不变。
 - `ChMatrix` 的行是目标声道，列是源声道。输入适配器的矩阵方向是设备→图，输出适配器是图→设备。相同声道数时空矩阵表示直通；不同声道数必须提供显式矩阵，否则返回 `ChannelMismatch`。不自动复制单声道，也不自动混合多声道；相同声道数也可用显式矩阵选择、交换或混合声道。
 - `pcm_frames()` 和 `pcm_bytes()` 在配置成功后返回一块设备 PCM 的帧数和字节数，未配置时返回零。设备采样率限于 `SampleRate` 列出的值，周期配置必须能得到整数 PCM 帧数。以 48 kHz / 5 ms 的图连接 44.1 kHz / 10 ms 设备为例，一块 441 帧的 PCM 在图内按 221 帧和 220 帧处理。
 - 调用方在各设备周期开始前用 `bind_pcm()` 绑定对应的整块缓冲，并保证它在接下来 `periods` 次引擎推进期间有效。适配器逐周期读写对应片段，设备周期结束后自动解除绑定，驱动可提交输出。上一块仍在使用时重新绑定返回 `BufferFull`。缺少输入时图得到静音，缺少输出缓冲时图继续推进。
-- 两个适配器公开继承 `NodeT`，通过内部 `PCMTransfer` 复用缓冲绑定、周期推进、配置提交和重置，组合持有 `PCMConverter`。输入先解码为设备声道的 float32，重采样后映射到图内声道；输出先映射到设备声道，再重采样和编码。Adapter 与图连接复用同一份矩阵累加实现，尺寸在各自配置入口校验，处理路径不再复查。同采样率、空矩阵的 `F32LE` 保持样本位表示，小端单声道可以整块复制，多声道按布局重排。整数 PCM 在设备边界做归一化或量化。
+- 两个适配器公开继承 `NodeT`，各自保存借用的设备缓冲和一个 `PCMConverter`。适配器共用配置和绑定校验，转换器负责计算 PCM 切片和推进周期。输入先解码为设备声道的 float32，重采样后映射到图内声道。输出先映射到设备声道，再重采样和编码。Adapter 和图连接都用 `ChMatrix::mix_add()` 累加样本，尺寸在各自的配置入口校验。同采样率、空矩阵的 `F32LE` 保持样本位表示，小端单声道可以整块复制，多声道按布局重排。整数 PCM 在设备边界做归一化或量化。
 - **不新增缓冲延迟。** 解码、声道映射和编码在当前 `process()` 内完成，工作缓冲不跨周期排队。即使绑定了多个周期的 PCM，也逐周期直接写入输出，不等待整块计算结束。只有既有 sinc 重采样器带来 48 个源端帧的滤波延迟；本次声道映射和配置切换不叠加额外周期或帧延迟。
 - `reset()` 解除绑定、将周期索引归零并清除相位和滤波历史，保留设备配置。拔出设备时重置对应 Adapter，停止绑定数据；重新接入后配置新格式并绑定新缓冲。不调用全局 `Engine::reset()`，其他节点和引擎时间继续运行。
 - `configure_pcm()` 会分配和释放资源，必须在非音频线程执行，且与 `prepare()/bind_pcm()/reset()/process()` 串行。本阶段不提供并发配置或无停顿的后台状态交接。
@@ -264,7 +263,7 @@ checked(sink.receive({pcm.data(), pcm.size()}));
 例如图内始终为 48 kHz、2ch，采集设备改为 16 kHz、1ch 时，调用方显式决定复制规则：
 
 ```cpp
-const auto capture_matrix = checked(ChMatrix::create(2, 1, {1, 1}));
+const ChMatrix capture_matrix(2, 1, {1, 1});
 checked(input->configure_pcm({SampleRate::Hz16000, PCMFormat::S16LE, 1}, capture_matrix));
 // 下一次绑定使用 input->pcm_bytes() 对应的新规格；现有图连接保持不变。
 ```
@@ -298,18 +297,18 @@ ctest --test-dir build -C Debug --output-on-failure
 
 使用 PCM 适配器或虚拟端点的应用链接 `aereborn::plugins`，自定义节点可以只链接 `aereborn::core`。
 
-测试按职责分组，每个用例独立注册为 CTest 的 `组名.场景名`，并使用组名作为 label。统一入口负责报告场景名和失败原因；失败不会被其他场景的成功掩盖。
+测试源文件按验证对象命名，统一使用小写下划线和 `_tests.cpp` 后缀。共用的断言、PCM 参照和路由夹具放在 `tests/support/`。每个用例独立注册为 CTest 的 `组名.场景名`，并使用组名作为 label。
 
-| 分组 | 验证边界 |
-| --- | --- |
-| `core` | 块视图、矩阵入口、图句柄与端口、反馈拒绝、准备失败重试、异常转换、状态保留与跨翻译单元 ID |
-| `routing` | 使用真实的图外 `VirtualSource/VirtualSink`，经 Adapter 收发；中间用仅供测试的 `VirtualNode` 模拟 Processor 和 Mixer |
-| `adapter` | 独立字节参照验证五种 PCM 格式、饱和量化、缓冲绑定、周期切片、显式声道映射和脉冲无额外帧延迟 |
-| `resampling` | 连续正弦的独立相位参照、分数周期、8–96 kHz 极端比例、滤波历史重置和抗混叠 |
-| `device` | 虚拟设备离线、48K2ch 与 16K1ch 切换、旧缓冲解除绑定和稳定逻辑端口 |
-| `virtual` | 单独验证图外端点的信号格式、独立时间线、数据所有权及配置入口，不重复搭建路由 |
-| `allocation` | 逐次注入配置分配失败，验证部分处理的旧缓冲、周期索引和滤波状态保持有效 |
-| `example` | 构建并运行可独立使用的示例 |
+| 分组 | 源文件 | 验证边界 |
+| --- | --- | --- |
+| `core` | `engine_graph_tests.cpp` | 只链接核心库，覆盖块视图、矩阵构造、运行时图规格、句柄、端口、反馈拒绝、准备重试和异常传播 |
+| `routing` | `graph_routing_tests.cpp` | 经 Adapter 连接图外 `VirtualSource/VirtualSink`，验证路由、拓扑重建和跨设备周期 |
+| `adapter` | `pcm_adapter_tests.cpp` | 独立字节参照、PCM 量化与格式、缓冲绑定、图规格匹配、声道映射和脉冲延迟 |
+| `resampling` | `pcm_resampling_tests.cpp` | 正弦相位参照、分数周期、8–96 kHz 极端比例、滤波历史重置和抗混叠 |
+| `device` | `pcm_reconfiguration_tests.cpp` | 模拟采集和播放切换、旧缓冲解绑、稳定的节点身份和逻辑端口 |
+| `virtual` | `virtual_pcm_tests.cpp` | 发端 PCM 字节和独立时间线、收端报文所有权、端点配置校验 |
+| `allocation` | `allocation_failure_tests.cpp` | 缓冲扩容和 PCM 配置分配失败后的异常传播与状态恢复 |
+| `example` | `examples/virtual_routing.cpp` | 构建并运行可独立使用的示例 |
 
 `routing` 覆盖一对一、一对多、多对一、多对多、处理器串联、Bus 串联、效果前后输出监听、多输入输出端口、声道矩阵、缺失端点和不同设备周期。输出与独立计算的正弦叠加、增益和矩阵结果比较，并检查共享节点每周期只执行一次。虚拟处理节点只放在测试目录，不作为正式 DSP 插件；系统回环、真实异步 Observer、设备线程和热插拔服务仍属于后续运行内核。
 
@@ -319,11 +318,11 @@ MSVC Debug 的标准容器会在 `noexcept` 构造内分配迭代器代理，因
 
 ```powershell
 ctest --test-dir build -C Debug -L routing --output-on-failure
-ctest --test-dir build -C Debug -R '^core.cycles$' --output-on-failure
+ctest --test-dir build -C Debug -R '^core.feedback_rejection$' --output-on-failure
 ctest --test-dir build -C Release -L allocation --output-on-failure
 ```
 
-示例由 `BUILD_EXAMPLES` 控制，默认开启，也会作为 `virtual_routing_example` 加入 CTest。关闭测试后仍可独立构建和运行示例：
+示例由 `BUILD_EXAMPLES` 控制，默认开启，也会作为 `example.virtual_routing` 加入 CTest。关闭测试后仍可独立构建和运行示例：
 
 ```powershell
 cmake -S . -B build/examples-only -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=ON
@@ -340,3 +339,5 @@ cmake --build build/examples-only --config Debug --parallel
 5. **网络**：先 PCM，再 Opus、乱序/抖动缓冲与丢包恢复；验证本地与远程源进入同一 Bus，断网后有界退化并恢复。
 
 第一步先写少量核心类型和离线执行，不接系统设备，不启动 Asio 线程。每一步复用同一张图与同一套节点执行机制。
+
+第一步的验收用例包括 `core.audio_block_layout`、`core.prepare_retry`、`routing.many_to_many`、`routing.processor_chain`、`routing.bus_chain_and_taps`、`routing.one_to_many` 和 `core.feedback_rejection`。路由走实际的 PCM Adapter，处理器和总线由测试节点提供。

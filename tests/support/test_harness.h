@@ -1,5 +1,5 @@
-#ifndef AEREBORN_TESTS_CHECKED_H
-#define AEREBORN_TESTS_CHECKED_H
+#ifndef AEREBORN_TESTS_TEST_HARNESS_H
+#define AEREBORN_TESTS_TEST_HARNESS_H
 
 #include "core/retcode.h"
 #include <cstring>
@@ -74,4 +74,4 @@ inline int run_tests(int argc, char **argv, std::initializer_list<TestCase> case
 } // namespace test
 } // namespace aereborn
 
-#endif // AEREBORN_TESTS_CHECKED_H
+#endif // AEREBORN_TESTS_TEST_HARNESS_H

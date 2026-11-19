@@ -11,8 +11,8 @@ namespace aereborn
 class VirtualSource
 {
   public:
-    VirtualSource(PCMSpec spec, BlockPeriod period, double frequency_hz = 440.0, float amplitude = 0.25f) noexcept;
-    RetCode prepare() noexcept;
+    VirtualSource(PCMSpec spec, BlockPeriod period, double frequency_hz = 440.0, float amplitude = 0.25f);
+    RetCode prepare();
     RetCode generate() noexcept;
     void reset() noexcept;
     std::size_t pcm_frames() const noexcept;
@@ -33,8 +33,8 @@ class VirtualSource
 class VirtualSink
 {
   public:
-    VirtualSink(PCMSpec spec, BlockPeriod period) noexcept;
-    RetCode prepare() noexcept;
+    VirtualSink(PCMSpec spec, BlockPeriod period);
+    RetCode prepare();
     RetCode receive(View<const std::uint8_t> pcm) noexcept;
     void reset() noexcept;
     View<const std::uint8_t> pcm() const noexcept;

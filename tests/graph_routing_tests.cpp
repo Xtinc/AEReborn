@@ -1,4 +1,4 @@
-#include "virtual_nodes.h"
+#include "support/routing_fixture.h"
 
 namespace
 {
@@ -7,17 +7,14 @@ using namespace aereborn::test;
 
 void one_to_one()
 {
-    RoutingEngine engine;
+    Engine engine(render_rate, render_period);
     Playback output(engine, 2);
     Capture input(engine, 2, 997, 0.25f);
     checked(engine.connect({input.id}, {output.id}));
     checked(engine.prepare());
     for (std::size_t tick = 0; tick < 4; ++tick)
     {
-        input.generate();
-        output.bind();
-        checked(engine.process());
-        output.receive();
+        render_route(engine, {&input}, {&output});
         check(output.device.matches(input.device.pcm()), "Direct virtual-device route preserves F32 PCM");
         output.expect([&](std::size_t frame, std::size_t) { return tone(997, 0.25, tick * render_frames + frame); });
     }
@@ -25,7 +22,7 @@ void one_to_one()
 
 void processor_chain()
 {
-    RoutingEngine engine;
+    Engine engine(render_rate, render_period);
     Playback output(engine, 1);
     // Reverse creation order must not determine the execution order.
     const auto second = checked(engine.emplace_node<VirtualNode<>>(1, -2.0f));
@@ -35,10 +32,7 @@ void processor_chain()
     checked(engine.connect({first}, {second}));
     checked(engine.connect({input.id}, {first}));
     checked(engine.prepare());
-    input.generate();
-    output.bind();
-    checked(engine.process());
-    output.receive();
+    render_route(engine, {&input}, {&output});
     output.expect([](std::size_t frame, std::size_t) { return -tone(733, 0.25, frame); });
     check(checked(engine.node<VirtualNode<>>(first))->calls == 1 &&
               checked(engine.node<VirtualNode<>>(second))->calls == 1, "Each processor executes once");
@@ -46,7 +40,7 @@ void processor_chain()
 
 void one_to_many()
 {
-    RoutingEngine engine;
+    Engine engine(render_rate, render_period);
     Playback main(engine, 1);
     Playback monitor(engine, 1);
     Capture input(engine, 1, 997, 0.25f);
@@ -57,12 +51,7 @@ void one_to_many()
     checked(engine.prepare());
     for (std::size_t tick = 0; tick < 4; ++tick)
     {
-        input.generate();
-        main.bind();
-        monitor.bind();
-        checked(engine.process());
-        main.receive();
-        monitor.receive();
+        render_route(engine, {&input}, {&main, &monitor});
         main.expect([&](std::size_t frame, std::size_t) { return tone(997, 0.125, tick * render_frames + frame); });
         monitor.expect([&](std::size_t frame, std::size_t) { return -tone(997, 0.0625, tick * render_frames + frame); });
         check(checked(engine.node<VirtualNode<>>(bus))->calls == tick + 1,
@@ -72,7 +61,7 @@ void one_to_many()
 
 void many_to_one()
 {
-    RoutingEngine engine;
+    Engine engine(render_rate, render_period);
     Playback output(engine, 1);
     Capture voice(engine, 1, 997, 0.25f);
     Capture music(engine, 1, 431, 0.125f);
@@ -82,11 +71,7 @@ void many_to_one()
     checked(engine.connect({music.id}, {bus}, {0.5f, false, {}}));
     checked(engine.connect({bus}, {output.id}));
     checked(engine.prepare());
-    voice.generate();
-    music.generate();
-    output.bind();
-    checked(engine.process());
-    output.receive();
+    render_route(engine, {&voice, &music}, {&output});
     output.expect([](std::size_t frame, std::size_t) { return tone(997, 0.25, frame) + tone(431, 0.0625, frame); });
     check(checked(engine.node<VirtualNode<>>(idle))->calls == 0 &&
               checked(engine.node<VirtualNode<>>(idle))->prepares == 0,
@@ -95,7 +80,7 @@ void many_to_one()
 
 void many_to_many()
 {
-    RoutingEngine engine;
+    Engine engine(render_rate, render_period);
     Playback main(engine, 1);
     Playback monitor(engine, 1);
     Capture a(engine, 1, 997, 0.25f);
@@ -116,13 +101,7 @@ void many_to_many()
             checked(engine.set_muted(a_main, false));
             checked(engine.set_gain(a_main, -1));
         }
-        a.generate();
-        b.generate();
-        main.bind();
-        monitor.bind();
-        checked(engine.process());
-        main.receive();
-        monitor.receive();
+        render_route(engine, {&a, &b}, {&main, &monitor});
         main.expect([&](std::size_t frame, std::size_t) {
             const auto index = tick * render_frames + frame;
             const auto gain = tick == 0 ? 1 : tick == 1 ? 0 : -1;
@@ -138,7 +117,7 @@ void many_to_many()
 
 void bus_chain_and_taps()
 {
-    RoutingEngine engine;
+    Engine engine(render_rate, render_period);
     Playback pre_effects(engine, 1);
     Playback post_effects(engine, 1);
     Capture a(engine, 1, 997, 0.25f);
@@ -154,13 +133,7 @@ void bus_chain_and_taps()
     checked(engine.connect({b.id}, {master}, {0.5f, false, {}}));
     checked(engine.connect({master}, {post_effects.id}));
     checked(engine.prepare());
-    a.generate();
-    b.generate();
-    pre_effects.bind();
-    post_effects.bind();
-    checked(engine.process());
-    pre_effects.receive();
-    post_effects.receive();
+    render_route(engine, {&a, &b}, {&pre_effects, &post_effects});
     pre_effects.expect([](std::size_t frame, std::size_t) { return tone(997, 0.25, frame) + tone(431, 0.03125, frame); });
     post_effects.expect([](std::size_t frame, std::size_t) { return tone(997, 0.125, frame) + tone(431, 0.078125, frame); });
     check(checked(engine.node<VirtualNode<>>(bus))->calls == 1 &&
@@ -171,24 +144,18 @@ void bus_chain_and_taps()
 
 void ports_and_matrices()
 {
-    RoutingEngine engine;
+    Engine engine(render_rate, render_period);
     Playback stereo(engine, 2);
     Playback mono(engine, 1);
     Capture a(engine, 1, 997, 0.25f);
     Capture b(engine, 1, 431, 0.125f);
     const auto router = checked(engine.emplace_node<VirtualNode<2, 2>>(2));
-    checked(engine.connect({b.id}, {router, 1}, {1, false, checked(ChMatrix::create(2, 1, {0.5f, 2}))}));
-    checked(engine.connect({a.id}, {router, 0}, {1, false, checked(ChMatrix::create(2, 1, {1, -1}))}));
-    checked(engine.connect({router, 1}, {mono.id}, {1, false, checked(ChMatrix::create(1, 2, {0.25f, 0.75f}))}));
+    checked(engine.connect({b.id}, {router, 1}, {1, false, {2, 1, {0.5f, 2}}}));
+    checked(engine.connect({a.id}, {router, 0}, {1, false, {2, 1, {1, -1}}}));
+    checked(engine.connect({router, 1}, {mono.id}, {1, false, {1, 2, {0.25f, 0.75f}}}));
     checked(engine.connect({router, 0}, {stereo.id}));
     checked(engine.prepare());
-    a.generate();
-    b.generate();
-    stereo.bind();
-    mono.bind();
-    checked(engine.process());
-    stereo.receive();
-    mono.receive();
+    render_route(engine, {&a, &b}, {&stereo, &mono});
     stereo.expect([](std::size_t frame, std::size_t ch) {
         return (ch == 0 ? 1 : -1) * tone(997, 0.25, frame) + (ch == 0 ? 0.5 : 2) * tone(431, 0.125, frame);
     });
@@ -198,7 +165,7 @@ void ports_and_matrices()
 
 void missing_endpoints()
 {
-    RoutingEngine engine;
+    Engine engine(render_rate, render_period);
     Capture a(engine, 1, 997, 0.25f);
     Capture b(engine, 1, 431, 0.125f);
     Playback main(engine, 1);
@@ -209,42 +176,32 @@ void missing_endpoints()
     checked(engine.connect({bus}, {main.id}));
     checked(engine.connect({bus}, {monitor.id}));
     checked(engine.prepare());
-    a.generate();
-    main.bind();
-    checked(engine.process()); // Missing b and monitor must not block the live path.
-    main.receive();
+    render_route(engine, {&a}, {&main});
     main.expect([](std::size_t frame, std::size_t) { return tone(997, 0.25, frame); });
-    a.adapter->reset();
     for (std::size_t tick = 0; tick < 2; ++tick)
     {
-        b.generate();
-        monitor.bind();
-        checked(engine.process());
-        monitor.receive();
+        render_route(engine, {&b}, {&monitor});
         monitor.expect([&](std::size_t frame, std::size_t) { return tone(431, 0.125, tick * render_frames + frame); });
     }
-    main.bind();
-    monitor.bind();
-    checked(engine.process()); // Both sources absent: overwrite with silence, never reuse an old block.
-    main.receive();
-    monitor.receive();
+    // Both sources are absent, so this period overwrites both outputs with silence.
+    render_route(engine, {}, {&main, &monitor});
     main.expect([](std::size_t, std::size_t) { return 0; });
     monitor.expect([](std::size_t, std::size_t) { return 0; });
 }
 
 void mixed_device_cadence()
 {
-    RoutingEngine engine;
+    Engine engine(render_rate, render_period);
     const PCMSpec capture_spec{SampleRate::Hz44100, PCMFormat::F32LE, 1, 2};
     const PCMSpec playback_spec{render_rate, PCMFormat::F32LE, 1, 3};
     VirtualSource capture(capture_spec, render_period, 997, 0.25f);
     VirtualSink playback(playback_spec, render_period);
     checked(capture.prepare());
     checked(playback.prepare());
-    const auto input_id = checked(engine.emplace_node<CaptureAdapter>(1));
-    const auto output_id = checked(engine.emplace_node<PlaybackAdapter>(1));
-    auto *input = checked(engine.node<CaptureAdapter>(input_id));
-    auto *output = checked(engine.node<PlaybackAdapter>(output_id));
+    const auto input_id = checked(engine.emplace_node<IAdapter>(1, engine.spec()));
+    const auto output_id = checked(engine.emplace_node<OAdapter>(1, engine.spec()));
+    auto *input = checked(engine.node<IAdapter>(input_id));
+    auto *output = checked(engine.node<OAdapter>(output_id));
     checked(input->configure_pcm(capture_spec));
     checked(output->configure_pcm(playback_spec));
     Capture native(engine, 1, 431, 0.125f);
@@ -255,6 +212,8 @@ void mixed_device_cadence()
     checked(engine.connect({bus}, {output_id}));
     checked(engine.connect({bus}, {monitor.id}));
     checked(engine.prepare());
+    check(input->pcm_frames() == 441 && output->pcm_frames() == 720,
+          "Device packet sizes follow two capture periods and three playback periods");
     std::vector<std::uint8_t> packet(output->pcm_bytes());
     std::vector<std::uint8_t> observed(packet.size());
     for (std::size_t tick = 0; tick < 6; ++tick)
@@ -268,10 +227,7 @@ void mixed_device_cadence()
         {
             checked(output->bind_pcm({packet.data(), packet.size()}));
         }
-        native.generate();
-        monitor.bind();
-        checked(engine.process());
-        monitor.receive();
+        render_route(engine, {&native}, {&monitor});
         const auto pcm = monitor.device.pcm();
         std::copy(pcm.begin(), pcm.end(), observed.begin() + (tick % 3) * render_frames * 4);
         for (std::size_t frame = 0; frame < render_frames; ++frame)
@@ -296,6 +252,44 @@ void mixed_device_cadence()
     check(checked(engine.node<VirtualNode<>>(bus))->calls == 6 && engine.frame_position() == 6 * render_frames,
           "Multiple device cadences share one graph driver");
 }
+
+void topology_rebuild()
+{
+    Engine engine(render_rate, render_period);
+    Capture input(engine, 1, 997, 0.25f);
+    Playback main(engine, 1);
+    const auto processor = checked(engine.emplace_node<VirtualNode<>>());
+    checked(engine.connect({input.id}, {processor}));
+    checked(engine.connect({processor}, {main.id}));
+    input.generate();
+    main.bind();
+    checked(engine.prepare());
+    checked(engine.process());
+    main.receive();
+    main.expect([](std::size_t frame, std::size_t) { return tone(997, 0.25, frame); });
+    input.generate();
+    main.bind();
+    const auto previous = main.bytes;
+    Playback monitor(engine, 1);
+    checked(engine.connect({processor}, {monitor.id}));
+    expect_error(ErrorCode::NotPrepared, engine.process());
+    check(main.bytes == previous && engine.frame_position() == render_frames, "Graph edits do not consume pending PCM");
+    expect_error(ErrorCode::BufferFull, input.adapter->bind_pcm(input.device.pcm()));
+    checked(engine.prepare());
+    monitor.bind();
+    checked(engine.process());
+    main.receive();
+    monitor.receive();
+    main.expect([](std::size_t frame, std::size_t) { return tone(997, 0.25, render_frames + frame); });
+    check(monitor.device.matches(main.device.pcm()), "A newly attached monitor receives the same existing output");
+    auto *node = checked(engine.node<VirtualNode<>>(processor));
+    check(node->calls == 2 && node->prepares == 1 && node->resets == 0, "Rebuilding keeps existing node state");
+    checked(engine.remove_node(processor));
+    checked(engine.prepare());
+    render_route(engine, {}, {&main, &monitor});
+    main.expect([](std::size_t, std::size_t) { return 0; });
+    monitor.expect([](std::size_t, std::size_t) { return 0; });
+}
 } // namespace
 
 int main(int argc, char **argv)
@@ -305,6 +299,6 @@ int main(int argc, char **argv)
         {"one_to_many", one_to_many}, {"many_to_one", many_to_one},
         {"many_to_many", many_to_many}, {"bus_chain_and_taps", bus_chain_and_taps},
         {"ports_and_matrices", ports_and_matrices}, {"missing_endpoints", missing_endpoints},
-        {"mixed_device_cadence", mixed_device_cadence}
+        {"mixed_device_cadence", mixed_device_cadence}, {"topology_rebuild", topology_rebuild}
     });
 }

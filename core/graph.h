@@ -3,23 +3,13 @@
 
 #include "types.h"
 #include <array>
-#include <atomic>
 
 namespace aereborn
 {
 
-// Shared by all engine specializations and translation units.
-inline std::uint64_t get_next_identifier()
-{
-    static std::atomic<std::uint64_t> next{1};
-    return next.fetch_add(1, std::memory_order_relaxed);
-}
-
 // Execution unit with immutable input and output layouts.
-template <SampleRate Rate, BlockPeriod Period> class Node
+class Node
 {
-    static_assert(calc_block_frames<Rate, Period>() > 0, "Node needs a nonzero block size");
-
   public:
     virtual ~Node() = default;
     Node(const Node &) = delete;
@@ -31,7 +21,7 @@ template <SampleRate Rate, BlockPeriod Period> class Node
     virtual View<IBlock> iblocks() noexcept = 0;
     virtual View<OBlock> oblocks() noexcept = 0;
     // Validate configuration and prepare resources. The engine may retry a failed preparation.
-    virtual RetCode prepare()
+    virtual RetCode prepare(const EngineSpec &)
     {
         return {};
     }
@@ -46,7 +36,7 @@ template <SampleRate Rate, BlockPeriod Period> class Node
 };
 
 // Port counts are compile-time constants; channel counts and block views are stored inline.
-template <std::size_t I, std::size_t O, SampleRate Rate, BlockPeriod Period> class NodeT : public Node<Rate, Period>
+template <std::size_t I, std::size_t O> class NodeT : public Node
 {
     static_assert(I + O > 0, "Node needs at least one port");
 

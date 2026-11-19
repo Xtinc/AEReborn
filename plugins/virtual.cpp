@@ -4,14 +4,12 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <new>
 
 namespace aereborn
 {
 namespace
 {
-RetCode resize_pcm(PCMSpec spec, BlockPeriod period, std::vector<std::uint8_t> &pcm) noexcept
-try
+RetCode resize_pcm(PCMSpec spec, BlockPeriod period, std::vector<std::uint8_t> &pcm)
 {
     if (!pcm.empty())
     {
@@ -20,7 +18,7 @@ try
     const auto period_ms = static_cast<std::uint32_t>(period);
     const auto sample_bytes = pcm_sample_bytes(spec.format);
     if (!is_pcm_sample_rate(spec.sample_rate) || sample_bytes == 0 || spec.channels == 0 || spec.periods == 0 ||
-        !(period_ms == 5 || period_ms == 10 || period_ms == 20 || period_ms == 40))
+        !is_block_period(period))
     {
         return ErrorCode::InvalidArg;
     }
@@ -41,10 +39,6 @@ try
     }
     pcm.resize(static_cast<std::size_t>(frames) * spec.channels * sample_bytes);
     return {};
-}
-catch (const std::bad_alloc &)
-{
-    return ErrorCode::NoMemory;
 }
 
 // Generate the requested wire representation directly, independently of Adapter's conversion code.
@@ -74,12 +68,12 @@ void write_sample(float sample, PCMFormat format, std::uint8_t *output) noexcept
 }
 } // namespace
 
-VirtualSource::VirtualSource(PCMSpec spec, BlockPeriod period, double frequency_hz, float amplitude) noexcept
+VirtualSource::VirtualSource(PCMSpec spec, BlockPeriod period, double frequency_hz, float amplitude)
     : spec_(spec), period_(period), frequency_hz_(frequency_hz), amplitude_(amplitude)
 {
 }
 
-RetCode VirtualSource::prepare() noexcept
+RetCode VirtualSource::prepare()
 {
     const auto sample_rate = static_cast<std::uint32_t>(spec_.sample_rate);
     if (!(frequency_hz_ >= 0 && frequency_hz_ < sample_rate / 2.0) || !std::isfinite(amplitude_))
@@ -131,11 +125,11 @@ View<const std::uint8_t> VirtualSource::pcm() const noexcept
     return {pcm_.data(), generated_ ? pcm_.size() : 0};
 }
 
-VirtualSink::VirtualSink(PCMSpec spec, BlockPeriod period) noexcept : spec_(spec), period_(period)
+VirtualSink::VirtualSink(PCMSpec spec, BlockPeriod period) : spec_(spec), period_(period)
 {
 }
 
-RetCode VirtualSink::prepare() noexcept
+RetCode VirtualSink::prepare()
 {
     return resize_pcm(spec_, period_, pcm_);
 }

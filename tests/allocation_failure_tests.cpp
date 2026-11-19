@@ -1,5 +1,5 @@
-#include "checked.h"
-#include "pcm.h"
+#include "support/test_harness.h"
+#include "support/pcm_reference.h"
 #include "core/engine.h"
 #include "plugins/adapter.h"
 #include <cmath>
@@ -53,27 +53,55 @@ using namespace aereborn;
 using namespace aereborn::test;
 constexpr auto rate = SampleRate::Hz48000;
 constexpr auto period = BlockPeriod::Ms05;
-using TestEngine = Engine<rate, period>;
-using Input = IAdapter<rate, period>;
-using Output = OAdapter<rate, period>;
-constexpr auto block_frames = TestEngine::block_frames();
+constexpr std::size_t block_frames = 240;
 constexpr double two_pi = 6.283185307179586;
 
-void configuration_rollback()
+template <class Operation> bool allocation_fails_after(long allocations, Operation operation)
 {
-    // MSVC debug vectors allocate iterator proxies inside noexcept constructors.
-    // Inject allocation failures in Release; Debug still covers invalid/capacity rollback.
-    const auto mono_to_stereo = checked(ChMatrix::create(2, 1, {1, -0.5f}));
-    const auto stereo_to_mono = checked(ChMatrix::create(1, 2, {0.25f, 0.75f}));
+    allocation_test::fail_after = allocations;
+    try
+    {
+        operation();
+    }
+    catch (const std::bad_alloc &)
+    {
+        allocation_test::fail_after = -1;
+        return true;
+    }
+    catch (...)
+    {
+        allocation_test::fail_after = -1;
+        throw;
+    }
+    allocation_test::fail_after = -1;
+    return false;
+}
+
+void buffer_resize_rollback()
+{
+    Buffer buffer;
+    checked(buffer.resize(1, 8));
+    buffer.block(8).channel(0)[7] = 1.0f;
+    const bool failed = allocation_fails_after(0, [&] { buffer.resize(2, 32); });
+    check(failed && buffer.capacity_frames() == 8 && buffer.block(8).channel(0)[7] == 1.0f,
+          "A failed growth preserves the buffer's layout and contents");
+    checked(buffer.resize(2, 32));
+    check(buffer.block(32).channel(0)[7] == 0.0f, "A successful resize clears existing samples");
+}
+
+void pcm_configuration_rollback()
+{
+    const ChMatrix mono_to_stereo(2, 1, {1, -0.5f});
+    const ChMatrix stereo_to_mono(1, 2, {0.25f, 0.75f});
     for (const bool replace_input : {true, false})
     {
         for (long failure = 0;; ++failure)
         {
-            TestEngine engine;
-            const auto input_id = checked(engine.emplace_node<Input>(2));
-            const auto output_id = checked(engine.emplace_node<Output>(2));
-            auto *input = checked(engine.node<Input>(input_id));
-            auto *output = checked(engine.node<Output>(output_id));
+            Engine engine(rate, period);
+            const auto input_id = checked(engine.emplace_node<IAdapter>(2, engine.spec()));
+            const auto output_id = checked(engine.emplace_node<OAdapter>(2, engine.spec()));
+            auto *input = checked(engine.node<IAdapter>(input_id));
+            auto *output = checked(engine.node<OAdapter>(output_id));
             checked(input->configure_pcm({SampleRate::Hz44100, PCMFormat::F32LE, 2, 2}));
             checked(output->configure_pcm({rate, PCMFormat::F32LE, 2, 2}));
             checked(engine.connect({input_id}, {output_id}));
@@ -91,18 +119,19 @@ void configuration_rollback()
             checked(engine.process());
             const auto previous = packet;
 
-            allocation_test::fail_after = failure;
             const PCMSpec replacement{SampleRate::Hz16000, PCMFormat::S16LE, 1};
-            const auto code = replace_input ? input->configure_pcm(replacement, mono_to_stereo)
-                                            : output->configure_pcm(replacement, stereo_to_mono);
-            allocation_test::fail_after = -1;
-            if (code)
+            RetCode code;
+            const bool failed = allocation_fails_after(failure, [&] {
+                code = replace_input ? input->configure_pcm(replacement, mono_to_stereo)
+                                     : output->configure_pcm(replacement, stereo_to_mono);
+            });
+            if (!failed)
             {
+                checked(code);
                 check(failure > 0, "Fault injection must exercise the configuration allocation path");
                 break;
             }
-            check(code.code() == ErrorCode::NoMemory && packet == previous &&
-                      input->pcm_frames() == 441 && output->pcm_frames() == 480 &&
+            check(packet == previous && input->pcm_frames() == 441 && output->pcm_frames() == 480 &&
                       input->bind_pcm({pcm.data(), pcm.size()}).code() == ErrorCode::BufferFull &&
                       output->bind_pcm({packet.data(), packet.size()}).code() == ErrorCode::BufferFull,
                   "Every allocation failure preserves the partially consumed device buffers");
@@ -122,7 +151,8 @@ void configuration_rollback()
 int main(int argc, char **argv)
 {
     return aereborn::test::run_tests(argc, argv, {
-        {"configuration_rollback", configuration_rollback}
+        {"buffer_resize_rollback", buffer_resize_rollback},
+        {"pcm_configuration_rollback", pcm_configuration_rollback}
     });
 }
 #endif

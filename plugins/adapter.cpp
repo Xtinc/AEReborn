@@ -4,7 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <new>
+#include <utility>
 
 namespace aereborn
 {
@@ -139,42 +139,50 @@ float interpolate(const float *history, const float *input, std::size_t history_
 
 } // namespace
 
-namespace detail
+// Conversion state prepared from the device PCM and graph timing specifications.
+class PCMConverter
 {
+  public:
+    PCMConverter(PCMSpec spec, SampleRate src_fs, SampleRate dst_fs, BlockPeriod period, const ChMatrix &matrix);
+    RetCode prepare_pcm(std::size_t graph_frames);
+    void reset() noexcept;
+    std::size_t pcm_frames() const noexcept
+    {
+        return pcm_frames_;
+    }
+    std::size_t pcm_bytes() const noexcept
+    {
+        return pcm_frames_ * spec_.channels * sample_bytes_;
+    }
+    void decode(const std::uint8_t *pcm, OBlock output) noexcept;
+    void encode(IBlock input, std::uint8_t *pcm) noexcept;
+    // Return true when the current device buffer is complete.
+    bool advance_period() noexcept;
 
-Result<std::unique_ptr<PCMConverter>> PCMConverter::create(PCMSpec spec, SampleRate rate, BlockPeriod period,
-                                                         std::size_t frames, std::size_t channels, bool input,
-                                                         const ChMatrix &matrix) noexcept
-try
-{
-    if (channels == 0 || spec.channels == 0)
-    {
-        return ErrorCode::InvalidArg;
-    }
-    const auto src_channels = input ? spec.channels : channels;
-    const auto dst_channels = input ? channels : spec.channels;
-    if (matrix.empty() ? src_channels != dst_channels
-                       : matrix.input_channels() != src_channels || matrix.output_channels() != dst_channels)
-    {
-        return ErrorCode::ChannelMismatch;
-    }
-    auto converter = std::unique_ptr<PCMConverter>(
-        new PCMConverter(spec, input ? spec.sample_rate : rate, input ? rate : spec.sample_rate, period, matrix));
-    const auto code = converter->prepare_pcm(frames);
-    if (!code)
-    {
-        return code;
-    }
-    return converter;
-}
-catch (const std::bad_alloc &)
-{
-    return ErrorCode::NoMemory;
-}
+  private:
+    std::size_t frame_offset(std::size_t period_index) const noexcept;
+    void resample(IBlock input, OBlock output) noexcept;
 
-PCMConverter::PCMConverter(PCMSpec spec, SampleRate src_fs, SampleRate dst_fs, BlockPeriod period, const ChMatrix &matrix)
+    const PCMSpec spec_;
+    const ChMatrix matrix_;
+    const std::uint64_t period_frames_x1000_; // PCM frames per engine period in units of 1/1000 frame.
+    const std::size_t sample_bytes_;
+    const unsigned int sample_bits_;
+    const std::uint32_t src_fs_;
+    const std::uint32_t dst_fs_;
+    std::size_t pcm_frames_ = 0;
+    std::size_t period_index_ = 0;
+    Buffer pcm_samples_;
+    Buffer mapped_samples_; // Current-period workspace in device channels; never queues audio.
+    Buffer history_;
+    std::vector<float> kernel_;
+    std::int64_t phase_ = 0; // Next output sample's source position, in units of 1 / dst_fs_.
+};
+
+PCMConverter::PCMConverter(PCMSpec spec, SampleRate src_fs, SampleRate dst_fs, BlockPeriod period,
+                           const ChMatrix &matrix)
     : spec_(spec), matrix_(matrix), period_frames_x1000_(std::uint64_t{static_cast<std::uint32_t>(period)} *
-                                        static_cast<std::uint32_t>(spec.sample_rate)),
+                                                         static_cast<std::uint32_t>(spec.sample_rate)),
       sample_bytes_(pcm_sample_bytes(spec.format)), sample_bits_(pcm_sample_bits(spec.format)),
       src_fs_(static_cast<std::uint32_t>(src_fs)), dst_fs_(static_cast<std::uint32_t>(dst_fs))
 {
@@ -249,13 +257,13 @@ std::size_t PCMConverter::frame_offset(std::size_t period_index) const noexcept
     return static_cast<std::size_t>(frames_x1000 / 1000 + (frames_x1000 % 1000 != 0));
 }
 
-void PCMConverter::decode(const std::uint8_t *pcm, std::size_t period_index, OBlock output) noexcept
+void PCMConverter::decode(const std::uint8_t *pcm, OBlock output) noexcept
 {
-    const auto first_frame = frame_offset(period_index);
+    const auto first_frame = frame_offset(period_index_);
     pcm += first_frame * spec_.channels * sample_bytes_;
     const bool resampling = src_fs_ != dst_fs_;
     const auto mapped = matrix_.empty() ? output : mapped_samples_.block(output.frames());
-    const auto samples = resampling ? pcm_samples_.block(frame_offset(period_index + 1) - first_frame) : mapped;
+    const auto samples = resampling ? pcm_samples_.block(frame_offset(period_index_ + 1) - first_frame) : mapped;
     if (spec_.format == PCMFormat::F32LE)
     {
         copy_f32le(pcm, samples);
@@ -277,24 +285,24 @@ void PCMConverter::decode(const std::uint8_t *pcm, std::size_t period_index, OBl
     if (!matrix_.empty())
     {
         output.clear();
-        mix(mapped, output, matrix_);
+        matrix_.mix_add(mapped, output);
     }
 }
 
-void PCMConverter::encode(IBlock input, std::size_t period_index, std::uint8_t *pcm) noexcept
+void PCMConverter::encode(IBlock input, std::uint8_t *pcm) noexcept
 {
-    const auto first_frame = frame_offset(period_index);
+    const auto first_frame = frame_offset(period_index_);
     pcm += first_frame * spec_.channels * sample_bytes_;
     if (!matrix_.empty())
     {
         const auto mapped = mapped_samples_.block(input.frames());
         mapped.clear();
-        mix(input, mapped, matrix_);
+        matrix_.mix_add(input, mapped);
         input = mapped;
     }
     if (src_fs_ != dst_fs_)
     {
-        const auto samples = pcm_samples_.block(frame_offset(period_index + 1) - first_frame);
+        const auto samples = pcm_samples_.block(frame_offset(period_index_ + 1) - first_frame);
         resample(input, samples);
         input = samples;
     }
@@ -343,11 +351,203 @@ void PCMConverter::resample(IBlock input, OBlock output) noexcept
     }
 }
 
-void PCMConverter::reset_pcm() noexcept
+void PCMConverter::reset() noexcept
 {
+    period_index_ = 0;
     phase_ = 0;
     history_.block(history_.capacity_frames()).clear();
 }
 
-} // namespace detail
+bool PCMConverter::advance_period() noexcept
+{
+    if (++period_index_ == spec_.periods)
+    {
+        period_index_ = 0;
+        return true;
+    }
+    return false;
+}
+
+namespace
+{
+
+enum class Direction
+{
+    Capture,
+    Playback
+};
+
+RetCode configure_converter(std::unique_ptr<PCMConverter> &active, const EngineSpec &graph_spec, std::size_t channels,
+                            PCMSpec spec, const ChMatrix &matrix, Direction direction)
+{
+    const auto frames = graph_spec.block_frames();
+    if (frames == 0 || channels == 0 || spec.channels == 0)
+    {
+        return ErrorCode::InvalidArg;
+    }
+
+    const bool capture = direction == Direction::Capture;
+    const auto src_channels = capture ? spec.channels : channels;
+    const auto dst_channels = capture ? channels : spec.channels;
+    if (matrix.empty() ? src_channels != dst_channels
+                       : matrix.input_channels() != src_channels || matrix.output_channels() != dst_channels)
+    {
+        return ErrorCode::ChannelMismatch;
+    }
+
+    const auto src_fs = capture ? spec.sample_rate : graph_spec.sample_rate();
+    const auto dst_fs = capture ? graph_spec.sample_rate() : spec.sample_rate;
+    auto converter = std::make_unique<PCMConverter>(spec, src_fs, dst_fs, graph_spec.block_period(), matrix);
+    const auto code = converter->prepare_pcm(frames);
+    if (!code)
+    {
+        return code;
+    }
+    active = std::move(converter);
+    return {};
+}
+
+RetCode check_pcm_binding(const PCMConverter *converter, std::size_t bytes, bool bound) noexcept
+{
+    if (!converter)
+    {
+        return ErrorCode::NotPrepared;
+    }
+    if (bytes != converter->pcm_bytes())
+    {
+        return ErrorCode::InvalidArg;
+    }
+    return bound ? ErrorCode::BufferFull : ErrorCode::Ok;
+}
+
+} // namespace
+
+IAdapter::IAdapter(std::size_t channels, EngineSpec graph_spec) : NodeT<0, 1>({}, {{channels}}), graph_spec_(graph_spec)
+{
+}
+
+IAdapter::~IAdapter() = default;
+
+std::size_t IAdapter::pcm_frames() const noexcept
+{
+    return converter_ ? converter_->pcm_frames() : 0;
+}
+
+std::size_t IAdapter::pcm_bytes() const noexcept
+{
+    return converter_ ? converter_->pcm_bytes() : 0;
+}
+
+RetCode IAdapter::bind_pcm(View<const std::uint8_t> bytes) noexcept
+{
+    const auto code = check_pcm_binding(converter_.get(), bytes.size(), pcm_ != nullptr);
+    if (code)
+    {
+        pcm_ = bytes.data();
+    }
+    return code;
+}
+
+RetCode IAdapter::configure_pcm(PCMSpec spec, const ChMatrix &matrix)
+{
+    const auto code = configure_converter(converter_, graph_spec_, outputs()[0], spec, matrix, Direction::Capture);
+    if (code)
+    {
+        pcm_ = nullptr;
+    }
+    return code;
+}
+
+void IAdapter::process(const ProcContext &context) noexcept
+{
+    const auto output = context.outputs[0];
+    if (!pcm_)
+    {
+        output.clear();
+        return;
+    }
+    converter_->decode(pcm_, output);
+    if (converter_->advance_period())
+    {
+        pcm_ = nullptr;
+    }
+}
+
+void IAdapter::reset() noexcept
+{
+    pcm_ = nullptr;
+    if (converter_)
+    {
+        converter_->reset();
+    }
+}
+
+RetCode IAdapter::prepare(const EngineSpec &graph_spec) noexcept
+{
+    return graph_spec_ == graph_spec ? ErrorCode::Ok : ErrorCode::InvalidArg;
+}
+
+OAdapter::OAdapter(std::size_t channels, EngineSpec graph_spec) : NodeT<1, 0>({{channels}}, {}), graph_spec_(graph_spec)
+{
+}
+
+OAdapter::~OAdapter() = default;
+
+std::size_t OAdapter::pcm_frames() const noexcept
+{
+    return converter_ ? converter_->pcm_frames() : 0;
+}
+
+std::size_t OAdapter::pcm_bytes() const noexcept
+{
+    return converter_ ? converter_->pcm_bytes() : 0;
+}
+
+RetCode OAdapter::bind_pcm(View<std::uint8_t> bytes) noexcept
+{
+    const auto code = check_pcm_binding(converter_.get(), bytes.size(), pcm_ != nullptr);
+    if (code)
+    {
+        pcm_ = bytes.data();
+    }
+    return code;
+}
+
+RetCode OAdapter::configure_pcm(PCMSpec spec, const ChMatrix &matrix)
+{
+    const auto code = configure_converter(converter_, graph_spec_, inputs()[0], spec, matrix, Direction::Playback);
+    if (code)
+    {
+        pcm_ = nullptr;
+    }
+    return code;
+}
+
+void OAdapter::process(const ProcContext &context) noexcept
+{
+    if (!pcm_)
+    {
+        return;
+    }
+    converter_->encode(context.inputs[0], pcm_);
+    if (converter_->advance_period())
+    {
+        pcm_ = nullptr;
+    }
+}
+
+void OAdapter::reset() noexcept
+{
+    pcm_ = nullptr;
+    if (converter_)
+    {
+        converter_->reset();
+    }
+}
+
+RetCode OAdapter::prepare(const EngineSpec &graph_spec) noexcept
+{
+    return graph_spec_ == graph_spec ? ErrorCode::Ok : ErrorCode::InvalidArg;
+}
+
 } // namespace aereborn

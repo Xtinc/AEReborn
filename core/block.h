@@ -6,7 +6,6 @@
 #include <cassert>
 #include <cstddef>
 #include <limits>
-#include <new>
 #include <type_traits>
 #include <vector>
 
@@ -109,35 +108,9 @@ using OBlock = Block<float>;
 class Buffer
 {
   public:
-    Buffer() = default;
-    RetCode resize(std::size_t channels, std::size_t capacity_frames) noexcept
-    try
-    {
-        if (channels == 0 || capacity_frames == 0)
-        {
-            return ErrorCode::InvalidArg;
-        }
-        if (channels > samples_.max_size() / capacity_frames)
-        {
-            return ErrorCode::TooLarge;
-        }
-        samples_.assign(channels * capacity_frames, 0.0f);
-        channels_ = channels;
-        capacity_frames_ = capacity_frames;
-        return {};
-    }
-    catch (const std::bad_alloc &)
-    {
-        return ErrorCode::NoMemory;
-    }
-    OBlock block(std::size_t frames) noexcept
-    {
-        return {samples_.data(), channels_, frames, capacity_frames_};
-    }
-    std::size_t capacity_frames() const noexcept
-    {
-        return capacity_frames_;
-    }
+    RetCode resize(std::size_t channels, std::size_t capacity_frames);
+    OBlock block(std::size_t frames) noexcept;
+    std::size_t capacity_frames() const noexcept;
 
   private:
     std::vector<float> samples_;

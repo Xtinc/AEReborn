@@ -1,23 +1,39 @@
-#include "virtual_nodes.h"
+#include "support/test_harness.h"
+#include "support/test_node.h"
+#include "core/engine.h"
+#include <algorithm>
+#include <array>
+#include <exception>
 #include <limits>
+#include <new>
+#include <stdexcept>
 #include <type_traits>
-
-std::array<std::uint64_t, 4> ids_from_other_translation_unit();
 
 namespace
 {
 using namespace aereborn;
 using namespace aereborn::test;
-static_assert(Engine<SampleRate::Hz16000, BlockPeriod::Ms05>::block_frames() == 80, "16 kHz / 5 ms");
-static_assert(Engine<SampleRate::Hz44100, BlockPeriod::Ms10>::block_frames() == 441, "44.1 kHz / 10 ms");
-static_assert(Engine<SampleRate::Hz11025, BlockPeriod::Ms40>::block_frames() == 441, "11.025 kHz / 40 ms");
-static_assert(Engine<SampleRate::Hz96000, BlockPeriod::Ms40>::block_frames() == 3840, "96 kHz / 40 ms");
+static_assert(EngineSpec(SampleRate::Hz16000, BlockPeriod::Ms05).block_frames() == 80, "16 kHz / 5 ms");
+static_assert(EngineSpec(SampleRate::Hz44100, BlockPeriod::Ms10).block_frames() == 441, "44.1 kHz / 10 ms");
+static_assert(EngineSpec(SampleRate::Hz11025, BlockPeriod::Ms40).block_frames() == 441, "11.025 kHz / 40 ms");
+static_assert(EngineSpec(SampleRate::Hz96000, BlockPeriod::Ms40).block_frames() == 3840, "96 kHz / 40 ms");
 static_assert(std::is_convertible<OBlock, IBlock>::value, "Writable blocks become read-only views");
 static_assert(!std::is_convertible<IBlock, OBlock>::value, "Read-only blocks cannot become writable");
-static_assert(!std::is_convertible<std::unique_ptr<IAdapter<>>, std::unique_ptr<Node<render_rate, render_period>>>::value,
-              "Nodes must match the engine period");
 
-void blocks()
+template <class Exception, class Operation> void expect_exception(Operation operation)
+{
+    try
+    {
+        operation();
+    }
+    catch (const Exception &)
+    {
+        return;
+    }
+    check(false, "Expected exception was not thrown");
+}
+
+void audio_block_layout()
 {
     Buffer buffer;
     checked(buffer.resize(2, 8));
@@ -42,24 +58,50 @@ void blocks()
     check(empty.begin() == empty.end(), "An empty view supports iteration without pointer arithmetic on null");
 }
 
-void matrices()
+void channel_matrix_validation()
 {
-    const auto matrix = checked(ChMatrix::create(2, 3, {1, 2, 3, 4, 5, 6}));
+    const float coefficients[] = {1, 2, 3, 4, 5, 6};
+    const ChMatrix matrix(2, 3, View<const float>{coefficients, 6});
     check(matrix.output_channels() == 2 && matrix.input_channels() == 3 && matrix.coefficients()[3] == 4,
           "Matrix rows are destinations and columns are sources");
-    expect_error(ErrorCode::InvalidArg, ChMatrix::create(0, 1, {}));
-    expect_error(ErrorCode::InvalidArg, ChMatrix::create(2, 1, {1}));
-    expect_error(ErrorCode::InvalidArg, ChMatrix::create(1, 1, {std::numeric_limits<float>::infinity()}));
-    expect_error(ErrorCode::InvalidArg, ChMatrix::create(1, 1, {std::numeric_limits<float>::quiet_NaN()}));
-    const auto huge = std::numeric_limits<std::size_t>::max();
-    expect_error(ErrorCode::TooLarge, ChMatrix::create(huge, huge, {}));
+    expect_exception<std::invalid_argument>([] { ChMatrix(0, 1, {}); });
+    expect_exception<std::invalid_argument>([] { ChMatrix(2, 1, {1}); });
+    expect_exception<std::invalid_argument>([] { ChMatrix(1, 1, {std::numeric_limits<float>::infinity()}); });
+    expect_exception<std::invalid_argument>([] { ChMatrix(1, 1, {std::numeric_limits<float>::quiet_NaN()}); });
+    expect_exception<std::length_error>([] {
+        const auto huge = std::numeric_limits<std::size_t>::max();
+        ChMatrix(huge, huge, {});
+    });
 }
 
-void graph_validation()
+void engine_timing_validation()
 {
-    RoutingEngine engine;
+    const EngineSpec invalid_specs[] = {
+        {SampleRate::Hz44100, BlockPeriod::Ms05},
+        {static_cast<SampleRate>(0), BlockPeriod::Ms10},
+        {static_cast<SampleRate>(96100), BlockPeriod::Ms10},
+        {SampleRate::Hz48000, static_cast<BlockPeriod>(0)},
+        {SampleRate::Hz48000, static_cast<BlockPeriod>(15)},
+    };
+    for (const auto spec : invalid_specs)
+    {
+        Engine engine(spec.sample_rate(), spec.block_period());
+        check(engine.spec().block_frames() == 0, "Invalid graph timing cannot define a block size");
+        expect_error(ErrorCode::InvalidArg, engine.prepare());
+        expect_error(ErrorCode::NotPrepared, engine.process());
+    }
+
+    Engine custom_rate(static_cast<SampleRate>(12300), BlockPeriod::Ms10);
+    checked(custom_rate.prepare());
+    checked(custom_rate.process());
+    check(custom_rate.frame_position() == 123, "Graph rates within the range can define integral frames");
+}
+
+void connection_validation()
+{
+    Engine engine(render_rate, render_period);
     expect_error(ErrorCode::InvalidArg, engine.add_node(nullptr));
-    expect_error(ErrorCode::InvalidArg, engine.emplace_node<CaptureAdapter>(0));
+    expect_error(ErrorCode::InvalidArg, engine.emplace_node<VirtualNode<0, 1>>(0));
     const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>());
     const auto sink = checked(engine.emplace_node<VirtualNode<1, 0>>());
     const auto stereo = checked(engine.emplace_node<VirtualNode<1, 0>>(2));
@@ -70,7 +112,7 @@ void graph_validation()
     expect_error(ErrorCode::InvalidPort, engine.connect({source}, {sink, 1}));
     expect_error(ErrorCode::ChannelMismatch, engine.connect({source}, {stereo}));
     expect_error(ErrorCode::InvalidType, engine.node<VirtualNode<>>(source));
-    RoutingEngine other;
+    Engine other(render_rate, render_period);
     const auto foreign = checked(other.emplace_node<VirtualNode<>>());
     expect_error(ErrorCode::UnknownNode, engine.connect({foreign}, {sink}));
     expect_error(ErrorCode::UnknownNode, engine.connect({source}, {foreign}));
@@ -89,9 +131,9 @@ void graph_validation()
     expect_error(ErrorCode::UnknownNode, engine.remove_node(source));
 }
 
-void cycles()
+void feedback_rejection()
 {
-    RoutingEngine engine;
+    Engine engine(render_rate, render_period);
     const auto a = checked(engine.emplace_node<VirtualNode<2, 2>>());
     const auto b = checked(engine.emplace_node<VirtualNode<>>());
     const auto c = checked(engine.emplace_node<VirtualNode<>>());
@@ -110,9 +152,9 @@ void cycles()
     expect_error(ErrorCode::Cycle, engine.connect({y}, {x}));
 }
 
-void preparation()
+void prepare_retry()
 {
-    RoutingEngine engine;
+    Engine engine(render_rate, render_period);
     expect_error(ErrorCode::NotPrepared, engine.process());
     checked(engine.prepare());
     checked(engine.process());
@@ -130,7 +172,7 @@ void preparation()
     checked(engine.prepare());
     checked(engine.process());
     check(node->prepares == 2 && node->calls == 1, "Preparation is retryable and then idempotent");
-    const auto huge = checked(engine.emplace_node<PlaybackAdapter>(std::numeric_limits<std::size_t>::max()));
+    const auto huge = checked(engine.emplace_node<VirtualNode<1, 0>>(std::numeric_limits<std::size_t>::max()));
     expect_error(ErrorCode::TooLarge, engine.prepare());
     expect_error(ErrorCode::NotPrepared, engine.process());
     checked(engine.remove_node(huge));
@@ -144,111 +186,85 @@ void preparation()
 class ThrowingNode : public VirtualNode<>
 {
   public:
-    explicit ThrowingNode(ErrorCode construction)
+    explicit ThrowingNode(std::exception_ptr construction_error = {})
     {
-        if (construction == ErrorCode::NoMemory)
+        if (construction_error)
         {
-            throw std::bad_alloc();
-        }
-        if (construction == ErrorCode::TooLarge)
-        {
-            throw std::length_error("test capacity");
-        }
-        if (construction == ErrorCode::NodeFailed)
-        {
-            throw std::runtime_error("test construction");
+            std::rethrow_exception(construction_error);
         }
     }
-    RetCode prepare() override
+    RetCode prepare(const EngineSpec &spec) override
     {
-        throw std::runtime_error("test preparation");
+        if (fail_preparation)
+        {
+            throw std::runtime_error("test preparation");
+        }
+        return VirtualNode<>::prepare(spec);
     }
+
+    bool fail_preparation = true;
 };
 
-void exceptions()
+void node_exception_propagation()
 {
-    RoutingEngine engine;
-    expect_error(ErrorCode::NoMemory, engine.emplace_node<ThrowingNode>(ErrorCode::NoMemory));
-    expect_error(ErrorCode::TooLarge, engine.emplace_node<ThrowingNode>(ErrorCode::TooLarge));
-    expect_error(ErrorCode::NodeFailed, engine.emplace_node<ThrowingNode>(ErrorCode::NodeFailed));
-    const auto bad = checked(engine.emplace_node<ThrowingNode>(ErrorCode::Ok));
+    Engine engine(render_rate, render_period);
+    checked(engine.prepare());
+    expect_exception<std::bad_alloc>([&] {
+        engine.emplace_node<ThrowingNode>(std::make_exception_ptr(std::bad_alloc()));
+    });
+    expect_exception<std::length_error>([&] {
+        engine.emplace_node<ThrowingNode>(std::make_exception_ptr(std::length_error("test capacity")));
+    });
+    expect_exception<std::runtime_error>([&] {
+        engine.emplace_node<ThrowingNode>(std::make_exception_ptr(std::runtime_error("test construction")));
+    });
+    checked(engine.process());
+
+    const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>());
+    const auto processor = checked(engine.emplace_node<ThrowingNode>());
     const auto sink = checked(engine.emplace_node<VirtualNode<1, 0>>());
-    checked(engine.connect({bad}, {sink}));
-    expect_error(ErrorCode::NodeFailed, engine.prepare());
+    checked(engine.connect({source}, {processor}));
+    checked(engine.connect({processor}, {sink}));
+    expect_exception<std::runtime_error>([&] { engine.prepare(); });
     expect_error(ErrorCode::NotPrepared, engine.process());
-    checked(engine.remove_node(bad));
+    check(engine.frame_position() == render_frames, "Preparation exception does not advance time");
+    auto *node = checked(engine.node<ThrowingNode>(processor));
+    node->fail_preparation = false;
     checked(engine.prepare());
     checked(engine.process());
+    check(checked(engine.node<VirtualNode<0, 1>>(source))->prepares == 1 && node->calls == 1,
+          "Retry after an exception preserves prepared dependencies");
 }
 
-void identifiers()
+void handle_uniqueness()
 {
-    const auto remote = ids_from_other_translation_unit();
-    RoutingEngine engine;
+    Engine engine(render_rate, render_period);
     const auto a = checked(engine.emplace_node<VirtualNode<>>());
     const auto b = checked(engine.emplace_node<VirtualNode<>>());
     const auto connection = checked(engine.connect({a}, {b}));
-    for (std::size_t i = 0; i < remote.size(); ++i)
-    {
-        for (std::size_t j = i + 1; j < remote.size(); ++j)
-        {
-            check(remote[i] != remote[j], "Identifiers are shared across engine specializations");
-        }
-        for (const auto local : {a.value, b.value, connection.value})
-        {
-            check(remote[i] != local, "Identifiers are shared across translation units");
-        }
-    }
+
+    Engine other(SampleRate::Hz16000, BlockPeriod::Ms10);
+    const auto x = checked(other.emplace_node<VirtualNode<>>());
+    const auto y = checked(other.emplace_node<VirtualNode<>>());
+    const auto other_connection = checked(other.connect({x}, {y}));
+    std::array<std::uint64_t, 6> ids{{a.value, b.value, connection.value, x.value, y.value, other_connection.value}};
+    std::sort(ids.begin(), ids.end());
+    check(ids.front() != 0 && std::adjacent_find(ids.begin(), ids.end()) == ids.end(),
+          "Node and connection IDs are nonzero and unique across engines");
+
     checked(engine.remove_node(a));
     const auto replacement = checked(engine.emplace_node<VirtualNode<>>());
-    check(replacement != a, "Removed identifiers are not reused");
+    const auto replacement_connection = checked(engine.connect({replacement}, {b}));
+    check(replacement != a && replacement_connection != connection, "Removed identifiers are not reused");
 }
 
-void topology()
-{
-    RoutingEngine engine;
-    Capture input(engine, 1, 997, 0.25f);
-    Playback main(engine, 1);
-    const auto processor = checked(engine.emplace_node<VirtualNode<>>());
-    checked(engine.connect({input.id}, {processor}));
-    checked(engine.connect({processor}, {main.id}));
-    checked(engine.prepare());
-    input.generate();
-    main.bind();
-    checked(engine.process());
-    input.generate();
-    main.bind();
-    const auto previous = main.bytes;
-    Playback monitor(engine, 1);
-    checked(engine.connect({processor}, {monitor.id}));
-    expect_error(ErrorCode::NotPrepared, engine.process());
-    check(main.bytes == previous && engine.frame_position() == render_frames, "Graph edits do not consume pending PCM");
-    expect_error(ErrorCode::BufferFull, input.adapter->bind_pcm(input.device.pcm()));
-    checked(engine.prepare());
-    monitor.bind();
-    checked(engine.process());
-    main.receive();
-    monitor.receive();
-    main.expect([](std::size_t frame, std::size_t) { return tone(997, 0.25, render_frames + frame); });
-    check(monitor.device.matches(main.device.pcm()), "A newly attached monitor receives the same existing output");
-    auto *node = checked(engine.node<VirtualNode<>>(processor));
-    check(node->calls == 2 && node->prepares == 1 && node->resets == 0, "Rebuilding keeps existing node state");
-    checked(engine.remove_node(processor));
-    checked(engine.prepare());
-    main.bind();
-    monitor.bind();
-    checked(engine.process());
-    main.receive();
-    monitor.receive();
-    main.expect([](std::size_t, std::size_t) { return 0; });
-    monitor.expect([](std::size_t, std::size_t) { return 0; });
-}
 } // namespace
 
 int main(int argc, char **argv)
 {
     return aereborn::test::run_tests(argc, argv, {
-        {"blocks", blocks}, {"matrices", matrices}, {"graph_validation", graph_validation}, {"cycles", cycles},
-        {"preparation", preparation}, {"exceptions", exceptions}, {"identifiers", identifiers}, {"topology", topology}
+        {"audio_block_layout", audio_block_layout}, {"channel_matrix_validation", channel_matrix_validation}, {"engine_timing_validation", engine_timing_validation},
+        {"connection_validation", connection_validation}, {"feedback_rejection", feedback_rejection},
+        {"prepare_retry", prepare_retry}, {"node_exception_propagation", node_exception_propagation}, {"handle_uniqueness", handle_uniqueness}
     });
 }

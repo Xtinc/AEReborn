@@ -1,5 +1,5 @@
-#include "checked.h"
-#include "pcm.h"
+#include "support/test_harness.h"
+#include "support/pcm_reference.h"
 #include "core/engine.h"
 #include "plugins/adapter.h"
 
@@ -13,12 +13,9 @@ using namespace aereborn;
 using namespace aereborn::test;
 constexpr auto rate = SampleRate::Hz48000;
 constexpr auto period = BlockPeriod::Ms05;
-using TestEngine = Engine<rate, period>;
-using Input = IAdapter<rate, period>;
-using Output = OAdapter<rate, period>;
-constexpr auto block_frames = TestEngine::block_frames();
+constexpr std::size_t block_frames = 240;
 
-void formats()
+void pcm_format_conversion()
 {
     const struct
     {
@@ -34,17 +31,17 @@ void formats()
     };
     for (const auto &test : cases)
     {
-        TestEngine engine;
+        Engine engine(rate, period);
         const PCMSpec spec{rate, test.format, 2};
         const PCMSpec float_spec{rate, PCMFormat::F32LE, 2};
-        const auto input_id = checked(engine.emplace_node<Input>(spec.channels));
-        checked(checked(engine.node<Input>(input_id))->configure_pcm(spec));
-        const auto capture_id = checked(engine.emplace_node<Output>(float_spec.channels));
-        checked(checked(engine.node<Output>(capture_id))->configure_pcm(float_spec));
-        const auto playback_id = checked(engine.emplace_node<Input>(float_spec.channels));
-        checked(checked(engine.node<Input>(playback_id))->configure_pcm(float_spec));
-        const auto output_id = checked(engine.emplace_node<Output>(spec.channels));
-        checked(checked(engine.node<Output>(output_id))->configure_pcm(spec));
+        const auto input_id = checked(engine.emplace_node<IAdapter>(spec.channels, engine.spec()));
+        checked(checked(engine.node<IAdapter>(input_id))->configure_pcm(spec));
+        const auto capture_id = checked(engine.emplace_node<OAdapter>(float_spec.channels, engine.spec()));
+        checked(checked(engine.node<OAdapter>(capture_id))->configure_pcm(float_spec));
+        const auto playback_id = checked(engine.emplace_node<IAdapter>(float_spec.channels, engine.spec()));
+        checked(checked(engine.node<IAdapter>(playback_id))->configure_pcm(float_spec));
+        const auto output_id = checked(engine.emplace_node<OAdapter>(spec.channels, engine.spec()));
+        checked(checked(engine.node<OAdapter>(output_id))->configure_pcm(spec));
         checked(engine.connect({input_id}, {capture_id}));
         checked(engine.connect({playback_id}, {output_id}));
         checked(engine.prepare());
@@ -65,10 +62,10 @@ void formats()
         }
         std::vector<std::uint8_t> decoded(graph_pcm.size());
         std::vector<std::uint8_t> encoded(input_pcm.size());
-        checked(checked(engine.node<Input>(input_id))->bind_pcm({input_pcm.data(), input_pcm.size()}));
-        checked(checked(engine.node<Output>(capture_id))->bind_pcm({decoded.data(), decoded.size()}));
-        checked(checked(engine.node<Input>(playback_id))->bind_pcm({graph_pcm.data(), graph_pcm.size()}));
-        checked(checked(engine.node<Output>(output_id))->bind_pcm({encoded.data(), encoded.size()}));
+        checked(checked(engine.node<IAdapter>(input_id))->bind_pcm({input_pcm.data(), input_pcm.size()}));
+        checked(checked(engine.node<OAdapter>(capture_id))->bind_pcm({decoded.data(), decoded.size()}));
+        checked(checked(engine.node<IAdapter>(playback_id))->bind_pcm({graph_pcm.data(), graph_pcm.size()}));
+        checked(checked(engine.node<OAdapter>(output_id))->bind_pcm({encoded.data(), encoded.size()}));
         checked(engine.process());
         const float expected_samples[] = {-1.0f, 0.5f, 0.25f, test.peak};
         for (std::size_t i = 0; i < decoded.size() / 4; ++i)
@@ -82,15 +79,15 @@ void formats()
     }
 }
 
-void binding()
+void buffer_binding()
 {
-    TestEngine engine;
+    Engine engine(rate, period);
     const PCMSpec spec{rate, PCMFormat::S16LE, 1};
-    const auto input_id = checked(engine.emplace_node<Input>(spec.channels));
-    const auto output_id = checked(engine.emplace_node<Output>(spec.channels));
+    const auto input_id = checked(engine.emplace_node<IAdapter>(spec.channels, engine.spec()));
+    const auto output_id = checked(engine.emplace_node<OAdapter>(spec.channels, engine.spec()));
     checked(engine.connect({input_id}, {output_id}));
-    auto *input = checked(engine.node<Input>(input_id));
-    auto *output = checked(engine.node<Output>(output_id));
+    auto *input = checked(engine.node<IAdapter>(input_id));
+    auto *output = checked(engine.node<OAdapter>(output_id));
     engine.reset(); // Reset must also accept converters with no allocated history.
     std::array<std::uint8_t, block_frames * 2> pcm;
     for (std::size_t i = 0; i < pcm.size(); ++i)
@@ -120,8 +117,7 @@ void binding()
 
     checked(input->bind_pcm({pcm.data(), pcm.size()}));
     checked(output->bind_pcm({packet.data(), packet.size()}));
-    checked(input->prepare());
-    checked(output->prepare());
+    checked(engine.prepare());
     check(input->bind_pcm({pcm.data(), pcm.size()}).code() == ErrorCode::BufferFull &&
               output->bind_pcm({packet.data(), packet.size()}).code() == ErrorCode::BufferFull,
           "A bound device period survives repeated preparation and cannot be replaced early");
@@ -144,71 +140,17 @@ void binding()
     checked(engine.process());
 }
 
-void cadence()
-{
-    constexpr std::size_t input_periods = 2;
-    constexpr std::size_t output_periods = 3;
-    const PCMSpec input_spec{SampleRate::Hz44100, PCMFormat::S16LE, 1, input_periods};
-    const PCMSpec output_spec{rate, PCMFormat::S16LE, 1, output_periods};
-    Input invalid_period(1);
-    check(invalid_period.configure_pcm({input_spec.sample_rate, input_spec.format, input_spec.channels}).code() ==
-              ErrorCode::InvalidArg, "One 5 ms period cannot hold integer 44.1 kHz frames");
-    Output invalid_rate(1);
-    Input zero_periods(1);
-    check(invalid_rate.configure_pcm({static_cast<SampleRate>(48001), PCMFormat::S16LE, 1}).code() == ErrorCode::InvalidArg &&
-              zero_periods.configure_pcm({rate, PCMFormat::S16LE, 1, 0}).code() == ErrorCode::InvalidArg,
-          "Require a listed PCM rate and a positive period multiplier");
-
-    TestEngine engine;
-    const auto input_id = checked(engine.emplace_node<Input>(input_spec.channels));
-    checked(checked(engine.node<Input>(input_id))->configure_pcm(input_spec));
-    const auto output_id = checked(engine.emplace_node<Output>(output_spec.channels));
-    checked(checked(engine.node<Output>(output_id))->configure_pcm(output_spec));
-    checked(engine.connect({input_id}, {output_id}));
-    checked(engine.prepare());
-    auto *input = checked(engine.node<Input>(input_id));
-    auto *output = checked(engine.node<Output>(output_id));
-    check(input->pcm_frames() == 441 && output->pcm_frames() == 720, "Compute device frame counts from period multiples");
-
-    std::array<std::uint8_t, 441 * 2> captured{};
-    std::array<std::uint8_t, 720 * 2> playback;
-    std::size_t reads = 0;
-    std::size_t writes = 0;
-    for (std::size_t tick = 0; tick < 6; ++tick)
-    {
-        if (tick % input_periods == 0)
-        {
-            ++reads;
-            checked(input->bind_pcm({captured.data(), captured.size()}));
-        }
-        if (tick % output_periods == 0)
-        {
-            playback.fill(0xff);
-            checked(output->bind_pcm({playback.data(), playback.size()}));
-        }
-        checked(engine.process());
-        if ((tick + 1) % output_periods == 0)
-        {
-            ++writes;
-            check(std::all_of(playback.begin(), playback.end(), [](std::uint8_t byte) { return byte == 0; }),
-                  "The device writes a complete bound buffer at its period boundary");
-        }
-    }
-    check(reads == 3 && writes == 2 && engine.frame_position() == 6 * block_frames,
-          "Device transfers follow a single base-period counter");
-}
-
-void float_copy()
+void unaligned_float_pcm()
 {
     constexpr std::size_t periods = 2;
     constexpr auto frames = periods * block_frames;
     constexpr auto bytes = frames * sizeof(float);
-    TestEngine engine;
+    Engine engine(rate, period);
     const PCMSpec spec{rate, PCMFormat::F32LE, 1, periods};
-    const auto input_id = checked(engine.emplace_node<Input>(spec.channels));
-    checked(checked(engine.node<Input>(input_id))->configure_pcm(spec));
-    const auto output_id = checked(engine.emplace_node<Output>(spec.channels));
-    checked(checked(engine.node<Output>(output_id))->configure_pcm(spec));
+    const auto input_id = checked(engine.emplace_node<IAdapter>(spec.channels, engine.spec()));
+    checked(checked(engine.node<IAdapter>(input_id))->configure_pcm(spec));
+    const auto output_id = checked(engine.emplace_node<OAdapter>(spec.channels, engine.spec()));
+    checked(checked(engine.node<OAdapter>(output_id))->configure_pcm(spec));
     checked(engine.connect({input_id}, {output_id}));
     checked(engine.prepare());
 
@@ -218,8 +160,8 @@ void float_copy()
     {
         write_f32le(capture.data() + 1 + frame * sizeof(float), 1.25f + static_cast<float>(frame) / 256.0f);
     }
-    checked(checked(engine.node<Input>(input_id))->bind_pcm({capture.data() + 1, bytes}));
-    checked(checked(engine.node<Output>(output_id))->bind_pcm({playback.data() + 1, bytes}));
+    checked(checked(engine.node<IAdapter>(input_id))->bind_pcm({capture.data() + 1, bytes}));
+    checked(checked(engine.node<OAdapter>(output_id))->bind_pcm({playback.data() + 1, bytes}));
     for (std::size_t step = 0; step < periods; ++step)
     {
         checked(engine.process());
@@ -229,17 +171,17 @@ void float_copy()
 
 void channel_mapping()
 {
-    TestEngine engine;
-    const auto input_id = checked(engine.emplace_node<Input>(2));
-    const auto output_id = checked(engine.emplace_node<Output>(2));
-    auto *input = checked(engine.node<Input>(input_id));
-    auto *output = checked(engine.node<Output>(output_id));
+    Engine engine(rate, period);
+    const auto input_id = checked(engine.emplace_node<IAdapter>(2, engine.spec()));
+    const auto output_id = checked(engine.emplace_node<OAdapter>(2, engine.spec()));
+    auto *input = checked(engine.node<IAdapter>(input_id));
+    auto *output = checked(engine.node<OAdapter>(output_id));
     checked(engine.connect({input_id}, {output_id}));
     checked(engine.prepare());
 
     // Deliberately non-square matrices exercise both conversion directions.
-    const auto capture_matrix = checked(ChMatrix::create(2, 3, {0, 1, 0, 0.5f, 0, 0.5f}));
-    const auto playback_matrix = checked(ChMatrix::create(4, 2, {1, 0, 0, 1, 1, -1, 0, 0}));
+    const ChMatrix capture_matrix(2, 3, {0, 1, 0, 0.5f, 0, 0.5f});
+    const ChMatrix playback_matrix(4, 2, {1, 0, 0, 1, 1, -1, 0, 0});
     checked(input->configure_pcm({rate, PCMFormat::S16LE, 3, 2}, capture_matrix));
     checked(output->configure_pcm({rate, PCMFormat::F32LE, 4, 2}, playback_matrix));
     std::vector<std::uint8_t> captured(input->pcm_bytes());
@@ -280,7 +222,7 @@ void channel_mapping()
     }
 
     // Explicit matrices also apply when channel counts happen to match.
-    const auto swap = checked(ChMatrix::create(2, 2, {0, 1, 1, 0}));
+    const ChMatrix swap(2, 2, {0, 1, 1, 0});
     checked(input->configure_pcm({rate, PCMFormat::F32LE, 2}, swap));
     checked(output->configure_pcm({rate, PCMFormat::F32LE, 2}));
     captured.assign(input->pcm_bytes(), 0);
@@ -295,20 +237,18 @@ void channel_mapping()
           "Same-channel mapping replaces the previous converter without adding delay or retaining a tail");
 }
 
-void configuration_errors()
+void invalid_pcm_configuration()
 {
-    Input input(2);
-    Output output(2);
-    const auto mono_to_stereo = checked(ChMatrix::create(2, 1, {1, -0.5f}));
-    const auto stereo_to_mono = checked(ChMatrix::create(1, 2, {0.25f, 0.75f}));
+    IAdapter input(2, {rate, period});
+    OAdapter output(2, {rate, period});
+    const ChMatrix mono_to_stereo(2, 1, {1, -0.5f});
+    const ChMatrix stereo_to_mono(1, 2, {0.25f, 0.75f});
     const PCMSpec mono{SampleRate::Hz16000, PCMFormat::S16LE, 1};
     check(input.configure_pcm(mono).code() == ErrorCode::ChannelMismatch &&
               output.configure_pcm(mono).code() == ErrorCode::ChannelMismatch &&
               input.configure_pcm(mono, stereo_to_mono).code() == ErrorCode::ChannelMismatch &&
               output.configure_pcm(mono, mono_to_stereo).code() == ErrorCode::ChannelMismatch,
           "Unequal channels require explicit matrices with the correct direction");
-    checked(input.prepare());
-    checked(output.prepare());
     check(input.pcm_bytes() == 0 && output.pcm_bytes() == 0,
           "Failed first configuration does not publish PCM state");
     checked(input.configure_pcm(mono, mono_to_stereo));
@@ -316,6 +256,7 @@ void configuration_errors()
     const PCMSpec invalid_specs[] = {
         {SampleRate::Hz16000, static_cast<PCMFormat>(99), 1},
         {static_cast<SampleRate>(0), PCMFormat::S16LE, 1},
+        {static_cast<SampleRate>(48001), PCMFormat::S16LE, 1},
         {SampleRate::Hz16000, PCMFormat::S16LE, 0},
         {SampleRate::Hz16000, PCMFormat::S16LE, 1, 0},
         {SampleRate::Hz44100, PCMFormat::S16LE, 1},
@@ -333,21 +274,52 @@ void configuration_errors()
               input.pcm_frames() == 80 && input.pcm_bytes() == 160 &&
               output.pcm_frames() == 80 && output.pcm_bytes() == 160,
           "Capacity errors preserve the active device buffer requirements");
-    Input zero_channels(0);
+    IAdapter zero_channels(0, {rate, period});
     check(zero_channels.configure_pcm(mono, mono_to_stereo).code() == ErrorCode::InvalidArg,
           "Standalone adapters reject zero logical channels");
 }
 
+void graph_timing_mismatch()
+{
+    Engine invalid_graph(rate, static_cast<BlockPeriod>(0));
+    IAdapter standalone(1, invalid_graph.spec());
+    expect_error(ErrorCode::InvalidArg, standalone.configure_pcm({rate, PCMFormat::F32LE, 1}));
+
+    Engine engine(rate, period);
+    const EngineSpec other_spec(SampleRate::Hz24000, BlockPeriod::Ms10);
+    const auto frames = engine.spec().block_frames();
+    check(frames == block_frames && frames == other_spec.block_frames(),
+          "Equal frame counts can represent different graph rates and periods");
+    const auto output = checked(engine.emplace_node<OAdapter>(1, engine.spec()));
+    const auto wrong_input = checked(engine.emplace_node<IAdapter>(1, other_spec));
+    checked(engine.connect({wrong_input}, {output}));
+    expect_error(ErrorCode::InvalidArg, engine.prepare());
+    expect_error(ErrorCode::NotPrepared, engine.process());
+    checked(engine.remove_node(wrong_input));
+
+    const auto input = checked(engine.emplace_node<IAdapter>(1, engine.spec()));
+    checked(checked(engine.node<IAdapter>(input))->configure_pcm({rate, PCMFormat::F32LE, 1}));
+    checked(engine.connect({input}, {output}));
+    const auto wrong_output = checked(engine.emplace_node<OAdapter>(1, other_spec));
+    checked(engine.connect({input}, {wrong_output}));
+    expect_error(ErrorCode::InvalidArg, engine.prepare());
+    expect_error(ErrorCode::NotPrepared, engine.process());
+    checked(engine.remove_node(wrong_output));
+    checked(engine.prepare());
+    checked(engine.process());
+    check(engine.frame_position() == block_frames, "Preparing the corrected graph makes it executable");
+}
+
 void zero_contributions()
 {
-    const auto selector = checked(ChMatrix::create(2, 2, {0, 1, 0, 0}));
+    const ChMatrix selector(2, 2, {0, 1, 0, 0});
     for (const bool map_at_input : {false, true})
     {
-        TestEngine engine;
-        const auto input_id = checked(engine.emplace_node<Input>(2));
-        const auto output_id = checked(engine.emplace_node<Output>(2));
-        auto *input = checked(engine.node<Input>(input_id));
-        auto *output = checked(engine.node<Output>(output_id));
+        Engine engine(rate, period);
+        const auto input_id = checked(engine.emplace_node<IAdapter>(2, engine.spec()));
+        const auto output_id = checked(engine.emplace_node<OAdapter>(2, engine.spec()));
+        auto *input = checked(engine.node<IAdapter>(input_id));
+        auto *output = checked(engine.node<OAdapter>(output_id));
         const PCMSpec spec{rate, PCMFormat::F32LE, 2};
         checked(input->configure_pcm(spec, map_at_input ? selector : ChMatrix{}));
         checked(output->configure_pcm(spec));
@@ -371,13 +343,13 @@ void zero_contributions()
     }
 }
 
-void integer_limits()
+void integer_sample_limits()
 {
-    TestEngine engine;
-    const auto input_id = checked(engine.emplace_node<Input>(1));
-    const auto output_id = checked(engine.emplace_node<Output>(1));
-    auto *input = checked(engine.node<Input>(input_id));
-    auto *output = checked(engine.node<Output>(output_id));
+    Engine engine(rate, period);
+    const auto input_id = checked(engine.emplace_node<IAdapter>(1, engine.spec()));
+    const auto output_id = checked(engine.emplace_node<OAdapter>(1, engine.spec()));
+    auto *input = checked(engine.node<IAdapter>(input_id));
+    auto *output = checked(engine.node<OAdapter>(output_id));
     checked(input->configure_pcm({rate, PCMFormat::F32LE, 1}));
     checked(output->configure_pcm({rate, PCMFormat::S16LE, 1}));
     checked(engine.connect({input_id}, {output_id}));
@@ -406,12 +378,12 @@ void integer_limits()
 int main(int argc, char **argv)
 {
     return aereborn::test::run_tests(argc, argv, {
-        {"formats", formats},
-        {"binding", binding},
-        {"cadence", cadence},
-        {"float_copy", float_copy},
+        {"pcm_format_conversion", pcm_format_conversion},
+        {"buffer_binding", buffer_binding},
+        {"graph_timing_mismatch", graph_timing_mismatch},
+        {"unaligned_float_pcm", unaligned_float_pcm},
         {"channel_mapping", channel_mapping},
-        {"configuration_errors", configuration_errors},
-        {"zero_contributions", zero_contributions}, {"integer_limits", integer_limits}
+        {"invalid_pcm_configuration", invalid_pcm_configuration},
+        {"zero_contributions", zero_contributions}, {"integer_sample_limits", integer_sample_limits}
     });
 }
