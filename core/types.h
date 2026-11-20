@@ -7,6 +7,7 @@
 namespace aereborn
 {
 
+/// @brief Supported sample rates, in hertz.
 enum class SampleRate : std::uint32_t
 {
     Hz8000 = 8000,
@@ -20,9 +21,33 @@ enum class SampleRate : std::uint32_t
     Hz88200 = 88200,
     Hz96000 = 96000
 };
-constexpr bool is_sample_rate(SampleRate rate) noexcept
+
+/// @brief Supported durations of one engine tick, in milliseconds.
+enum class BlockPeriod : std::uint32_t
 {
-    switch (rate)
+    Ms05 = 5,
+    Ms10 = 10,
+    Ms20 = 20,
+    Ms40 = 40
+};
+
+/// @brief Sample storage format, including channel layout and byte order.
+///
+/// F32P stores native planar float32. All other formats store interleaved
+/// little-endian PCM.
+enum class SampleFormat
+{
+    F32P,
+    S16LE,
+    S24_3LE, ///< Signed 24-bit PCM packed into three bytes per sample.
+    S24LE,   ///< Signed 24-bit PCM stored in a four-byte slot per sample.
+    S32LE,
+    F32LE
+};
+
+constexpr bool is_sample_rate(SampleRate sample_rate) noexcept
+{
+    switch (sample_rate)
     {
     case SampleRate::Hz8000:
     case SampleRate::Hz11025:
@@ -38,56 +63,41 @@ constexpr bool is_sample_rate(SampleRate rate) noexcept
     }
     return false;
 }
-
-enum class BlockPeriod : std::uint32_t
-{
-    Ms05 = 5,
-    Ms10 = 10,
-    Ms20 = 20,
-    Ms40 = 40
-};
 constexpr bool is_block_period(BlockPeriod period) noexcept
 {
     return period == BlockPeriod::Ms05 || period == BlockPeriod::Ms10 || period == BlockPeriod::Ms20 ||
            period == BlockPeriod::Ms40;
 }
-
-// F32P is native planar float32. The other formats are interleaved little-endian PCM.
-enum class Format
-{
-    F32P,
-    S16LE,
-    S24_3LE,
-    S24LE,
-    S32LE,
-    F32LE
-};
-constexpr unsigned int sample_bits(Format format) noexcept
+constexpr unsigned int sample_bits(SampleFormat format) noexcept
 {
     switch (format)
     {
-    case Format::S16LE:
+    case SampleFormat::S16LE:
         return 16;
-    case Format::S24_3LE:
-    case Format::S24LE:
+    case SampleFormat::S24_3LE:
+    case SampleFormat::S24LE:
         return 24;
-    case Format::F32P:
-    case Format::S32LE:
-    case Format::F32LE:
+    case SampleFormat::F32P:
+    case SampleFormat::S32LE:
+    case SampleFormat::F32LE:
         return 32;
     }
     return 0;
 }
-constexpr std::size_t sample_bytes(Format format) noexcept
+constexpr std::size_t sample_bytes(SampleFormat format) noexcept
 {
-    return format == Format::S24LE ? 4 : sample_bits(format) / 8;
+    return format == SampleFormat::S24LE ? 4 : sample_bits(format) / 8;
 }
 
+/// @brief Fixed sample rate, channel count, and format declared by a port.
+///
+/// Connections require all three fields to match. Each frame contains one sample
+/// per channel.
 struct PortSpec
 {
     constexpr PortSpec() noexcept = default;
-    constexpr PortSpec(SampleRate rate, std::size_t channels, Format format = Format::F32P) noexcept
-        : sample_rate(rate), channels(channels), format(format)
+    constexpr PortSpec(SampleRate sample_rate, std::size_t channels, SampleFormat format = SampleFormat::F32P) noexcept
+        : channels(channels), sample_rate(sample_rate), format(format)
     {
     }
     constexpr bool valid() const noexcept
@@ -98,79 +108,167 @@ struct PortSpec
     {
         return sample_rate == other.sample_rate && channels == other.channels && format == other.format;
     }
-    constexpr bool operator!=(const PortSpec &other) const noexcept { return !(*this == other); }
+    constexpr bool operator!=(const PortSpec &other) const noexcept
+    {
+        return !(*this == other);
+    }
+
+    /// @brief Return the maximum frame count in one block for buffer sizing.
+    /// @param period Duration of the engine tick.
     std::size_t max_frames(BlockPeriod period) const noexcept;
+
+    /// @brief Return the actual frame count for a tick.
+    /// @param period Duration of the engine tick.
+    /// @param tick Zero-based tick position.
+    /// @note The count is the difference between two consecutive frame positions.
     std::size_t frames(BlockPeriod period, std::uint64_t tick) const noexcept;
+
+    /// @brief Return the zero-based frame position at the start of a tick.
+    /// @param period Duration of the engine tick.
+    /// @param tick Zero-based tick position.
+    /// @note Fractional frame positions round up.
     std::uint64_t frame_position(BlockPeriod period, std::uint64_t tick) const noexcept;
 
-    SampleRate sample_rate{};
     std::size_t channels = 0;
-    Format format = Format::F32P;
+    SampleRate sample_rate{};
+    SampleFormat format = SampleFormat::F32P;
 };
 
-// A read-only or writable view of one port's current block. Storage is owned by Engine.
-// audio() is for plugins whose declared ports are F32P; bytes() exposes any declared format.
-// F32P is packed with a channel stride of frames(), which can vary from tick to tick.
-template <class T> class PortBlock
+/// @brief Borrow the current audio block of a port with its specification and frame count.
+/// @tparam Byte Use std::uint8_t for writable bytes or const std::uint8_t for read-only bytes.
+///
+/// The render plan owns the storage provided to a node. Use its views only for the
+/// duration of the process call.
+template <class Byte> class PortBlock
 {
     template <class> friend class PortBlock;
-    using Sample = typename std::conditional<std::is_const<T>::value, const float, float>::type;
+    using Float = typename std::conditional<std::is_const<Byte>::value, const float, float>::type;
 
   public:
     PortBlock() noexcept = default;
-    PortBlock(T *data, PortSpec spec, std::size_t frames) noexcept : data_(data), spec_(spec), frames_(frames) {}
-    template <class U, typename std::enable_if<std::is_convertible<U *, T *>::value, int>::type = 0>
-    PortBlock(PortBlock<U> other) noexcept : data_(other.data_), spec_(other.spec_), frames_(other.frames_)
-    {
-    }
-    PortSpec spec() const noexcept { return spec_; }
-    std::size_t frames() const noexcept { return frames_; }
-    View<T> bytes() const noexcept { return {data_, frames_ * spec_.channels * sample_bytes(spec_.format)}; }
-    Block<Sample> audio() const noexcept
-    {
-        assert(spec_.format == Format::F32P);
-        return {reinterpret_cast<Sample *>(data_), spec_.channels, frames_, frames_};
-    }
 
+    /// @brief Interpret a borrowed buffer according to the port specification.
+    /// @param data Address of the buffer.
+    /// @param spec Sample rate, channel count, and format of the buffer.
+    /// @param frames Number of frames available in the buffer for this block.
+    /// @pre A nonempty block refers to storage large enough for the specified frames.
+    PortBlock(Byte *data, PortSpec spec, std::size_t frames) noexcept : data_(data), spec_(spec), frames_(frames)
+    {
+    }
+    template <class OtherByte, typename std::enable_if<std::is_convertible<OtherByte *, Byte *>::value, int>::type = 0>
+    PortBlock(PortBlock<OtherByte> other) noexcept : data_(other.data_), spec_(other.spec_), frames_(other.frames_)
+    {
+    }
+    PortSpec spec() const noexcept
+    {
+        return spec_;
+    }
+    std::size_t frames() const noexcept
+    {
+        return frames_;
+    }
+    View<Byte> byte_view() const noexcept
+    {
+        return {data_, frames_ * spec_.channels * sample_bytes(spec_.format)};
+    }
+    FloatBlock<Float> f32p_view() const noexcept
+    {
+        assert(spec_.format == SampleFormat::F32P);
+        return {reinterpret_cast<Float *>(data_), spec_.channels, frames_, frames_};
+    }
   private:
-    T *data_ = nullptr;
+    Byte *data_ = nullptr;
     PortSpec spec_;
     std::size_t frames_ = 0;
 };
+
 using IPortBlock = PortBlock<const std::uint8_t>;
 using OPortBlock = PortBlock<std::uint8_t>;
 
+/// @brief Stable identity of a node in the graph, including across instance replacement.
+/// @note Zero is the empty ID. The engine resolves nonzero IDs against the graph.
 struct NodeId
 {
     std::uint64_t value = 0;
-    constexpr bool operator==(NodeId other) const noexcept { return value == other.value; }
-    constexpr bool operator!=(NodeId other) const noexcept { return !(*this == other); }
-    constexpr bool operator<(NodeId other) const noexcept { return value < other.value; }
+    constexpr explicit operator bool() const noexcept
+    {
+        return value != 0;
+    }
+    constexpr bool operator==(NodeId other) const noexcept
+    {
+        return value == other.value;
+    }
+    constexpr bool operator!=(NodeId other) const noexcept
+    {
+        return !(*this == other);
+    }
+    constexpr bool operator<(NodeId other) const noexcept
+    {
+        return value < other.value;
+    }
 };
+
+/// @brief Identity assigned to one connection when it is created.
+/// @note Zero is the empty ID. Reconnecting the same ports creates a new ID.
 struct ConnId
 {
     std::uint64_t value = 0;
-    constexpr bool operator==(ConnId other) const noexcept { return value == other.value; }
-    constexpr bool operator!=(ConnId other) const noexcept { return !(*this == other); }
-    constexpr bool operator<(ConnId other) const noexcept { return value < other.value; }
-};
-struct IPort
-{
-    NodeId node;
-    std::size_t index = 0;
-};
-struct OPort
-{
-    NodeId node;
-    std::size_t index = 0;
+    constexpr explicit operator bool() const noexcept
+    {
+        return value != 0;
+    }
+    constexpr bool operator==(ConnId other) const noexcept
+    {
+        return value == other.value;
+    }
+    constexpr bool operator!=(ConnId other) const noexcept
+    {
+        return !(*this == other);
+    }
+    constexpr bool operator<(ConnId other) const noexcept
+    {
+        return value < other.value;
+    }
 };
 
-struct ProcContext
+/// @brief Address of an input port in the graph.
+struct IPort
 {
-    BlockPeriod block_period;
-    std::uint64_t tick_position;
-    View<const IPortBlock> inputs;
-    View<const OPortBlock> outputs;
+    NodeId node;           ///< Node that declares the port.
+    std::size_t index = 0; ///< Zero-based input port index.
+    constexpr bool operator==(IPort other) const noexcept
+    {
+        return node == other.node && index == other.index;
+    }
+    constexpr bool operator!=(IPort other) const noexcept
+    {
+        return !(*this == other);
+    }
+};
+
+/// @brief Address of an output port in the graph.
+struct OPort
+{
+    NodeId node;           ///< Node that declares the port.
+    std::size_t index = 0; ///< Zero-based output port index.
+    constexpr bool operator==(OPort other) const noexcept
+    {
+        return node == other.node && index == other.index;
+    }
+    constexpr bool operator!=(OPort other) const noexcept
+    {
+        return !(*this == other);
+    }
+};
+
+/// @brief Timing and port blocks passed to a node for one process call.
+/// @note The port block views and their buffers are borrowed for the duration of that call.
+struct ProcessContext
+{
+    BlockPeriod block_period;       ///< Duration of the current engine tick.
+    std::uint64_t tick_position;    ///< Zero-based position of the current tick.
+    View<const IPortBlock> inputs;  ///< Read-only input blocks in port index order.
+    View<const OPortBlock> outputs; ///< Output blocks with writable samples in port index order.
 };
 
 } // namespace aereborn

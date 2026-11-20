@@ -1,6 +1,7 @@
 #ifndef AEREBORN_PLUGINS_IO_H
 #define AEREBORN_PLUGINS_IO_H
 #include "core/graph.h"
+#include <limits>
 namespace aereborn
 {
 namespace detail
@@ -8,14 +9,47 @@ namespace detail
 template <class Byte> class TickBuffer
 {
   public:
-    RetCode prepare(BlockPeriod period) noexcept;
-    RetCode bind(PortSpec spec, View<Byte> bytes, std::uint64_t tick) noexcept;
-    View<Byte> take(std::uint64_t tick) noexcept;
-    void reset() noexcept { bytes_ = {nullptr, 0}; }
+    RetCode prepare(BlockPeriod period) noexcept
+    {
+        if (period_ != period)
+            reset();
+        period_ = period;
+        return {};
+    }
+
+    RetCode bind(PortSpec spec, View<Byte> bytes, std::uint64_t tick) noexcept
+    {
+        if (!bytes.empty() && !bytes.data())
+            return ErrorCode::InvalidArg;
+        if (period_ == BlockPeriod{})
+            return ErrorCode::NotPrepared;
+        if (!bytes_.empty())
+            return ErrorCode::BufferFull;
+        const auto bytes_per_channel = spec.frames(period_, tick) * sample_bytes(spec.format);
+        // Every supported rate and period produces a nonempty block.
+        if (spec.channels > std::numeric_limits<std::size_t>::max() / bytes_per_channel)
+            return ErrorCode::TooLarge;
+        if (bytes.size() != spec.channels * bytes_per_channel)
+            return ErrorCode::InvalidArg;
+        bytes_ = bytes;
+        tick_ = tick;
+        return {};
+    }
+
+    View<Byte> take(std::uint64_t tick) noexcept
+    {
+        if (bytes_.empty() || tick < tick_)
+            return {};
+        const auto bytes = bytes_;
+        reset();
+        return tick == tick_ ? bytes : View<Byte>{};
+    }
+
+    void reset() noexcept { bytes_ = {}; }
 
   private:
     BlockPeriod period_{};
-    View<Byte> bytes_{nullptr, 0};
+    View<Byte> bytes_;
     std::uint64_t tick_ = 0;
 };
 } // namespace detail
@@ -29,7 +63,7 @@ class Capture final : public NodeT<0, 1>
     RetCode prepare(BlockPeriod period) override;
     // Must be serialized with process(), like reset().
     RetCode bind(View<const std::uint8_t> bytes, std::uint64_t tick) noexcept;
-    void process(const ProcContext &context) noexcept override;
+    void process(const ProcessContext &context) noexcept override;
     void reset() noexcept override;
 
   private:
@@ -42,7 +76,7 @@ class Playback final : public NodeT<1, 0>
     RetCode prepare(BlockPeriod period) override;
     // Must be serialized with process(), like reset().
     RetCode bind(View<std::uint8_t> bytes, std::uint64_t tick) noexcept;
-    void process(const ProcContext &context) noexcept override;
+    void process(const ProcessContext &context) noexcept override;
     void reset() noexcept override;
 
   private:

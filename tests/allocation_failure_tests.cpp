@@ -1,6 +1,7 @@
 #include "plugins/matrix.h"
 #include "plugins/mixer.h"
 #include "support/audio_fixture.h"
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <new>
@@ -96,36 +97,42 @@ void buffer_resize_rollback()
 
 void conversion_rollback()
 {
-    const PortSpec input(rate, 1, Format::F32LE), output(SampleRate::Hz16000, 1);
+    const PortSpec input(rate, 1, SampleFormat::F32LE), output(SampleRate::Hz16000, 1);
+    std::array<std::uint8_t, 960> bytes{};
+    const IPortBlock input_block(bytes.data(), input, 240);
+    const auto fill_input = [&](std::size_t first) {
+        for (std::size_t i = 0; i < 240; ++i)
+            write_f32le(bytes.data() + 4 * i, static_cast<float>(std::sin(two_pi * 997 * (first + i) / 48000)));
+    };
     for (long failure = 0;; ++failure)
     {
-        Conversion actual(input, output), reference(input, output);
-        std::vector<std::uint8_t> bytes(960);
-        for (std::size_t i = 0; i < 240; ++i)
-            write_f32le(bytes.data() + 4 * i, static_cast<float>(std::sin(two_pi * 997 * i / 48000)));
-        actual.run({bytes.data(), bytes.size()});
-        reference.run({bytes.data(), bytes.size()});
-        checked(actual.clock.stop());
-        auto *convert = checked(actual.engine.node<Convert>(actual.convert_id));
+        Convert actual(input, output), reference(input, output);
+        checked(actual.prepare(period));
+        checked(reference.prepare(period));
+        std::array<float, 80> actual_samples{}, reference_samples{};
+        const OPortBlock actual_block(reinterpret_cast<std::uint8_t *>(actual_samples.data()), output, 80);
+        const OPortBlock reference_block(reinterpret_cast<std::uint8_t *>(reference_samples.data()), output, 80);
+        fill_input(0);
+        actual.process({period, 0, {&input_block, 1}, {&actual_block, 1}});
+        reference.process({period, 0, {&input_block, 1}, {&reference_block, 1}});
+
         RetCode code;
-        const bool failed = allocation_fails_after(failure, [&] { code = convert->prepare(period); });
+        const bool failed = allocation_fails_after(failure, [&] { code = actual.prepare(period); });
         if (!failed)
         {
             checked(code);
             check(failure > 0, "Fault injection visits converter allocations");
             break;
         }
-        for (std::size_t i = 0; i < 240; ++i)
-            write_f32le(bytes.data() + 4 * i, static_cast<float>(std::sin(two_pi * 997 * (240 + i) / 48000)));
-        actual.run({bytes.data(), bytes.size()});
-        reference.run({bytes.data(), bytes.size()});
-        check(std::equal(actual.sink->bytes().begin(), actual.sink->bytes().end(), reference.sink->bytes().begin()),
-              "Failed converter preparation retains the original filter history and buffers");
+        fill_input(240);
+        actual.process({period, 1, {&input_block, 1}, {&actual_block, 1}});
+        reference.process({period, 1, {&input_block, 1}, {&reference_block, 1}});
+        check(actual_samples == reference_samples, "Failed converter preparation retains filter history and buffers");
     }
 }
 void identity_needs_no_workspace()
 {
-    for (const auto format : {Format::F32P, Format::S16LE})
+    for (const auto format : {SampleFormat::F32P, SampleFormat::S16LE})
     {
         const PortSpec spec(rate, 2, format);
         Convert convert(spec, spec);
@@ -140,37 +147,68 @@ void plan_allocation_rollback()
     for (long failure = 0;; ++failure)
     {
         Engine engine(period);
-        ManualClock clock(engine);
+        ClockedGraph clock(engine);
         const auto source =
             checked(engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 1.0f; }));
         const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1)));
         checked(engine.connect({source}, {sink}));
-        const auto initial = checked(engine.prepare());
-        checked(clock.tick());
+        checked(engine.commit());
+        clock.start();
+        clock.advance();
         const auto converter =
             checked(engine.emplace_node<Convert>(PortSpec(rate, 1), PortSpec(SampleRate::Hz16000, 1)));
         const auto added = checked(engine.emplace_node<PacketSink>(PortSpec(SampleRate::Hz16000, 1)));
         checked(engine.connect({source}, {converter}));
         checked(engine.connect({converter}, {added}));
-        Result<PlanRevision> revision(ErrorCode::InvalidArg);
-        const bool failed = allocation_fails_after(failure, [&] { revision = engine.prepare(); });
+        RetCode code;
+        clock.resume();
+        const bool failed = allocation_fails_after(failure, [&] { code = engine.commit(); });
+        clock.advance();
         if (!failed)
         {
-            checked(revision);
+            checked(code);
             check(failure > 0, "Fault injection visits plan allocations");
             break;
         }
-        checked(clock.tick());
-        check(engine.applied_revision() == initial && checked(engine.node<PacketSink>(sink))->sample(0) == 1,
+        auto *new_sink = checked(engine.node<PacketSink>(added));
+        clock.advance();
+        check(new_sink->frames == 0 && checked(engine.node<PacketSink>(sink))->sample(0) == 1,
               "Failed plan construction preserves the running graph");
-        checked(engine.prepare());
-        checked(clock.tick());
+        clock.commit();
+        clock.advance();
+        check(new_sink->frames == 80, "Retry applies the new graph");
     }
 }
+
+class HeapProbe final : public NodeT<1, 0>
+{
+  public:
+    explicit HeapProbe(bool begin) : NodeT({{PortSpec(rate, 1)}}, {}), begin_(begin) {}
+    RetCode prepare(BlockPeriod) override { return {}; }
+    void process(const ProcessContext &context) noexcept override
+    {
+        if (begin_ && context.tick_position == 0)
+        {
+            allocation_test::heap_calls = 0;
+            allocation_test::measure_heap = true;
+        }
+        if (!begin_ && allocation_test::measure_heap)
+        {
+            allocation_test::measure_heap = false;
+            heap_calls = allocation_test::heap_calls;
+        }
+    }
+    std::size_t heap_calls = 1;
+
+  private:
+    const bool begin_;
+};
+
 void render_uses_prepared_buffers()
 {
     Engine engine(period);
-    ManualClock clock(engine);
+    ClockedGraph clock(engine);
+    checked(engine.emplace_node<HeapProbe>(true));
     const auto source = checked(
         engine.emplace_node<FloatSource>(SampleRate::Hz44100, 1, [](std::uint64_t, std::size_t) { return 0.25f; }));
     const auto converter = checked(engine.emplace_node<Convert>(PortSpec(SampleRate::Hz44100, 1), PortSpec(rate, 1)));
@@ -181,20 +219,15 @@ void render_uses_prepared_buffers()
     checked(engine.connect({converter}, {mixer}));
     checked(engine.connect({mixer}, {matrix}));
     checked(engine.connect({matrix}, {sink}));
-    checked(engine.prepare());
-    checked(clock.start());
-    checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1)));
-    const auto revision = checked(engine.prepare());
+    checked(engine.commit());
+    clock.start();
+    const auto probe = checked(engine.emplace_node<HeapProbe>(false));
     checked(checked(engine.node<Matrix>(matrix))->set_gain(0.5f));
     checked(checked(engine.node<Mixer>(mixer))->set_muted(0, true));
-    allocation_test::heap_calls = 0;
-    allocation_test::measure_heap = true;
-    const auto code = clock.tick();
-    allocation_test::measure_heap = false;
-    checked(code);
-    check(allocation_test::heap_calls == 0 && engine.applied_revision() == revision,
-          "Plan switching, fractional blocks, conversion, matrix gain and mixer mute allocate and reclaim nothing on "
-          "the driver");
+    clock.commit();
+    clock.advance();
+    check(checked(engine.node<HeapProbe>(probe))->heap_calls == 0,
+          "Plan switching and rendering perform no heap operations on the clock thread");
 }
 } // namespace
 int main(int argc, char **argv)

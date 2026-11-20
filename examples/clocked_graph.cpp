@@ -27,11 +27,11 @@ class Meter final : public NodeT<1, 0>
     explicit Meter(std::atomic<float> &level) : NodeT({{PortSpec(SampleRate::Hz48000, 1)}}, {}), level_(level) {}
     RetCode prepare(BlockPeriod) override
     {
-        return level_.is_lock_free() ? RetCode{} : RetCode{ErrorCode::Unsupported};
+        return {};
     }
-    void process(const ProcContext &context) noexcept override
+    void process(const ProcessContext &context) noexcept override
     {
-        const auto input = context.inputs[0].audio();
+        const auto input = context.inputs[0].f32p_view();
         float level = 0;
         for (std::size_t i = 0; i < input.frames(); ++i)
             level = std::max(level, std::abs(input.channel(0)[i]));
@@ -56,7 +56,7 @@ int main()
         checked(engine.connect({mix}, {matrix}));
         checked(engine.connect({matrix}, {sink}));
         auto *gain = checked(engine.node<Matrix>(matrix));
-        checked(engine.prepare());
+        checked(engine.commit());
         checked(engine.start());
         const auto wait = [&]
         {

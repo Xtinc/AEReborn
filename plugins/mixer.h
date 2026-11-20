@@ -2,6 +2,7 @@
 #define AEREBORN_PLUGINS_MIXER_H
 #include "core/graph.h"
 #include <atomic>
+#include <memory>
 #include <vector>
 namespace aereborn
 {
@@ -15,19 +16,14 @@ class Mixer final : public Node
     // Thread-safe with process().
     RetCode set_muted(std::size_t input, bool muted) noexcept;
     RetCode prepare(BlockPeriod period) override;
-    void process(const ProcContext &context) noexcept override;
+    void process(const ProcessContext &context) noexcept override;
     void reset() noexcept override;
 
   private:
-    struct InputState
-    {
-        std::atomic<bool> target{false};
-        bool muted = false;
-    };
-
     const PortSpec output_;
     const std::vector<PortSpec> inputs_;
-    std::vector<InputState> states_;
+    std::unique_ptr<std::atomic<bool>[]> targets_;
+    std::vector<std::uint8_t> muted_;
 };
 } // namespace aereborn
 #endif

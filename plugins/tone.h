@@ -7,7 +7,8 @@ class Tone final : public NodeT<0, 1>
 {
   public:
     Tone(SampleRate rate, std::size_t channels, double frequency = 440, float amplitude = 0.25f);
-    void process(const ProcContext &context) noexcept override;
+    RetCode prepare(BlockPeriod) override { return {}; }
+    void process(const ProcessContext &context) noexcept override;
 
   private:
     const double frequency_;

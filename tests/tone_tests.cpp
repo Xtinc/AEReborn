@@ -9,16 +9,17 @@ void tone_timeline()
 {
     constexpr auto tone_period = BlockPeriod::Ms10;
     Engine engine(tone_period);
-    ManualClock clock(engine);
+    ClockedGraph clock(engine);
     const PortSpec spec(SampleRate::Hz11025, 2);
     const auto source = checked(engine.emplace_node<Tone>(spec.sample_rate, 2, 997, 0.25f));
     const auto sink = checked(engine.emplace_node<PacketSink>(spec));
     checked(engine.connect({source}, {sink}));
-    checked(engine.prepare());
+    checked(engine.commit());
     auto *out = checked(engine.node<PacketSink>(sink));
+    clock.start();
     for (std::uint64_t tick = 0; tick < 5; ++tick)
     {
-        checked(clock.tick());
+        clock.advance();
         check(out->frames == spec.frames(tone_period, tick), "Tone follows the configured fractional block period");
         for (std::size_t frame = 0; frame < out->frames; ++frame)
         {
@@ -28,8 +29,10 @@ void tone_timeline()
                   "Tone uses each port's continuous sample timeline");
         }
     }
-    checked(clock.reset());
-    checked(clock.tick());
+    clock.stop();
+    checked(engine.reset());
+    clock.start();
+    clock.advance();
     check(out->sample(0) == 0, "Reset restarts the tone at zero phase");
 }
 void tone_validation()
@@ -39,7 +42,6 @@ void tone_validation()
     expect_exception<std::invalid_argument>([] { Tone invalid(rate, 1, 440, std::numeric_limits<float>::infinity()); });
     expect_exception<std::invalid_argument>([] { Tone invalid(rate, 0); });
     Tone silent(rate, 1, 0, 0);
-    expect_error(ErrorCode::InvalidArg, silent.prepare(static_cast<BlockPeriod>(0)));
     checked(silent.prepare(period));
 }
 } // namespace

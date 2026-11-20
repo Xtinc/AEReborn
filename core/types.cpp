@@ -24,7 +24,7 @@ RetCode Buffer::resize(std::size_t channels, std::size_t capacity_frames)
     return {};
 }
 
-OBlock Buffer::block(std::size_t frames) noexcept
+OFBlock Buffer::block(std::size_t frames) noexcept
 {
     return {samples_.data(), channels_, frames, capacity_frames_};
 }
@@ -44,6 +44,8 @@ std::size_t PortSpec::frames(BlockPeriod period, std::uint64_t tick) const noexc
 {
     const auto units = std::uint64_t{static_cast<std::uint32_t>(sample_rate)} * static_cast<std::uint32_t>(period);
     const auto fraction = units % 1000;
+    if (fraction == 0)
+        return static_cast<std::size_t>(units / 1000);
     const auto start = (tick % 1000) * fraction;
     return static_cast<std::size_t>(units / 1000 + (start + fraction + 999) / 1000 - (start + 999) / 1000);
 }

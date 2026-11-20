@@ -18,7 +18,7 @@ class Matrix final : public NodeT<1, 1>
     // Thread-safe with process().
     RetCode set_gain(float gain) noexcept;
     RetCode prepare(BlockPeriod period) override;
-    void process(const ProcContext &context) noexcept override;
+    void process(const ProcessContext &context) noexcept override;
     void reset() noexcept override;
 
   private:

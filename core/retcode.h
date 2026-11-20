@@ -22,8 +22,7 @@ enum class ErrorCode
     Cycle,
     NotPrepared,
     Busy,
-    Unsupported,
-    BufferFull,
+    BufferFull = 14,
     TooLarge
 };
 
@@ -69,8 +68,6 @@ class RetCode
             return "Preparation is required";
         case ErrorCode::Busy:
             return "The current execution context or state prevents this operation";
-        case ErrorCode::Unsupported:
-            return "The platform does not support the required lock-free atomics";
         case ErrorCode::BufferFull:
             return "A buffer is full or still in use";
         case ErrorCode::TooLarge:

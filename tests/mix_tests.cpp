@@ -9,7 +9,7 @@ using namespace aereborn::test;
 void matrix_mapping()
 {
     Engine engine(period);
-    ManualClock clock(engine);
+    ClockedGraph clock(engine);
     const auto src = checked(engine.emplace_node<FloatSource>(rate, 3, [](std::uint64_t, std::size_t ch)
                                                               { return static_cast<float>(ch + 1); }));
     const auto matrix =
@@ -17,8 +17,9 @@ void matrix_mapping()
     const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 2)));
     checked(engine.connect({src}, {matrix}));
     checked(engine.connect({matrix}, {sink}));
-    checked(engine.prepare());
-    checked(clock.tick());
+    checked(engine.commit());
+    clock.start();
+    clock.advance();
     const auto *out = checked(engine.node<PacketSink>(sink));
     check(out->sample(0, 0) == -0.25f && out->sample(0, 1) == 3.5f,
           "Matrix rows map and combine source channels with gain");
@@ -38,40 +39,49 @@ void matrix_validation()
     Matrix matrix(rate, 1);
     expect_error(ErrorCode::InvalidArg, matrix.set_gain(nan));
 }
-void gain_ramp_and_zero()
+void check_gain_ramp(bool identity)
 {
     Engine engine(period);
-    ManualClock clock(engine);
+    ClockedGraph clock(engine);
     const auto source = checked(engine.emplace_node<FloatSource>(
         rate, 1, [](std::uint64_t frame, std::size_t)
         { return frame % 240 == 119 ? std::numeric_limits<float>::quiet_NaN() : 1.0f; }));
-    const auto matrix = checked(engine.emplace_node<Matrix>(rate, 1));
+    const auto matrix = checked(identity ? engine.emplace_node<Matrix>(rate, 1)
+                                         : engine.emplace_node<Matrix>(rate, 1, 1, std::initializer_list<float>{2}));
     const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1)));
     checked(engine.connect({source}, {matrix}));
     checked(engine.connect({matrix}, {sink}));
-    checked(engine.prepare());
-    checked(clock.tick());
+    checked(engine.commit());
+    clock.start();
+    clock.advance();
     auto *gain = checked(engine.node<Matrix>(matrix));
     auto *out = checked(engine.node<PacketSink>(sink));
     checked(gain->set_gain(-1));
-    checked(clock.tick());
-    check(std::abs(out->sample(0) - (1.0f - 2.0f / 240)) < 1e-6 && out->sample(119) == 0 && out->sample(239) == -1,
+    clock.advance();
+    const auto coefficient = identity ? 1.0f : 2.0f;
+    check(std::abs(out->sample(0) - coefficient * (1.0f - 2.0f / 240)) < 1e-6 && out->sample(119) == 0 &&
+              out->sample(239) == -coefficient,
           "Gain ramps have exact endpoints and skip an exactly zero crossing");
     checked(gain->set_gain(0));
-    checked(clock.tick());
-    checked(clock.tick());
+    clock.advance();
+    clock.advance();
     for (std::size_t frame = 0; frame < 240; ++frame)
         check(out->sample(frame) == 0, "Zero gain suppresses non-finite inputs");
     checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1)));
-    checked(engine.prepare());
-    checked(clock.tick());
+    clock.commit();
+    clock.advance();
     check(out->sample(0) == 0, "A graph rebuild preserves the matrix target and current gain");
+}
+void gain_ramp_and_zero()
+{
+    check_gain_ramp(true);
+    check_gain_ramp(false);
 }
 void mixer_mute()
 {
     expect_exception<std::invalid_argument>([] { Mixer(rate, 1, 0); });
     Engine engine(period);
-    ManualClock clock(engine);
+    ClockedGraph clock(engine);
     const auto a = checked(engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 1.0f; }));
     const auto b = checked(engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 2.0f; }));
     const auto mix = checked(engine.emplace_node<Mixer>(rate, 1, 2));
@@ -79,20 +89,21 @@ void mixer_mute()
     checked(engine.connect({a}, {mix, 0}));
     checked(engine.connect({b}, {mix, 1}));
     checked(engine.connect({mix}, {sink}));
-    checked(engine.prepare());
-    checked(clock.tick());
+    checked(engine.commit());
+    clock.start();
+    clock.advance();
     auto *mixer = checked(engine.node<Mixer>(mix));
     auto *out = checked(engine.node<PacketSink>(sink));
     check(out->sample(0) == 3, "Both mixer inputs contribute");
     expect_error(ErrorCode::InvalidPort, mixer->set_muted(2, true));
     checked(mixer->set_muted(0, true));
-    checked(clock.tick());
+    clock.advance();
     check(std::abs(out->sample(0) - (3.0f - 1.0f / 240)) < 1e-6 && out->sample(239) == 2,
           "An input mute ramps only that source");
-    checked(clock.tick());
+    clock.advance();
     check(out->sample(0) == 2, "Mute remains stable");
     checked(mixer->set_muted(0, false));
-    checked(clock.tick());
+    clock.advance();
     check(out->sample(239) == 3, "Unmute restores the selected source");
 }
 void empty_block_ramps()

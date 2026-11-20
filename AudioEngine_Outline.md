@@ -1,8 +1,8 @@
 # AEReborn：音频引擎框架草案
 
-项目使用 C++14。默认时钟使用 standalone Asio。设备、文件和网络后端沿用本稿定义的运行边界。
-命名空间统一为 `aereborn`，方向类型采用 `IPort/OPort`、`IBlock/OBlock` 的对称命名。
-离线图和虚拟 PCM 路径已由第一阶段验证。第二阶段由时钟驱动同一套渲染逻辑，实际 API、运行约定和构建方法见第 7 节。
+项目使用 C++14。Engine 由内置软件时钟线程推进。设备、文件和网络后端沿用本稿定义的运行边界。
+命名空间统一为 `aereborn`。命名规则见 [编程约束](CODING_GUIDELINES.md#1-命名)。
+图处理和虚拟 PCM 使用同一套渲染逻辑。API、运行约定和构建方法见第 7 节。
 
 ## 1. 参考与取舍
 
@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | [JUCE AudioProcessorGraph](https://docs.juce.com/master/classjuce_1_1AudioProcessorGraph.html) | 处理器组成节点图，通过通道连接；提供图重建机制 | 统一 Node/Port/Connection，将图描述编译为执行计划 |
 | [JACK 实时处理回调](https://jackaudio.org/api/group__ClientCallbacks.html) | 处理回调禁止内存分配及可能阻塞的 I/O、锁和等待 | 音频执行路径只处理已准备的数据，外部工作通过有界队列交换 |
-| [PipeWire 图运行](https://docs.pipewire.org/devel/page_running.html)、[调度](https://docs.pipewire.org/page_scheduling.html)、[时钟](https://docs.pipewire.org/page_man_pipewire-props_7.html) | 调度组选择 driver；配置与数据处理分离；区分设备时钟并适配 | 第一版只做一个渲染执行域、一个 ClockDriver，预留边界时钟适配 |
+| [PipeWire 图运行](https://docs.pipewire.org/devel/page_running.html)、[调度](https://docs.pipewire.org/page_scheduling.html)、[时钟](https://docs.pipewire.org/page_man_pipewire-props_7.html) | 调度组选择 driver；配置与数据处理分离；区分设备时钟并适配 | 每个 Engine 由一条软件时钟线程驱动，设备通过边界适配 |
 | [FMOD 混音与连接](https://www.fmod.com/docs/2.04/api/mixing-and-routing-in-the-core-api.html)、[DSPConnection](https://www.fmod.com/docs/2.04/api/core-api-dspconnection.html) | 总线分组、子混音、效果处理；连接持有增益和声道矩阵 | Connection 只读共享同规格端口的数据；Mixer 混音，Matrix 处理声道矩阵与增益，Convert 转换格式与采样率 |
 
 第一版不做多进程共享图、节点并行调度、插件宿主或完整 DAW 自动化系统。先实现能运行、能恢复、能验证的单进程引擎。
@@ -31,9 +31,9 @@ Node A 的 OPort ── Connection ──> Node B 的 IPort
 | Port | 节点上的多声道音频入口或出口，固定声明采样率、声道数和格式 |
 | Connection | 将上游输出零拷贝地借给同规格的下游输入，只读 |
 
-Port 按方向使用 `IPort/OPort` 引用。`PortSpec` 固定声明采样率、声道数和格式。连接两端必须完全一致，否则返回 `FormatMismatch`；需要转换时显式插入 Convert。一个输入端口只能接一个来源，重复占用返回 `InputConnected`，多路求和使用 Mixer 的不同输入。没有连接的输入得到该格式的零值静音。
+`IPort` 和 `OPort` 用节点 ID 和从零开始的下标定位端口。`PortSpec` 固定声明采样率、声道数和 `SampleFormat`。连接两端必须完全一致，否则返回 `FormatMismatch`；需要转换时显式插入 Convert。一个输入端口只能接一个来源，重复占用返回 `InputConnected`，多路求和使用 Mixer 的不同输入。没有连接的输入得到该格式的零值静音。
 一个 Port 表示一组声道，声道间的选择、复制和合并由 Matrix 表达。
-`NodeId/ConnId` 是类型化句柄，原型采用进程内不复用的唯一 ID。Node 不持有其他 Node 的共享所有权，也不各自维护连接列表或调度循环。
+`NodeId` 标识图中的节点，替换节点实例时 ID 继续有效。`ConnId` 标识一次连接，重新连接相同端口会生成新的 ID。原型采用进程内不复用的唯一 ID。Node 不持有其他 Node 的共享所有权，也不各自维护连接列表或调度循环。
 
 Source、Processor、Mixer、Sink 是具体节点的用途。`plugins/` 中的 Capture、Playback 是设备缓冲交接节点，Convert 是格式与采样率转换节点。Mixer、Matrix 和 Tone 是只支持 planar float 的普通插件；算法节点可以声明自己需要的 PCM 格式。
 
@@ -44,12 +44,12 @@ Source、Processor、Mixer、Sink 是具体节点的用途。`plugins/` 中的 C
 | Mixer | 显式合并多个相同规格的输入 | `Mixer` |
 | Sink | 消费音频并交给设备 | `Playback` |
 
-PCM 适配器和固定端口数量的自定义节点通常继承 `NodeT<I, O>`，由它保存端口描述。节点在 `prepare(BlockPeriod)` 中按周期准备资源，在 `process()` 中从上下文读取周期，数据规格来自自身端口。端口数量由运行时决定的节点可以直接继承 `Node`，通过 `inputs()/outputs()` 提供固定的端口描述。引擎持有节点期间借用这些描述，节点负责保持描述及其存储有效。
+PCM 适配器和固定端口数量的自定义节点通常继承 `NodeT<I, O>`，由它保存端口描述。具体节点实现 `prepare(BlockPeriod)`，按周期准备资源，无需准备资源时直接返回成功。节点在 `process()` 中从上下文读取周期，数据规格来自自身端口。端口数量由运行时决定的节点可以直接继承 `Node`，通过 `inputs()/outputs()` 提供固定的端口描述。引擎持有节点期间借用这些描述，节点负责保持描述及其存储有效。
 后续设备、文件、网络、滤波等节点遵循同一边界。Bus 表示 Mixer 与效果节点构成的应用层总线，不是新的核心基类。
 
 ### 从输出创建输入：直接复用端口
 
-任何 OPort 都能继续连接到其他节点。Bus 可提供 PreEffects、PostEffects、PostFader 等命名输出位置，第一版先提供最终输出。
+任何 `OPort` 都能继续连接到其他节点。Bus 可提供 PreEffects、PostEffects、PostFader 等命名输出位置，第一版先提供最终输出。
 需要取得总线音频时，从相应输出连接普通 Sink；需要其他数据规格时连接 Convert，再由算法节点或 Playback 消费结果。图核心不提供独立的端口订阅机制。
 编译器保证一个节点每个渲染块只执行一次，同一输出供多个下游只读使用；需要修改数据的下游使用自己的工作缓冲。
 
@@ -58,53 +58,40 @@ PCM 适配器和固定端口数量的自定义节点通常继承 `NodeT<I, O>`�
 
 ## 3. 引擎骨架
 
-core 提供 Node、端口描述、只读/可写块视图、ClockDriver 和 Engine。plugins 提供按功能命名的 Convert、Mixer、Matrix、Capture、Playback、Tone。
+core 提供 Node、端口描述、只读/可写块视图和 Engine。plugins 提供按功能命名的 Convert、Mixer、Matrix、Capture、Playback、Tone。
 
-Engine 持有编辑图和渲染计划。prepare() 按依赖排序，从无输出的 Sink 遍历可达节点；未连接到 Sink 的分支不执行。每个可达节点每周期只执行一次。
+Engine 持有编辑图和渲染计划。`commit()` 按依赖排序，从无输出的 Sink 遍历可达节点；未连接到 Sink 的分支不执行。每个可达节点每周期只执行一次。
 
 引擎按各端口的最大周期帧数分配两块连续缓冲池，分别存放 F32P 的 float 对象和交错 PCM 的字节。连接输入只读借用上游输出；未连接的输入按存储类型共享缓冲池开头的只读零区间。所有缓冲和块视图由 Engine 管理。
 
-`ProcContext` 提供 `block_period`、`tick_position`、`inputs` 和 `outputs`。IPortBlock / OPortBlock 携带端口规格和本周期实际帧数。普通 float 插件声明 F32P 后使用 `audio()` 取得 IBlock / OBlock；每声道按本周期实际帧数紧凑排列，声道偏移可随 tick 改变。PCM 插件使用 `bytes()`。视图只在 `process()` 调用内有效，节点必须写满自己的输出。
+`ProcessContext` 提供 `block_period`、`tick_position`、`inputs` 和 `outputs`。`IPortBlock` 只读，`OPortBlock` 可写，两者都携带缓冲地址、端口规格和本周期实际帧数。`byte_view()` 按原格式借用字节，适用于所有格式。`f32p_view()` 用于 F32P 端口，返回 `IFBlock` 或 `OFBlock`，声道步长为本周期的实际帧数。`FloatBlock` 也可借用插件工作区的分声道浮点样本，此时声道步长可以大于实际帧数。端口提供的视图只在 `process()` 调用内有效，节点必须写满自己的输出。
 
-渲染计划直接保存已绑定的输入、输出视图，每个 tick 只更新实际帧数。构图节点索引在 prepare() 返回前释放，缓冲归属由计划统一保存。
+渲染计划用两个连续数组保存已绑定的输入、输出视图，每个节点按端口范围访问。包含分数帧端口的计划在每个 tick 更新实际帧数，全整数帧计划使用预先绑定的帧数。缓冲和节点引用由计划统一持有。
 
-控制侧 prepare() 完成所有分配和节点准备，再提交至多一个待应用计划；音频线程在周期边界接管，只用原子变量确认版本。节点身份不变时保留 DSP 状态。控制侧或回收线程在确认切换后释放旧计划。回收线程在运行中的首次提交时创建，仅在有待应用计划时定时检查。
+控制侧 `commit()` 完成分配和节点准备。运行时，时钟线程在块边界从原子槽接管计划，控制侧等待接管后同步释放旧计划及仅由旧计划持有的节点。沿用的节点实例保留 DSP 状态。
 
 ## 4. 执行与时钟
 
-第一版只有一个串行渲染执行域：任意时刻只有一个执行上下文可以调用 render。
-选定的 ClockDriver 驱动整张图，其他设备仅通过边界适配器交换数据，不分别执行同一张图。
-引擎周期是运行时的基础节拍。当前 Capture / Playback 每次交接一个基础周期的数据；后端负责将实际硬件收发整理为这个粒度，不要求硬件周期本身与图周期相同。跨周期拼拆包插件留待后续实现。
+每个运行中的 Engine 由一条内置软件时钟线程串行执行渲染。设备通过边界适配器交换数据。当前 Capture / Playback 每次交接一个基础周期的数据，后端负责将实际硬件收发整理为这个粒度。跨周期拼拆包留待后续实现。
 
-| 场景 | ClockDriver |
-| --- | --- |
-| 主设备周期等于引擎周期 | 该设备的音频回调或设备 I/O 线程可提供基础节拍 |
-| 设备周期覆盖多个引擎周期 | 由基础周期驱动器推进图，设备在各自的周期边界收发 |
-| 主设备掉线、纯网络或无物理设备 | 独立的 TimerDriver，保持逻辑时间推进 |
-| 确定性测试 | 测试时钟逐块触发 |
+Engine(BlockPeriod) 固定推进周期。调用方可用 block_period() 查询周期，节点可从 ProcessContext 读取周期。tick_position() 返回已完成的周期数，停止后重启继续计数，reset() 归零。每个 process() 收到本周期开始时的 tick_position。
 
-主设备由显式配置或确定的选择策略指定，可以是采集或播放设备，不把某一方向写死为主时钟。
-主设备能提供基础节拍时，可以直接在其回调或设备线程执行渲染。
-主驱动切换须先确认旧驱动退出，再接管执行权；帧序号继续递增，并报告时钟切换或数据不连续。
-
-Engine(BlockPeriod) 只固定推进周期，不持有全局采样率或音频格式。驱动在 start() 时收到周期，节点可从 ProcContext 读取周期。tick_position() 返回已完成的周期数，停止后重启继续计数，reset() 归零。每个 process() 收到本周期开始时的 tick_position。
-
-端口只支持 `SampleRate` 枚举中的采样率，单位为 Hz。当前为 8000、11025、16000、22050、24000、32000、44100、48000、88200 和 96000。Format::F32P 是原生 planar float32；S16LE、S24_3LE、S24LE、S32LE、F32LE 是交错小端 PCM。连接匹配包含采样率、声道数、样本格式及其布局，不做自动协商或隐式转换。
+端口只支持 `SampleRate` 枚举中的采样率，单位为 Hz。当前为 8000、11025、16000、22050、24000、32000、44100、48000、88200 和 96000。SampleFormat::F32P 是原生 planar float32；S16LE、S24_3LE、S24LE、S32LE、F32LE 是交错小端 PCM。连接匹配包含采样率、声道数、样本格式及其布局，不做自动协商或隐式转换。
 
 每个端口按累计时间的向上取整差值计算本周期实际帧数。44.1 kHz / 5 ms 为 221、220 帧交替，11.025 kHz 等规格也不逐周期独立取整；PortSpec::max_frames() 用于容量，frames() 和 frame_position() 用于实际块与该端口的样本时间。不同采样率端口仍由同一个基础周期驱动。Convert 将分数相位对齐到共享 tick，运行中新增或替换节点不会另起采样时钟。
 
-ClockDriver 每次触发一个完整周期，包括空图。默认时钟仍使用 standalone Asio 的单调定时器，延误时跳过过期定时期限，逻辑时间只按实际执行的 tick 前进。本轮所有可达节点每 tick 调用一次；不同算法处理间隔、独立设备时钟和跨周期拼拆包留给后续插件。
+内置时钟用 steady_clock 和 condition_variable::wait_until 调度，包括空图在内的每个 tick 都执行一个完整周期。延误时跳过过期的唤醒期限，逻辑时间按实际执行的 tick 前进。
 
 从设备与引擎时钟不一致时，在边界做缓冲与自适应重采样。即使标称采样率相同，也不能默认两个设备共享时钟。
 
-### Asio 与实时处理的边界
+### 控制与实时处理的边界
 
-Asio 负责控制命令、UDP I/O、设备事件、恢复定时及非实时任务协调。
+应用负责串行执行 Engine 的控制操作。应用可以用 Asio strand 承载控制命令，也可以独立使用 Asio 协调网络 I/O、设备事件和恢复定时。
 设备打开/关闭、文件访问、编解码和应用回调都在非渲染路径完成。设备必要的实时缓冲交付由平台后端封装。
-音频路径不分配/释放堆内存，不等待互斥锁，不打印日志，不调用普通应用回调，也不依赖一次 asio::post 在截止时间前完成。
+音频路径只读写已准备的缓冲，避免堆操作、锁等待、日志和应用回调。
 
 ```text
-Asio 控制执行器 ──> 计划/参数 ──> 渲染路径
+应用串行控制执行器 ──> 计划/参数 ──> 渲染路径
 从设备 / 网络 / 文件 ──> 有界队列 ──> 音频入口节点
 音频出口节点 ──> 有界队列 ──> 从设备 / 网络 / 文件
 音频出口节点 ──> 有界队列 ──> 用户回调执行器
@@ -150,7 +137,7 @@ Matrix 的行是目标声道，列是源声道，系数可用于选取、复制�
 
 ## 7. 时钟运行 API
 
-应用创建 Engine，加入节点、连接端口、调用 prepare()，再用 start() 启动时钟。示例演示 Tone → Mixer → Matrix → 电平 Sink，以及运行中修改 Matrix 增益。[时钟运行示例](examples/clocked_graph.cpp)
+应用创建 Engine，加入节点、连接端口、调用 `commit()`，再用 `start()` 启动时钟。示例演示 Tone → Mixer → Matrix → 电平 Sink，以及运行中修改 Matrix 增益。[时钟运行示例](examples/clocked_graph.cpp)
 
 ### 固定能力与连接检查
 
@@ -180,7 +167,7 @@ Tone / BUS（48k F32P）
 | Playback(spec) | (1,0) | 将输入复制进后端绑定的一周期缓冲；无缓冲时丢弃数据 |
 | Tone(rate, channels, frequency, amplitude) | (0,1) | 按端口样本时间生成 F32P 正弦波 |
 
-内置插件在构造时校验固定端口和参数，规格错误抛出 `std::invalid_argument`，静态配置超出容量抛出 `std::length_error`。`prepare(BlockPeriod)` 校验周期和所需的平台能力，按周期准备运行状态及工作区。应用也可通过 `Engine::add_node()` 加入自定义节点，引擎继续校验端口声明。
+内置插件在构造时校验固定端口和参数，规格错误抛出 `std::invalid_argument`，静态配置超出容量抛出 `std::length_error`。`Engine::commit()` 先校验周期，再开始构建计划。节点的 `prepare(BlockPeriod)` 接收已校验的周期，检查自身的平台和资源条件，并准备运行状态及工作区。应用也可通过 `Engine::add_node()` 加入自定义节点，引擎继续校验端口声明。
 
 相同规格的 Convert 按字节直通，无需转换状态或工作区；同采样率 PCM → F32P 直接写入 Engine 输出，不经中间 float 缓冲。其余路径只准备实际转换需要的工作区。
 
@@ -188,18 +175,19 @@ Tone / BUS（48k F32P）
 
 ### 运行控制与缓冲交接
 
-- 图编辑修改草稿，prepare() 返回计划版本；运行时在块边界生效，applied_revision() 返回已接管的版本。已有待应用计划时再次提交新草稿返回 BufferFull；准备失败保留当前计划。
-- replace_node() 要求输入、输出的数量及完整规格相同，否则返回 FormatMismatch。改变设备格式时，显式替换相应设备节点与 Convert 并重建连接，可用一次 prepare() 共同提交；稳定的下游 float 节点继续运行。
+- 图编辑修改草稿。`commit()` 返回 `RetCode`。停机时新计划立即生效。运行时，成功返回表示时钟已在块边界接管新计划，旧计划已由调用线程释放。首个新块的处理可能仍在进行。草稿未改动时直接返回成功，准备失败保留当前计划。
+- replace_node() 要求输入、输出的数量及完整规格相同，否则返回 FormatMismatch。改变设备格式时，显式替换相应设备节点与 Convert 并重建连接，可用一次 `commit()` 共同提交；稳定的下游 float 节点继续运行。
 - set_paused() 通过计划移除或恢复节点及相关连接，未改动实例保留状态。暂停导致某个输入失去来源时，该输入得到静音。需要平滑暂停时，先淡出 Matrix 增益或静音 Mixer 输入，再提交暂停。
-- `Matrix::set_gain()` 和 `Mixer::set_muted()` 使用无锁原子目标，可与 `process()` 并发调用。处理块读取最新目标。控制侧从 `Engine::node()` 借用草稿节点指针，须在节点被移除或替换前结束使用，最长有效期到 Engine 析构。
-- Capture / Playback 在 prepare() 后接受 bind(bytes, tick_position)，字节数必须恰好等于该 tick 的端口帧数乘声道数和样本宽度。已有绑定时返回 BufferFull；绑定和 reset 与处理串行，借用内存在指定 tick 结束前保持有效。未来 tick 的绑定保留到该 tick，过期数据不再输出。重新准备不同周期时释放已有绑定。
-- 测试驱动或主设备回调可在同一串行执行域内绑定单个图周期的缓冲。设备 I/O、跨线程队列、长设备包及完成通知由后端负责。
-- stop() 等待驱动和在途处理退出，停止回收线程，应用已接受的计划并释放旧计划；reset() 只允许在停止时调用，归零 tick 并重置节点。处理或准备期间同步修改 Engine 返回 Busy，tick_position() 和 applied_revision() 可并发查询。
-- 处理路径不分配/释放内存、不等待锁、不调用普通应用回调。异步使用块数据必须在 process() 返回前复制到后端自有缓冲。
+- `Matrix::set_gain()` 和 `Mixer::set_muted()` 使用原子目标，可与 `process()` 并发调用。处理块读取最新目标。控制侧从 `Engine::node()` 借用草稿节点指针，须在节点被移除或替换前结束使用，最长有效期到 Engine 析构。
+- Capture / Playback 在节点准备完成后接受 bind(bytes, tick_position)，字节数必须恰好等于该 tick 的端口帧数乘声道数和样本宽度。已有绑定时返回 BufferFull；绑定和 reset 与处理串行，借用内存在指定 tick 结束前保持有效。未来 tick 的绑定保留到该 tick，过期数据不再输出。重新准备不同周期时释放已有绑定。
+- 控制侧可在启动之前绑定单周期缓冲。运行时的跨线程供给由后端队列负责。
+- `stop()` 唤醒时钟并等待在途处理退出。`reset()` 在停机时归零 tick 并重置节点。
+- 调用方在控制侧串行执行控制接口和析构。同一 Engine 的时钟线程同步调用控制接口时返回 `Busy`。节点需要请求修改引擎时，将操作延后投递到应用的串行执行器并直接返回，例如使用 `asio::post`。实例有效期间可并发读取 `block_period()` 与 `tick_position()`。
+- 处理路径尽量避免锁等待，禁止堆分配、释放和调用普通应用回调。异步使用块数据必须在 process() 返回前复制到后端自有缓冲。
 
 ### 构建与验证
 
-项目使用 C++14、standalone Asio 和 Threads。CMake 搜索仓库根目录的 asio-1.30.2/include；其他位置通过 ASIO_INCLUDE_DIR 指定。应用链接 aereborn::plugins，单独使用核心可链接 aereborn::core。
+项目使用 C++14，core 通过 CMake 链接 Threads::Threads。应用链接 aereborn::plugins，单独使用核心可链接 aereborn::core。
 
 ~~~powershell
 cmake -S . -B build -DBUILD_TESTING=ON
@@ -209,7 +197,7 @@ cmake --build build --config Release --parallel 4
 ctest --test-dir build -C Release --output-on-failure
 ~~~
 
-测试按 core、runtime、routing、convert、resampling、mix、device、tone、allocation、example 分组。混音、格式转换和重采样使用独立字节或数值参照；完整算法链验证不同格式节点直接连线。覆盖分数帧、格式拒绝、禁止隐式混音、只读共享、参数斜坡、计划切换、停止屏障、失败恢复和实时路径无堆操作。
+测试按 core、runtime、routing、convert、resampling、mix、device、tone、allocation、example 分组。引擎测试使用内置时钟，通过测试节点在块边界与测试控制侧同步。混音、格式转换和重采样使用独立字节或数值参照；完整算法链验证不同格式节点直接连线。覆盖分数帧、格式拒绝、禁止隐式混音、只读共享、参数斜坡、计划切换、停止屏障、失败恢复和实时路径无堆操作。
 
 MSVC Debug 的迭代器代理会在 noexcept 构造中分配内存，allocation 用例按项目规则跳过，在 Release 完整执行。示例由默认开启的 BUILD_EXAMPLES 控制。
 
@@ -218,13 +206,13 @@ MSVC Debug 的迭代器代理会在 noexcept 构造中分配内存，allocation 
 ## 8. 实现顺序
 
 1. **离线图核心**：Node、Port、Connection、音频块及 Engine 的准备与执行。用插件节点验证多对多、处理器串联、总线互连、输出分发、环路拒绝。
-2. **运行内核**：ClockDriver、块边界计划切换、插件参数、显式 Mixer/Matrix、停止屏障。验证调音量不重建图，修改连接不重置未变节点的状态。
-3. **一个平台的设备闭环**：主设备驱动、多设备边界适配、DeviceSession、热插拔与恢复。验证同一张图只被一个驱动执行，拔插不破坏其他连接；再接另一个平台。
+2. **运行内核**包括内置软件时钟、块边界计划切换、同步提交、插件参数、显式 Mixer/Matrix 和停止屏障。验证调音量时复用图计划，修改连接时保留未变节点的状态。
+3. **一个平台的设备闭环**包括多设备边界适配、DeviceSession、热插拔与恢复。验证通过缓冲交付音频，拔插期间其他连接继续处理，再接入另一个平台。
 4. **文件、推入和混音策略**：预读/录制、PlaybackHandle、PushSource、DSP 链、ducking。验证多实例、循环、过载报告和增益包络。
 5. **网络**：先 PCM，再 Opus、乱序/抖动缓冲与丢包恢复；验证本地与远程源进入同一 Bus，断网后有界退化并恢复。
 
-第一步先写少量核心类型和离线执行，不接系统设备，不启动 Asio 线程。每一步复用同一张图与同一套节点执行机制。
+各阶段复用同一张图与同一套节点执行机制。
 
-第一步的验收用例包括 `core.audio_block_layout`、`core.prepare_retry`、`routing.explicit_mix_and_fanout`、`routing.algorithm_chain`、`routing.silence_and_pruning` 和 `core.feedback_rejection`。路由走实际的 Convert、Mixer 和 Matrix，算法由声明固定 PCM 格式的测试节点提供。
+第一步的验收用例包括 `core.audio_block_layout`、`core.commit_retry`、`routing.explicit_mix_and_fanout`、`routing.algorithm_chain`、`routing.silence_and_pruning` 和 `core.feedback_rejection`。路由走实际的 Convert、Mixer 和 Matrix，算法由声明固定 PCM 格式的测试节点提供。
 
 第二步的验收覆盖 `runtime` 用例、`allocation.render_uses_prepared_buffers` 和 `example.clocked_graph`。

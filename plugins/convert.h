@@ -11,7 +11,7 @@ class Convert final : public NodeT<1, 1>
     Convert(PortSpec input, PortSpec output);
     ~Convert() override;
     RetCode prepare(BlockPeriod period) override;
-    void process(const ProcContext &context) noexcept override;
+    void process(const ProcessContext &context) noexcept override;
     void reset() noexcept override;
 
   private:

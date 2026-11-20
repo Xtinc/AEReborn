@@ -1,10 +1,9 @@
 #include "engine.h"
-#include "runtime.h"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -15,20 +14,7 @@ namespace aereborn
 {
 namespace
 {
-thread_local const void *engine_execution_context = nullptr;
-
-class EngineExecutionScope
-{
-  public:
-    explicit EngineExecutionScope(const void *context) noexcept : previous_(engine_execution_context)
-    {
-        engine_execution_context = context;
-    }
-    ~EngineExecutionScope() { engine_execution_context = previous_; }
-
-  private:
-    const void *previous_;
-};
+thread_local const Engine *clock_engine = nullptr;
 
 std::uint64_t next_identifier() noexcept
 {
@@ -36,40 +22,13 @@ std::uint64_t next_identifier() noexcept
     return next.fetch_add(1, std::memory_order_relaxed);
 }
 
-struct GraphNode
-{
-    explicit GraphNode(std::unique_ptr<Node> instance)
-        : node(std::move(instance)), inputs(node->inputs()), outputs(node->outputs())
-    {
-    }
-    View<const PortSpec> ports(IPort) const noexcept { return inputs; }
-    View<const PortSpec> ports(OPort) const noexcept { return outputs; }
-    std::unique_ptr<Node> node;
-    const View<const PortSpec> inputs;
-    const View<const PortSpec> outputs;
-    bool prepared = false;
-};
 bool same_ports(View<const PortSpec> a, View<const PortSpec> b) noexcept
 {
     return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
 }
-struct Connection
+std::size_t pool_units_per_channel(SampleFormat format, std::size_t frames) noexcept
 {
-    OPort from;
-    IPort to;
-};
-
-struct DraftNode
-{
-    std::shared_ptr<GraphNode> entry;
-    // Points into the connection map. Only the control side reads these links.
-    std::vector<const Connection *> inputs;
-    bool paused = false;
-};
-
-std::size_t pool_units_per_channel(Format format, std::size_t frames) noexcept
-{
-    return format == Format::F32P ? frames : frames * sample_bytes(format);
+    return format == SampleFormat::F32P ? frames : frames * sample_bytes(format);
 }
 
 struct PoolSize
@@ -77,6 +36,7 @@ struct PoolSize
     const std::size_t limit;
     std::size_t outputs = 0;
     std::size_t silence = 0;
+    std::size_t offset = 0;
 
     bool count(PortSpec spec, BlockPeriod period, bool unconnected) noexcept
     {
@@ -95,72 +55,228 @@ struct PoolSize
         return silence <= limit - outputs;
     }
 };
-struct PlanNode
+struct PoolLayout
 {
-    NodeId id;
-    std::shared_ptr<GraphNode> entry;
-    std::vector<IPortBlock> inputs;
-    std::vector<OPortBlock> outputs;
-};
-struct RenderPlan
-{
-    PlanRevision revision = 0;
-    // The zero-filled prefix of each pool is shared by unconnected inputs.
-    std::vector<float> audio_pool;
-    std::vector<std::uint8_t> pcm_pool;
-    std::vector<PlanNode> nodes;
-    OPortBlock block(PortSpec spec, std::size_t frames, std::size_t offset) noexcept
+    PoolSize floats;
+    PoolSize bytes;
+    std::size_t input_count = 0;
+    std::size_t output_count = 0;
+
+    PoolSize &for_format(SampleFormat format) noexcept
     {
-        auto *data = spec.format == Format::F32P ? reinterpret_cast<std::uint8_t *>(audio_pool.data() + offset)
-                                                : pcm_pool.data() + offset;
-        return {data, spec, frames};
-    }
-    void render(BlockPeriod period, std::uint64_t tick) noexcept
-    {
-        for (auto &item : nodes)
-        {
-            for (auto &input : item.inputs)
-                input = {input.bytes().data(), input.spec(), input.spec().frames(period, tick)};
-            for (auto &output : item.outputs)
-                output = {output.bytes().data(), output.spec(), output.spec().frames(period, tick)};
-            item.entry->node->process(
-                {period, tick, {item.inputs.data(), item.inputs.size()}, {item.outputs.data(), item.outputs.size()}});
-        }
+        return format == SampleFormat::F32P ? floats : bytes;
     }
 };
-using NodeIndex = std::map<NodeId, std::size_t>;
-using Connections = std::map<ConnId, Connection>;
+
+template <class Block>
+View<const Block> port_range(const std::vector<Block> &blocks, std::size_t first, std::size_t count) noexcept
+{
+    if (count == 0)
+        return {};
+    return {blocks.data() + first, count};
+}
+struct NodeEntry
+{
+    NodeEntry(NodeId id, std::unique_ptr<Node> instance, View<const PortSpec> inputs, View<const PortSpec> outputs)
+        : id(id), node(std::move(instance)), inputs(inputs), outputs(outputs)
+    {
+    }
+    View<const PortSpec> ports(IPort) const noexcept
+    {
+        return inputs;
+    }
+    View<const PortSpec> ports(OPort) const noexcept
+    {
+        return outputs;
+    }
+
+    const NodeId id;
+    std::unique_ptr<Node> node;
+    const View<const PortSpec> inputs;
+    const View<const PortSpec> outputs;
+    bool prepared = false;
+};
+
+struct Link
+{
+    static constexpr auto unconnected = std::numeric_limits<std::size_t>::max();
+    std::size_t node_index = unconnected;
+    std::size_t port_index = 0;
+};
+
+struct Topology
+{
+    std::vector<std::shared_ptr<NodeEntry>> nodes;
+    std::vector<Link> links;
+};
 } // namespace
 
-struct Engine::Runtime
+class Engine::Graph
 {
-    explicit Runtime(BlockPeriod period) : period(period) {}
-    const BlockPeriod period;
-    std::map<NodeId, DraftNode> nodes;
-    Connections connections;
-    std::unique_ptr<RenderPlan> current;
-    std::unique_ptr<RenderPlan> pending;
-    std::mutex plans_mutex;
-    std::condition_variable plans_changed;
-    std::thread reclaimer;
-    bool stop_reclaimer = false;
-    std::atomic<RenderPlan *> published{nullptr};
-    std::unique_ptr<ClockDriver> driver;
-    std::atomic<PlanRevision> applied{0};
-    std::atomic<std::uint64_t> position{0};
-    bool dirty = true;
+  public:
+    Result<NodeId> add_node(std::unique_ptr<Node> instance)
+    {
+        if (!instance)
+            return ErrorCode::InvalidArg;
+        const auto inputs = instance->inputs();
+        const auto outputs = instance->outputs();
+        if (inputs.empty() && outputs.empty())
+            return ErrorCode::InvalidArg;
+        for (const auto ports : {inputs, outputs})
+            for (const auto &port : ports)
+                if (!port.valid())
+                    return ErrorCode::InvalidArg;
 
-    bool on_execution_thread() const noexcept { return engine_execution_context == this; }
+        std::vector<OPort> links(inputs.size());
+        const NodeId id{next_identifier()};
+        auto entry = std::make_shared<NodeEntry>(id, std::move(instance), inputs, outputs);
+        nodes_.emplace(id, DraftNode{std::move(entry), std::move(links)});
+        dirty_ = true;
+        return id;
+    }
+
+    RetCode remove_node(NodeId id) noexcept
+    {
+        const auto found = nodes_.find(id);
+        if (found == nodes_.end())
+            return ErrorCode::UnknownNode;
+        for (auto it = connections_.begin(); it != connections_.end();)
+            if (it->second.from.node == id || it->second.to.node == id)
+                it = erase_connection(it);
+            else
+                ++it;
+        dirty_ = true;
+        nodes_.erase(found);
+        return {};
+    }
+
+    RetCode replace_node(NodeId id, std::unique_ptr<Node> replacement)
+    {
+        const auto found = nodes_.find(id);
+        if (found == nodes_.end())
+            return ErrorCode::UnknownNode;
+        if (!replacement)
+            return ErrorCode::InvalidArg;
+        const auto inputs = replacement->inputs();
+        const auto outputs = replacement->outputs();
+        auto &current = found->second.entry;
+        if (!same_ports(current->inputs, inputs) || !same_ports(current->outputs, outputs))
+            return ErrorCode::FormatMismatch;
+        auto entry = std::make_shared<NodeEntry>(id, std::move(replacement), inputs, outputs);
+        dirty_ = true;
+        current = std::move(entry);
+        return {};
+    }
+
+    RetCode set_paused(NodeId id, bool paused)
+    {
+        const auto found = nodes_.find(id);
+        if (found == nodes_.end())
+            return ErrorCode::UnknownNode;
+        dirty_ |= found->second.paused != paused;
+        found->second.paused = paused;
+        return {};
+    }
+
+    Result<Node *> node(NodeId id) noexcept
+    {
+        const auto found = nodes_.find(id);
+        if (found == nodes_.end())
+            return ErrorCode::UnknownNode;
+        return found->second.entry->node.get();
+    }
+
+    Result<ConnId> connect(OPort from, IPort to)
+    {
+        const auto source = port_owner(from);
+        if (!source)
+            return source.ret_code();
+        const auto destination = port_owner(to);
+        if (!destination)
+            return destination.ret_code();
+        auto &draft = *destination.value();
+        if (source.value()->entry->outputs[from.index] != draft.entry->inputs[to.index])
+            return ErrorCode::FormatMismatch;
+        auto &input = draft.inputs[to.index];
+        if (input.node)
+            return input == from ? ErrorCode::DuplicateConn : ErrorCode::InputConnected;
+        if (would_cycle(from.node, to.node))
+            return ErrorCode::Cycle;
+        const ConnId id{next_identifier()};
+        connections_.emplace(id, Connection{from, to});
+        input = from;
+        dirty_ = true;
+        return id;
+    }
+
+    RetCode disconnect(ConnId id) noexcept
+    {
+        const auto found = connections_.find(id);
+        if (found == connections_.end())
+            return ErrorCode::UnknownConn;
+        erase_connection(found);
+        dirty_ = true;
+        return {};
+    }
+
+    Topology resolve() const
+    {
+        Topology topology;
+        NodeIndex node_index;
+        for (const auto &item : nodes_)
+            if (!item.second.paused && item.second.entry->outputs.empty())
+                visit(item.second, topology, node_index);
+
+        return topology;
+    }
+
+    bool owns(const NodeEntry &entry) const noexcept
+    {
+        const auto found = nodes_.find(entry.id);
+        return found != nodes_.end() && found->second.entry.get() == &entry;
+    }
+
+    void reset_nodes() noexcept
+    {
+        for (const auto &item : nodes_)
+            item.second.entry->node->reset();
+    }
+
+    bool dirty() const noexcept
+    {
+        return dirty_;
+    }
+
+    void mark_clean() noexcept
+    {
+        dirty_ = false;
+    }
+
+  private:
+    struct DraftNode
+    {
+        std::shared_ptr<NodeEntry> entry;
+        std::vector<OPort> inputs;
+        bool paused = false;
+    };
+    struct Connection
+    {
+        OPort from;
+        IPort to;
+    };
+    using Connections = std::map<ConnId, Connection>;
+    using NodeIndex = std::map<NodeId, std::size_t>;
     template <class Port> Result<DraftNode *> port_owner(Port port) noexcept
     {
-        const auto found = nodes.find(port.node);
-        if (found == nodes.end())
+        const auto found = nodes_.find(port.node);
+        if (found == nodes_.end())
             return ErrorCode::UnknownNode;
         const auto ports = found->second.entry->ports(port);
         if (port.index >= ports.size())
             return ErrorCode::InvalidPort;
         return &found->second;
     }
+
     bool would_cycle(NodeId from, NodeId to) const
     {
         std::vector<NodeId> stack{from};
@@ -171,394 +287,453 @@ struct Engine::Runtime
             stack.pop_back();
             if (id == to)
                 return true;
-            for (const auto *connection : nodes.find(id)->second.inputs)
-                if (connection && visited.insert(connection->from.node).second)
-                    stack.push_back(connection->from.node);
+            for (const auto input : nodes_.find(id)->second.inputs)
+                if (input.node && visited.insert(input.node).second)
+                    stack.push_back(input.node);
         }
+
         return false;
     }
+
     Connections::iterator erase_connection(Connections::iterator connection) noexcept
     {
         const auto to = connection->second.to;
-        nodes.find(to.node)->second.inputs[to.index] = nullptr;
-        return connections.erase(connection);
+        nodes_.find(to.node)->second.inputs[to.index] = {};
+        return connections_.erase(connection);
     }
-    const Connection *active_input(const Connection *connection) const noexcept
+
+    void visit(const DraftNode &draft, Topology &topology, NodeIndex &node_index) const
     {
-        return connection && !nodes.find(connection->from.node)->second.paused ? connection : nullptr;
-    }
-    RetCode visit(NodeId id, RenderPlan &plan, NodeIndex &node_index)
-    {
-        if (node_index.count(id))
-            return {};
-        const auto &draft = nodes.find(id)->second;
-        for (const auto *input : draft.inputs)
-            if (const auto *connection = active_input(input))
+        if (node_index.count(draft.entry->id))
+            return;
+
+        for (const auto input : draft.inputs)
+            if (input.node)
             {
-                const auto code = visit(connection->from.node, plan, node_index);
-                if (!code)
-                    return code;
+                const auto &source = nodes_.find(input.node)->second;
+                if (!source.paused)
+                    visit(source, topology, node_index);
             }
-        const auto &entry = draft.entry;
-        if (!entry->prepared)
+
+        node_index.emplace(draft.entry->id, topology.nodes.size());
+        topology.nodes.push_back(draft.entry);
+
+        // An absent source is unconnected or was excluded by pause.
+        for (const auto input : draft.inputs)
         {
-            const auto code = entry->node->prepare(period);
-            if (!code)
-                return code;
-            entry->prepared = true;
+            const auto source = input.node ? node_index.find(input.node) : node_index.end();
+            topology.links.push_back(source == node_index.end() ? Link{} : Link{source->second, input.index});
         }
-        node_index.emplace(id, plan.nodes.size());
-        plan.nodes.push_back(
-            {id, entry, std::vector<IPortBlock>(entry->inputs.size()), std::vector<OPortBlock>(entry->outputs.size())});
+    }
+
+    std::map<NodeId, DraftNode> nodes_;
+    Connections connections_;
+    bool dirty_ = true;
+};
+
+class Engine::Clock
+{
+  public:
+    ~Clock()
+    {
+        stop();
+    }
+
+    /// @brief Publish a plan under the clock mutex and wait for takeover.
+    /// @tparam Plan Type of the render plan exchanged with the clock.
+    /// @param submitted Slot that the clock clears after taking the plan.
+    /// @param plan New plan. The caller keeps ownership throughout the wait.
+    /// @pre The clock is running and the control side is the sole submitter.
+    template <class Plan> void submit_and_wait(std::atomic<Plan *> &submitted, Plan *plan)
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        submitted.store(plan, std::memory_order_release);
+        applied_.wait(lock, [&submitted]() noexcept { return submitted.load(std::memory_order_acquire) == nullptr; });
+    }
+
+    /// @brief Launch the worker that drives the engine's ticks.
+    /// @param engine Engine to drive, kept alive until the worker joins.
+    void start(Engine &engine)
+    {
+        stopping_ = false;
+        const auto interval = std::chrono::milliseconds(static_cast<std::uint32_t>(engine.period_));
+        const auto first_deadline = std::chrono::steady_clock::now() + interval;
+        thread_ = std::thread([this, &engine, interval, deadline = first_deadline]() mutable {
+            clock_engine = &engine;
+            std::unique_lock<std::mutex> lock(mutex_);
+            while (!changed_.wait_until(lock, deadline, [this] { return stopping_; }))
+            {
+                lock.unlock();
+                const bool swapped = engine.tick();
+                lock.lock();
+                if (swapped)
+                    applied_.notify_one();
+                const auto lateness = std::chrono::steady_clock::now() - deadline;
+                deadline += interval * (lateness >= interval ? lateness / interval + 1 : 1);
+            }
+        });
+    }
+
+    void stop() noexcept
+    {
+        if (!thread_.joinable())
+            return;
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        changed_.notify_one();
+        thread_.join();
+    }
+
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::condition_variable applied_;
+    bool stopping_ = false;
+    std::thread thread_;
+};
+
+class Engine::Runner
+{
+  public:
+    RetCode commit(Topology topology, BlockPeriod period, Clock *live_clock)
+    {
+        auto plan = std::make_unique<Plan>();
+        const auto code = build_plan(*plan, topology, period);
+        if (!code)
+            return code;
+
+        plan->owners = std::move(topology.nodes);
+        if (live_clock)
+            live_clock->submit_and_wait(submitted_, plan.get());
+        else
+            rendering_ = plan.get();
+        current_ = std::move(plan);
         return {};
     }
-    RetCode build_plan(RenderPlan &plan)
+
+    /// @brief Reset nodes held by the current plan after removal or replacement in the draft.
+    /// @param draft Graph whose node instances are reset separately.
+    /// @pre The clock is stopped.
+    void reset(const Graph &draft) noexcept
     {
-        if (!is_block_period(period))
-            return ErrorCode::InvalidArg;
-        NodeIndex node_index;
-        for (const auto &item : nodes)
-            if (!item.second.paused && item.second.entry->outputs.empty())
+        if (!current_)
+            return;
+        for (const auto &entry : current_->owners)
+            if (!draft.owns(*entry))
+                entry->node->reset();
+    }
+
+    bool render(BlockPeriod period, std::uint64_t tick) noexcept
+    {
+        const auto plan = submitted_.load(std::memory_order_acquire);
+        if (plan)
+        {
+            rendering_ = plan;
+            // The control side may now retire the previous plan.
+            submitted_.store(nullptr, std::memory_order_release);
+        }
+
+        rendering_->render(period, tick);
+        return plan != nullptr;
+    }
+
+  private:
+    struct Step
+    {
+        Node *node;
+        std::size_t first_input;
+        std::size_t input_count;
+        std::size_t first_output;
+        std::size_t output_count;
+    };
+    struct Plan
+    {
+        OPortBlock block(PortSpec spec, std::size_t frames, std::size_t offset) noexcept
+        {
+            auto *data = spec.format == SampleFormat::F32P
+                             ? reinterpret_cast<std::uint8_t *>(float_pool.data() + offset)
+                             : byte_pool.data() + offset;
+            return {data, spec, frames};
+        }
+
+        void render(BlockPeriod period, std::uint64_t tick) noexcept
+        {
+            if (has_fractional_ports)
             {
-                const auto code = visit(item.first, plan, node_index);
+                const auto refresh_frames = [period, tick](auto &block) noexcept {
+                    const auto spec = block.spec();
+                    block = {block.byte_view().data(), spec, spec.frames(period, tick)};
+                };
+                for (auto &input : inputs)
+                    refresh_frames(input);
+                for (auto &output : outputs)
+                    refresh_frames(output);
+            }
+
+            for (const auto &step : steps)
+                step.node->process({period, tick, port_range(inputs, step.first_input, step.input_count),
+                                    port_range(outputs, step.first_output, step.output_count)});
+        }
+
+        bool has_fractional_ports = false;
+        // The zero-filled prefix of each pool is shared by unconnected inputs.
+        std::vector<float> float_pool;
+        std::vector<std::uint8_t> byte_pool;
+        std::vector<IPortBlock> inputs;
+        std::vector<OPortBlock> outputs;
+        std::vector<Step> steps;
+        std::vector<std::shared_ptr<NodeEntry>> owners;
+    };
+
+    /// @brief Prepare nodes and build their execution steps and buffers.
+    /// @param plan Empty plan to populate.
+    /// @param topology Reachable nodes in dependency order and their input links.
+    /// @param period Validated block period shared by the plan and its nodes.
+    /// @return Success or a node preparation or capacity error.
+    static RetCode build_plan(Plan &plan, const Topology &topology, BlockPeriod period)
+    {
+        for (const auto &entry : topology.nodes)
+            if (!entry->prepared)
+            {
+                const auto code = entry->node->prepare(period);
                 if (!code)
                     return code;
+                entry->prepared = true;
             }
-        PoolSize audio{plan.audio_pool.max_size()}, pcm{plan.pcm_pool.max_size()};
-        for (const auto &item : plan.nodes)
+
+        PoolLayout layout{{plan.float_pool.max_size()}, {plan.byte_pool.max_size()}};
+        const auto code = measure_layout(plan, topology, period, layout);
+        if (!code)
+            return code;
+        bind_blocks(plan, topology, period, layout);
+        return {};
+    }
+
+    /// @brief Measure buffer capacity and record each node's port offsets.
+    /// @param plan Plan receiving the execution steps and fractional-frame flag.
+    /// @param topology Node order and input links used by those steps.
+    /// @param period Block duration used to size each port at its maximum frame count.
+    /// @param layout Pool limits and accumulated port and storage counts.
+    /// @return Success or `TooLarge` when a port table or buffer pool would exceed capacity.
+    static RetCode measure_layout(Plan &plan, const Topology &topology, BlockPeriod period, PoolLayout &layout)
+    {
+        const auto period_ms = static_cast<std::uint32_t>(period);
+        const auto fractional = [period_ms](PortSpec spec) {
+            return (static_cast<std::uint32_t>(spec.sample_rate) * period_ms) % 1000 != 0;
+        };
+        plan.steps.reserve(topology.nodes.size());
+        for (const auto &entry : topology.nodes)
         {
-            for (const auto spec : item.entry->outputs)
-                if (!(spec.format == Format::F32P ? audio : pcm).count(spec, period, false))
-                    return ErrorCode::TooLarge;
-            const auto &inputs = nodes.find(item.id)->second.inputs;
-            for (std::size_t port = 0; port < item.inputs.size(); ++port)
+            const auto inputs = entry->inputs;
+            const auto outputs = entry->outputs;
+            if (inputs.size() > plan.inputs.max_size() - layout.input_count ||
+                outputs.size() > plan.outputs.max_size() - layout.output_count)
+                return ErrorCode::TooLarge;
+            plan.steps.push_back(
+                {entry->node.get(), layout.input_count, inputs.size(), layout.output_count, outputs.size()});
+
+            for (const auto spec : outputs)
             {
-                if (active_input(inputs[port]))
+                if (!layout.for_format(spec.format).count(spec, period, false))
+                    return ErrorCode::TooLarge;
+                plan.has_fractional_ports |= fractional(spec);
+            }
+            for (std::size_t port = 0; port < inputs.size(); ++port)
+            {
+                if (topology.links[layout.input_count + port].node_index != Link::unconnected)
                     continue;
-                const auto spec = item.entry->inputs[port];
-                if (!(spec.format == Format::F32P ? audio : pcm).count(spec, period, true))
+                const auto spec = inputs[port];
+                if (!layout.for_format(spec.format).count(spec, period, true))
                     return ErrorCode::TooLarge;
+                plan.has_fractional_ports |= fractional(spec);
             }
+            layout.input_count += inputs.size();
+            layout.output_count += outputs.size();
         }
-        plan.audio_pool.resize(audio.silence + audio.outputs);
-        plan.pcm_pool.resize(pcm.silence + pcm.outputs);
-        auto audio_offset = audio.silence;
-        auto pcm_offset = pcm.silence;
-        for (auto &item : plan.nodes)
+        return {};
+    }
+
+    /// @brief Allocate buffers and bind their input and output views.
+    /// @param plan Plan owning the buffers and measured execution steps.
+    /// @param topology Input links and port specifications in execution order.
+    /// @param period Block duration used to size each bound block.
+    /// @param layout Measured capacity and pool offsets advanced during binding.
+    /// @pre measure_layout() succeeded for the same plan, topology, and period.
+    static void bind_blocks(Plan &plan, const Topology &topology, BlockPeriod period, PoolLayout &layout)
+    {
+        plan.inputs.resize(layout.input_count);
+        plan.outputs.resize(layout.output_count);
+        plan.float_pool.resize(layout.floats.silence + layout.floats.outputs);
+        plan.byte_pool.resize(layout.bytes.silence + layout.bytes.outputs);
+        layout.floats.offset = layout.floats.silence;
+        layout.bytes.offset = layout.bytes.silence;
+        // Outputs are bound upstream first. Connected inputs copy the corresponding read-only view.
+        for (std::size_t node_index = 0; node_index < topology.nodes.size(); ++node_index)
         {
-            for (std::size_t port = 0; port < item.outputs.size(); ++port)
+            const auto &entry = *topology.nodes[node_index];
+            const auto &step = plan.steps[node_index];
+            for (std::size_t port = 0; port < step.output_count; ++port)
             {
-                const auto spec = item.entry->outputs[port];
+                const auto spec = entry.outputs[port];
                 const auto frames = spec.max_frames(period);
-                auto &offset = spec.format == Format::F32P ? audio_offset : pcm_offset;
-                item.outputs[port] = plan.block(spec, frames, offset);
-                offset += spec.channels * pool_units_per_channel(spec.format, frames);
+                auto &pool = layout.for_format(spec.format);
+                plan.outputs[step.first_output + port] = plan.block(spec, frames, pool.offset);
+                pool.offset += spec.channels * pool_units_per_channel(spec.format, frames);
             }
-            const auto &inputs = nodes.find(item.id)->second.inputs;
-            for (std::size_t port = 0; port < item.inputs.size(); ++port)
+            for (std::size_t port = 0; port < step.input_count; ++port)
             {
-                if (const auto *connection = active_input(inputs[port]))
-                    item.inputs[port] =
-                        plan.nodes[node_index.find(connection->from.node)->second].outputs[connection->from.index];
+                const auto input_index = step.first_input + port;
+                const auto link = topology.links[input_index];
+                if (link.node_index != Link::unconnected)
+                    plan.inputs[input_index] = plan.outputs[plan.steps[link.node_index].first_output + link.port_index];
                 else
                 {
-                    const auto spec = item.entry->inputs[port];
-                    item.inputs[port] = plan.block(spec, spec.max_frames(period), 0);
+                    const auto spec = entry.inputs[port];
+                    plan.inputs[input_index] = plan.block(spec, spec.max_frames(period), 0);
                 }
             }
         }
-        return {};
     }
-    RenderPlan &apply_published() noexcept
-    {
-        // The acknowledged plan stays owned until a later tick acknowledges its replacement.
-        auto &plan = *published.load(std::memory_order_acquire);
-        if (applied.load(std::memory_order_relaxed) != plan.revision)
-            applied.store(plan.revision, std::memory_order_release);
-        return plan;
-    }
-    std::unique_ptr<RenderPlan> collect() noexcept
-    {
-        if (pending && applied.load(std::memory_order_acquire) == pending->revision)
-        {
-            auto retired = std::move(current);
-            current = std::move(pending);
-            return retired;
-        }
-        return {};
-    }
-    void reclaim_plans()
-    {
-        const EngineExecutionScope scope(this);
-        const auto check_delay = std::chrono::milliseconds(static_cast<std::uint32_t>(period));
-        std::unique_lock<std::mutex> lock(plans_mutex);
-        while (!stop_reclaimer)
-        {
-            plans_changed.wait(lock, [this] { return stop_reclaimer || pending; });
-            if (stop_reclaimer)
-                break;
-            if (auto retired = collect())
-            {
-                lock.unlock();
-                retired.reset();
-                lock.lock();
-            }
-            else
-            {
-                // Only check again while a submission is outstanding. The tick only acknowledges it atomically.
-                plans_changed.wait_for(lock, check_delay);
-            }
-        }
-    }
-    static void tick(void *context) noexcept
-    {
-        auto &runtime = *static_cast<Runtime *>(context);
-        const EngineExecutionScope scope(context);
-        const auto tick = runtime.position.load(std::memory_order_relaxed);
-        runtime.apply_published().render(runtime.period, tick);
-        runtime.position.store(tick + 1, std::memory_order_release);
-    }
+
+    std::unique_ptr<Plan> current_;
+    std::atomic<Plan *> submitted_{nullptr};
+    // Only the clock thread accesses this while running.
+    Plan *rendering_ = nullptr;
 };
 
-Engine::Engine(BlockPeriod period) : runtime_(std::make_unique<Runtime>(period)) {}
-Engine::~Engine()
+Engine::Engine(BlockPeriod period)
+    : period_(period), graph_(std::make_unique<Graph>()), runner_(std::make_unique<Runner>()),
+      clock_(std::make_unique<Clock>())
 {
-    stop();
+}
+
+// The clock is destroyed first and joins before the runner or graph is destroyed.
+Engine::~Engine() = default;
+
+bool Engine::on_clock_thread() const noexcept
+{
+    return clock_engine == this;
+}
+
+bool Engine::tick() noexcept
+{
+    const auto tick = position_.load(std::memory_order_relaxed);
+    const bool swapped = runner_->render(period_, tick);
+    position_.store(tick + 1, std::memory_order_release);
+    return swapped;
 }
 
 Result<NodeId> Engine::add_node(std::unique_ptr<Node> instance)
 {
-    if (runtime_->on_execution_thread())
+    if (on_clock_thread())
         return ErrorCode::Busy;
-    if (!instance)
-        return ErrorCode::InvalidArg;
-    auto entry = std::make_shared<GraphNode>(std::move(instance));
-    if (entry->inputs.empty() && entry->outputs.empty())
-        return ErrorCode::InvalidArg;
-    for (const auto ports : {entry->inputs, entry->outputs})
-        for (const auto &port : ports)
-            if (!port.valid())
-                return ErrorCode::InvalidArg;
-    const NodeId id{next_identifier()};
-    std::vector<const Connection *> inputs(entry->inputs.size());
-    runtime_->nodes.emplace(id, DraftNode{std::move(entry), std::move(inputs)});
-    runtime_->dirty = true;
-    return id;
+    return insert_node(std::move(instance));
 }
+
+Result<NodeId> Engine::insert_node(std::unique_ptr<Node> instance)
+{
+    return graph_->add_node(std::move(instance));
+}
+
 RetCode Engine::remove_node(NodeId id) noexcept
 {
-    auto &runtime = *runtime_;
-    if (runtime.on_execution_thread())
+    if (on_clock_thread())
         return ErrorCode::Busy;
-    const auto found = runtime.nodes.find(id);
-    if (found == runtime.nodes.end())
-        return ErrorCode::UnknownNode;
-    for (auto it = runtime.connections.begin(); it != runtime.connections.end();)
-        if (it->second.from.node == id || it->second.to.node == id)
-            it = runtime.erase_connection(it);
-        else
-            ++it;
-    runtime.nodes.erase(found);
-    runtime.dirty = true;
-    return {};
+    return graph_->remove_node(id);
 }
+
 RetCode Engine::replace_node(NodeId id, std::unique_ptr<Node> replacement)
 {
-    auto &runtime = *runtime_;
-    if (runtime.on_execution_thread())
+    if (on_clock_thread())
         return ErrorCode::Busy;
-    const auto found = runtime.nodes.find(id);
-    if (found == runtime.nodes.end())
-        return ErrorCode::UnknownNode;
-    if (!replacement)
-        return ErrorCode::InvalidArg;
-    auto entry = std::make_shared<GraphNode>(std::move(replacement));
-    auto &current = found->second.entry;
-    if (!same_ports(current->inputs, entry->inputs) || !same_ports(current->outputs, entry->outputs))
-        return ErrorCode::FormatMismatch;
-    current = std::move(entry);
-    runtime.dirty = true;
-    return {};
+    return graph_->replace_node(id, std::move(replacement));
 }
+
 RetCode Engine::set_paused(NodeId id, bool paused)
 {
-    auto &runtime = *runtime_;
-    if (runtime.on_execution_thread())
+    if (on_clock_thread())
         return ErrorCode::Busy;
-    const auto found = runtime.nodes.find(id);
-    if (found == runtime.nodes.end())
-        return ErrorCode::UnknownNode;
-    runtime.dirty |= found->second.paused != paused;
-    found->second.paused = paused;
-    return {};
+    return graph_->set_paused(id, paused);
 }
+
 Result<Node *> Engine::node(NodeId id) noexcept
 {
-    if (runtime_->on_execution_thread())
+    if (on_clock_thread())
         return ErrorCode::Busy;
-    const auto found = runtime_->nodes.find(id);
-    if (found == runtime_->nodes.end())
-        return ErrorCode::UnknownNode;
-    return found->second.entry->node.get();
+    return graph_->node(id);
 }
+
 Result<ConnId> Engine::connect(OPort from, IPort to)
 {
-    auto &runtime = *runtime_;
-    if (runtime.on_execution_thread())
+    if (on_clock_thread())
         return ErrorCode::Busy;
-    const auto source = runtime.port_owner(from);
-    if (!source)
-        return source.ret_code();
-    const auto destination = runtime.port_owner(to);
-    if (!destination)
-        return destination.ret_code();
-    auto &draft = *destination.value();
-    if (source.value()->entry->outputs[from.index] != draft.entry->inputs[to.index])
-        return ErrorCode::FormatMismatch;
-    auto &input = draft.inputs[to.index];
-    if (input)
-        return input->from.node == from.node && input->from.index == from.index ? ErrorCode::DuplicateConn
-                                                                               : ErrorCode::InputConnected;
-    if (runtime.would_cycle(from.node, to.node))
-        return ErrorCode::Cycle;
-    const ConnId id{next_identifier()};
-    const auto inserted = runtime.connections.emplace(id, Connection{from, to});
-    input = &inserted.first->second;
-    runtime.dirty = true;
-    return id;
+    return graph_->connect(from, to);
 }
+
 RetCode Engine::disconnect(ConnId id) noexcept
 {
-    auto &runtime = *runtime_;
-    if (runtime.on_execution_thread())
+    if (on_clock_thread())
         return ErrorCode::Busy;
-    const auto found = runtime.connections.find(id);
-    if (found == runtime.connections.end())
-        return ErrorCode::UnknownConn;
-    runtime.erase_connection(found);
-    runtime.dirty = true;
+    return graph_->disconnect(id);
+}
+
+RetCode Engine::commit()
+{
+    if (on_clock_thread())
+        return ErrorCode::Busy;
+    if (!is_block_period(period_))
+        return ErrorCode::InvalidArg;
+    if (!graph_->dirty())
+        return {};
+
+    const auto code = runner_->commit(graph_->resolve(), period_, state_ == State::Running ? clock_.get() : nullptr);
+    if (code)
+    {
+        graph_->mark_clean();
+        if (state_ == State::Unprepared)
+            state_ = State::Ready;
+    }
+    return code;
+}
+
+RetCode Engine::start()
+{
+    if (on_clock_thread() || state_ == State::Running)
+        return ErrorCode::Busy;
+    if (state_ == State::Unprepared)
+        return ErrorCode::NotPrepared;
+    clock_->start(*this);
+    state_ = State::Running;
     return {};
 }
-Result<PlanRevision> Engine::prepare()
-{
-    auto &runtime = *runtime_;
-    if (runtime.on_execution_thread())
-        return ErrorCode::Busy;
-    const EngineExecutionScope scope(&runtime);
-    std::unique_ptr<RenderPlan> retired;
-    PlanRevision revision;
-    {
-        const std::lock_guard<std::mutex> lock(runtime.plans_mutex);
-        retired = runtime.collect();
-        if (!runtime.dirty)
-            return (runtime.pending ? runtime.pending : runtime.current)->revision;
-        if (runtime.pending)
-            return ErrorCode::BufferFull;
-        revision = runtime.current ? runtime.current->revision + 1 : 1;
-    }
-    retired.reset();
-    auto plan = std::make_unique<RenderPlan>();
-    const auto code = runtime.build_plan(*plan);
-    if (!code)
-        return code;
-    plan->revision = revision;
-    if (runtime.driver)
-    {
-        if (!runtime.reclaimer.joinable())
-        {
-            runtime.stop_reclaimer = false;
-            runtime.reclaimer = std::thread([&runtime] { runtime.reclaim_plans(); });
-        }
-        {
-            const std::lock_guard<std::mutex> lock(runtime.plans_mutex);
-            runtime.pending = std::move(plan);
-            runtime.published.store(runtime.pending.get(), std::memory_order_release);
-        }
-        runtime.plans_changed.notify_one();
-    }
-    else
-    {
-        runtime.current = std::move(plan);
-        runtime.published.store(runtime.current.get(), std::memory_order_release);
-        runtime.apply_published();
-    }
-    runtime.dirty = false;
-    return revision;
-}
-RetCode Engine::start(std::unique_ptr<ClockDriver> driver)
-{
-    auto &runtime = *runtime_;
-    if (runtime.on_execution_thread() || runtime.driver)
-        return ErrorCode::Busy;
-    if (!runtime.current)
-        return ErrorCode::NotPrepared;
-    if (!runtime.published.is_lock_free() || !runtime.applied.is_lock_free() || !runtime.position.is_lock_free())
-        return ErrorCode::Unsupported;
-    runtime.driver = driver ? std::move(driver) : make_timer_driver();
-    try
-    {
-        const auto code = runtime.driver->start(runtime.period, &Runtime::tick, &runtime);
-        if (!code)
-            stop();
-        return code;
-    }
-    catch (...)
-    {
-        stop();
-        throw;
-    }
-}
+
 RetCode Engine::stop() noexcept
 {
-    auto &runtime = *runtime_;
-    if (runtime.on_execution_thread())
+    if (on_clock_thread())
         return ErrorCode::Busy;
-    if (runtime.driver)
+    if (state_ == State::Running)
     {
-        runtime.driver->stop();
-        runtime.driver.reset();
-        if (runtime.reclaimer.joinable())
-        {
-            {
-                const std::lock_guard<std::mutex> lock(runtime.plans_mutex);
-                runtime.stop_reclaimer = true;
-            }
-            runtime.plans_changed.notify_one();
-            runtime.reclaimer.join();
-        }
-        const EngineExecutionScope scope(&runtime);
-        if (runtime.pending)
-        {
-            runtime.apply_published();
-            runtime.collect();
-        }
+        clock_->stop();
+        state_ = State::Ready;
     }
     return {};
 }
+
 RetCode Engine::reset() noexcept
 {
-    auto &runtime = *runtime_;
-    if (runtime.on_execution_thread() || runtime.driver)
+    if (on_clock_thread() || state_ == State::Running)
         return ErrorCode::Busy;
-    if (runtime.current)
-        for (const auto &item : runtime.current->nodes)
-        {
-            const auto draft = runtime.nodes.find(item.id);
-            if (draft == runtime.nodes.end() || draft->second.entry != item.entry)
-                item.entry->node->reset();
-        }
-    for (const auto &item : runtime.nodes)
-        item.second.entry->node->reset();
-    runtime.position.store(0, std::memory_order_release);
+    runner_->reset(*graph_);
+    graph_->reset_nodes();
+    position_.store(0, std::memory_order_release);
     return {};
 }
+
 std::uint64_t Engine::tick_position() const noexcept
 {
-    return runtime_->position.load(std::memory_order_acquire);
-}
-PlanRevision Engine::applied_revision() const noexcept
-{
-    return runtime_->applied.load(std::memory_order_acquire);
+    return position_.load(std::memory_order_acquire);
 }
 
 } // namespace aereborn

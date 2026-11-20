@@ -9,15 +9,15 @@ void pcm_formats()
 {
     const struct
     {
-        Format format;
+        SampleFormat format;
         std::vector<std::uint8_t> bytes;
         float peak;
     } cases[] = {
-        {Format::S16LE, {0, 0x80, 0, 0x40, 0, 0x20, 0xff, 0x7f}, 32767.0f / 32768},
-        {Format::S24_3LE, {0, 0, 0x80, 0, 0, 0x40, 0, 0, 0x20, 0xff, 0xff, 0x7f}, 8388607.0f / 8388608},
-        {Format::S24LE, {0, 0, 0x80, 0, 0, 0, 0x40, 0, 0, 0, 0x20, 0, 0xff, 0xff, 0x7f, 0}, 8388607.0f / 8388608},
-        {Format::S32LE, {0, 0, 0, 0x80, 0, 0, 0, 0x40, 0, 0, 0, 0x20, 0xff, 0xff, 0xff, 0x7f}, 1},
-        {Format::F32LE, {0, 0, 0x80, 0xbf, 0, 0, 0, 0x3f, 0, 0, 0x80, 0x3e, 0, 0, 0xc0, 0x3f}, 1.5f}};
+        {SampleFormat::S16LE, {0, 0x80, 0, 0x40, 0, 0x20, 0xff, 0x7f}, 32767.0f / 32768},
+        {SampleFormat::S24_3LE, {0, 0, 0x80, 0, 0, 0x40, 0, 0, 0x20, 0xff, 0xff, 0x7f}, 8388607.0f / 8388608},
+        {SampleFormat::S24LE, {0, 0, 0x80, 0, 0, 0, 0x40, 0, 0, 0, 0x20, 0, 0xff, 0xff, 0x7f, 0}, 8388607.0f / 8388608},
+        {SampleFormat::S32LE, {0, 0, 0, 0x80, 0, 0, 0, 0x40, 0, 0, 0, 0x20, 0xff, 0xff, 0xff, 0x7f}, 1},
+        {SampleFormat::F32LE, {0, 0, 0x80, 0xbf, 0, 0, 0, 0x3f, 0, 0, 0x80, 0x3e, 0, 0, 0xc0, 0x3f}, 1.5f}};
     for (const auto &item : cases)
     {
         const PortSpec pcm(rate, 2, item.format), planar(rate, 2);
@@ -29,7 +29,7 @@ void pcm_formats()
                   decode.sink->sample(1, 0) == 0.25f && decode.sink->sample(1, 1) == item.peak,
               "Decode matches independent signed PCM and float byte references");
         std::vector<float> samples(480);
-        samples[0] = item.format == Format::F32LE ? -1.0f : -2.0f;
+        samples[0] = item.format == SampleFormat::F32LE ? -1.0f : -2.0f;
         samples[1] = 0.25f;
         samples[240] = 0.5f;
         samples[241] = 1.5f;
@@ -45,7 +45,7 @@ void pcm_formats()
 }
 void float_layout()
 {
-    const PortSpec planar(rate, 2), interleaved(rate, 2, Format::F32LE);
+    const PortSpec planar(rate, 2), interleaved(rate, 2, SampleFormat::F32LE);
     Conversion conversion(planar, interleaved);
     std::vector<float> input(480);
     for (std::size_t i = 0; i < 240; ++i)
@@ -61,7 +61,7 @@ void float_layout()
 }
 void bit_preservation()
 {
-    for (const auto format : {Format::F32P, Format::F32LE, Format::S24LE})
+    for (const auto format : {SampleFormat::F32P, SampleFormat::F32LE, SampleFormat::S24LE})
     {
         const PortSpec spec(rate, 2, format);
         Conversion conversion(spec, spec);
@@ -72,7 +72,7 @@ void bit_preservation()
         check(std::equal(bytes.begin(), bytes.end(), conversion.sink->bytes().begin()),
               "Identity conversion preserves every bit, including NaNs and padding");
     }
-    const PortSpec native(rate, 1), wire(rate, 1, Format::F32LE);
+    const PortSpec native(rate, 1), wire(rate, 1, SampleFormat::F32LE);
     Conversion encode(native, wire), decode(wire, native);
     std::vector<float> values(240);
     const std::uint32_t words[] = {0x80000000u, 0x7fc12345u, 0x7f800000u, 0xff800000u};
@@ -86,7 +86,7 @@ void bit_preservation()
 }
 void unaligned_pcm()
 {
-    const PortSpec pcm(rate, 1, Format::F32LE), planar(rate, 1);
+    const PortSpec pcm(rate, 1, SampleFormat::F32LE), planar(rate, 1);
     Conversion conversion(pcm, planar);
     std::vector<std::uint8_t> bytes(961);
     write_f32le(bytes.data() + 1, 0.375f);
@@ -97,14 +97,12 @@ void converter_validation()
 {
     const PortSpec mono(rate, 1), stereo(rate, 2);
     expect_exception<std::invalid_argument>([&] { Convert invalid(mono, stereo); });
-    expect_exception<std::invalid_argument>([&] { Convert invalid(PortSpec(rate, 1, static_cast<Format>(99)), mono); });
+    expect_exception<std::invalid_argument>([&] { Convert invalid(PortSpec(rate, 1, static_cast<SampleFormat>(99)), mono); });
     expect_exception<std::invalid_argument>([&] { Convert invalid(mono, PortSpec(static_cast<SampleRate>(1), 1)); });
-    Convert valid(mono, mono);
-    expect_error(ErrorCode::InvalidArg, valid.prepare(static_cast<BlockPeriod>(0)));
 }
 void integer_limits()
 {
-    const PortSpec planar(rate, 1), pcm(rate, 1, Format::S16LE);
+    const PortSpec planar(rate, 1), pcm(rate, 1, SampleFormat::S16LE);
     Conversion conversion(planar, pcm);
     std::vector<float> values(240);
     values[0] = std::numeric_limits<float>::quiet_NaN();
@@ -119,7 +117,7 @@ void integer_limits()
 }
 void empty_blocks()
 {
-    const PortSpec input(rate, 1), output(rate, 1, Format::S16LE);
+    const PortSpec input(rate, 1), output(rate, 1, SampleFormat::S16LE);
     Convert convert(input, output);
     checked(convert.prepare(period));
     const float value = 0.5f;

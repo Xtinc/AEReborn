@@ -26,16 +26,16 @@ class VirtualNode : public NodeT<I, O>
         ++prepares;
         return preparation;
     }
-    void process(const ProcContext &context) noexcept override
+    void process(const ProcessContext &context) noexcept override
     {
         ++calls;
         for (const auto block : context.outputs)
         {
-            const auto output = block.audio();
+            const auto output = block.f32p_view();
             output.clear();
             for (const auto source : context.inputs)
             {
-                const auto input = source.audio();
+                const auto input = source.f32p_view();
                 for (std::size_t ch = 0; ch < output.channels(); ++ch)
                 {
                     for (std::size_t frame = 0; frame < output.frames(); ++frame)

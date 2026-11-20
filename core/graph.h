@@ -7,24 +7,43 @@
 namespace aereborn
 {
 
-// Execution unit with immutable input and output layouts.
+/// @brief Graph execution unit with immutable input and output port layouts.
+///
+/// Keep the port descriptors and their storage valid and unchanged for as long as
+/// the engine owns the node.
+/// Defer any requests to control the owning engine and return without waiting for them.
 class Node
 {
   public:
     virtual ~Node() = default;
     Node(const Node &) = delete;
     Node &operator=(const Node &) = delete;
-    // The engine borrows these descriptors for as long as it owns the node.
+
+    /// @brief Describe the input ports.
+    /// @return A read-only view of the input port specifications in port index order.
     virtual View<const PortSpec> inputs() const noexcept = 0;
+
+    /// @brief Describe the output ports.
+    /// @return A read-only view of the output port specifications in port index order.
     virtual View<const PortSpec> outputs() const noexcept = 0;
-    // Validate configuration and prepare resources. The engine may retry a failed preparation.
-    virtual RetCode prepare(BlockPeriod period)
-    {
-        return is_block_period(period) ? ErrorCode::Ok : ErrorCode::InvalidArg;
-    }
-    // Context views are valid during this call. Fill every sample of each output using its declared format.
-    virtual void process(const ProcContext &context) noexcept = 0;
-    // Must be serialized with process().
+
+    /// @brief Prepare the node's processing resources on the control thread.
+    /// @param period Block period validated by the engine.
+    /// @return Success when the node is ready to process, or a preparation error.
+    /// @note The engine may retry after a failure.
+    virtual RetCode prepare(BlockPeriod period) = 0;
+
+    /// @brief Process one block and write every output sample in its declared format.
+    /// @param context Current period, tick position, and input and output block views.
+    /// @pre Preparation has succeeded.
+    /// @note The context and its views are valid only during this call. Keep processing
+    /// free of heap allocation and deallocation, blocking I/O, and logging.
+    /// Avoid lock waits where possible.
+    virtual void process(const ProcessContext &context) noexcept = 0;
+
+    /// @brief Reset the node's processing state.
+    /// @pre Reset must be serialized with processing.
+    /// @note The engine may reset a node before its first preparation.
     virtual void reset() noexcept
     {
     }
@@ -33,7 +52,9 @@ class Node
     Node() = default;
 };
 
-// Port counts are compile-time constants. Descriptors are stored inline.
+/// @brief Node base with compile-time port counts and inline port specifications.
+/// @tparam I Number of input ports.
+/// @tparam O Number of output ports.
 template <std::size_t I, std::size_t O> class NodeT : public Node
 {
     static_assert(I + O > 0, "Node needs at least one port");

@@ -13,8 +13,11 @@ PortSpec mixer_output(SampleRate rate, std::size_t channels, std::size_t inputs)
 }
 } // namespace
 Mixer::Mixer(SampleRate rate, std::size_t channels, std::size_t inputs)
-    : output_(mixer_output(rate, channels, inputs)), inputs_(inputs, output_), states_(inputs)
+    : output_(mixer_output(rate, channels, inputs)), inputs_(inputs, output_),
+      targets_(std::make_unique<std::atomic<bool>[]>(inputs)), muted_(inputs)
 {
+    for (std::size_t i = 0; i < inputs; ++i)
+        std::atomic_init(&targets_[i], false);
 }
 View<const PortSpec> Mixer::inputs() const noexcept
 {
@@ -26,41 +29,36 @@ View<const PortSpec> Mixer::outputs() const noexcept
 }
 RetCode Mixer::set_muted(std::size_t input, bool muted) noexcept
 {
-    if (input >= states_.size())
+    if (input >= inputs_.size())
         return ErrorCode::InvalidPort;
-    states_[input].target.store(muted, std::memory_order_release);
+    targets_[input].store(muted, std::memory_order_release);
     return {};
 }
-RetCode Mixer::prepare(BlockPeriod period)
+RetCode Mixer::prepare(BlockPeriod)
 {
-    if (!is_block_period(period))
-        return ErrorCode::InvalidArg;
-    if (!states_.front().target.is_lock_free())
-        return ErrorCode::Unsupported;
     reset();
     return {};
 }
 void Mixer::reset() noexcept
 {
-    for (auto &state : states_)
-        state.muted = state.target.load(std::memory_order_acquire);
+    for (std::size_t i = 0; i < inputs_.size(); ++i)
+        muted_[i] = targets_[i].load(std::memory_order_acquire);
 }
-void Mixer::process(const ProcContext &context) noexcept
+void Mixer::process(const ProcessContext &context) noexcept
 {
-    const auto output = context.outputs[0].audio();
+    const auto output = context.outputs[0].f32p_view();
     const auto frames = output.frames();
     if (frames == 0)
         return;
     output.clear();
-    for (std::size_t i = 0; i < states_.size(); ++i)
+    for (std::size_t i = 0; i < inputs_.size(); ++i)
     {
-        auto &state = states_[i];
-        const bool target = state.target.load(std::memory_order_acquire);
-        const bool ramping = state.muted != target;
+        const bool target = targets_[i].load(std::memory_order_acquire);
+        const bool ramping = muted_[i] != target;
         if (target && !ramping)
             continue;
-        const auto input = context.inputs[i].audio();
-        const auto gain = state.muted ? 0.0 : 1.0;
+        const auto input = context.inputs[i].f32p_view();
+        const auto gain = muted_[i] ? 0.0 : 1.0;
         const auto step = ramping ? (target ? -1.0 : 1.0) / frames : 0.0;
         const auto last = frames - 1;
         for (std::size_t ch = 0; ch < output.channels(); ++ch)
@@ -80,7 +78,7 @@ void Mixer::process(const ProcContext &context) noexcept
                     dst[frame] += src[frame];
             }
         }
-        state.muted = target;
+        muted_[i] = target;
     }
 }
 } // namespace aereborn

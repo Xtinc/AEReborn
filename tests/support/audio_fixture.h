@@ -1,6 +1,6 @@
 #ifndef AEREBORN_TESTS_AUDIO_FIXTURE_H
 #define AEREBORN_TESTS_AUDIO_FIXTURE_H
-#include "manual_clock.h"
+#include "clocked_graph.h"
 #include "pcm_reference.h"
 #include "plugins/convert.h"
 #include "plugins/io.h"
@@ -30,10 +30,10 @@ class FloatSource : public NodeT<0, 1>
         ++prepares;
         return {};
     }
-    void process(const ProcContext &context) noexcept override
+    void process(const ProcessContext &context) noexcept override
     {
         ++calls;
-        const auto output = context.outputs[0].audio();
+        const auto output = context.outputs[0].f32p_view();
         const auto start = outputs()[0].frame_position(context.block_period, context.tick_position);
         for (std::size_t ch = 0; ch < output.channels(); ++ch)
             for (std::size_t frame = 0; frame < output.frames(); ++frame)
@@ -55,21 +55,21 @@ class PacketSink final : public NodeT<1, 0>
         bytes_.resize(spec.max_frames(period) * spec.channels * sample_bytes(spec.format));
         return {};
     }
-    void process(const ProcContext &context) noexcept override
+    void process(const ProcessContext &context) noexcept override
     {
         const auto input = context.inputs[0];
         frames = input.frames();
-        size_ = input.bytes().size();
-        address = input.bytes().data();
-        std::copy(input.bytes().begin(), input.bytes().end(), bytes_.begin());
+        size_ = input.byte_view().size();
+        address = input.byte_view().data();
+        std::copy(input.byte_view().begin(), input.byte_view().end(), bytes_.begin());
     }
     View<const std::uint8_t> bytes() const noexcept { return {bytes_.data(), size_}; }
     float sample(std::size_t frame, std::size_t ch = 0) const noexcept
     {
         const auto spec = inputs()[0];
-        if (spec.format == Format::F32LE)
+        if (spec.format == SampleFormat::F32LE)
             return read_f32le(bytes_.data() + (frame * spec.channels + ch) * 4);
-        assert(spec.format == Format::F32P);
+        assert(spec.format == SampleFormat::F32P);
         float value;
         std::memcpy(&value, bytes_.data() + (ch * frames + frame) * 4, 4);
         return value;
@@ -88,22 +88,22 @@ struct Conversion
         : engine(period), clock(engine)
     {
         const auto input_id = checked(engine.emplace_node<Capture>(input));
-        convert_id = checked(engine.emplace_node<Convert>(input, output));
+        const auto convert_id = checked(engine.emplace_node<Convert>(input, output));
         const auto sink_id = checked(engine.emplace_node<PacketSink>(output));
         checked(engine.connect({input_id}, {convert_id}));
         checked(engine.connect({convert_id}, {sink_id}));
-        checked(engine.prepare());
+        checked(engine.commit());
         capture = checked(engine.node<Capture>(input_id));
         sink = checked(engine.node<PacketSink>(sink_id));
+        clock.start();
     }
     void run(View<const std::uint8_t> bytes)
     {
         checked(capture->bind(bytes, engine.tick_position()));
-        checked(clock.tick());
+        clock.advance();
     }
     Engine engine;
-    ManualClock clock;
-    NodeId convert_id;
+    ClockedGraph clock;
     Capture *capture;
     PacketSink *sink;
 };
