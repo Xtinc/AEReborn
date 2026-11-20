@@ -10,7 +10,7 @@ void tone_timeline()
     constexpr auto tone_period = BlockPeriod::Ms10;
     Engine engine(tone_period);
     ClockedGraph clock(engine);
-    const PortSpec spec(SampleRate::Hz11025, 2);
+    const PortSpec spec(SampleRate::Hz11025, 2, SampleFormat::F32P);
     const auto source = checked(engine.emplace_node<Tone>(spec.sample_rate, 2, 997, 0.25f));
     const auto sink = checked(engine.emplace_node<PacketSink>(spec));
     checked(engine.connect({source}, {sink}));

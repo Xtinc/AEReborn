@@ -20,7 +20,7 @@ void pcm_formats()
         {SampleFormat::F32LE, {0, 0, 0x80, 0xbf, 0, 0, 0, 0x3f, 0, 0, 0x80, 0x3e, 0, 0, 0xc0, 0x3f}, 1.5f}};
     for (const auto &item : cases)
     {
-        const PortSpec pcm(rate, 2, item.format), planar(rate, 2);
+        const PortSpec pcm(rate, 2, item.format), planar(rate, 2, SampleFormat::F32P);
         Conversion decode(pcm, planar), encode(planar, pcm);
         auto bytes = item.bytes;
         bytes.resize(pcm.max_frames(period) * 2 * sample_bytes(item.format));
@@ -43,9 +43,21 @@ void pcm_formats()
                   "Remaining frames are silence");
     }
 }
+void pcm_to_pcm()
+{
+    const PortSpec input(rate, 2, SampleFormat::S32LE), output(rate, 2, SampleFormat::S24LE);
+    Conversion conversion(input, output);
+    // The first sample rounds to a half step in the float workspace.
+    std::vector<std::uint8_t> bytes{0x7f, 0, 0, 0x40, 0, 0, 0, 0x80, 0, 0, 0, 0x20, 0xff, 0xff, 0xff, 0x7f};
+    bytes.resize(input.max_frames(period) * input.channels * sample_bytes(input.format));
+    conversion.run({bytes.data(), bytes.size()});
+    const std::array<std::uint8_t, 16> expected{{1, 0, 0x40, 0, 0, 0, 0x80, 0, 0, 0, 0x20, 0, 0xff, 0xff, 0x7f, 0}};
+    check(std::equal(expected.begin(), expected.end(), conversion.sink->bytes().begin()),
+          "PCM conversion preserves float rounding, channel order, and canonical S24LE padding");
+}
 void float_layout()
 {
-    const PortSpec planar(rate, 2), interleaved(rate, 2, SampleFormat::F32LE);
+    const PortSpec planar(rate, 2, SampleFormat::F32P), interleaved(rate, 2, SampleFormat::F32LE);
     Conversion conversion(planar, interleaved);
     std::vector<float> input(480);
     for (std::size_t i = 0; i < 240; ++i)
@@ -72,21 +84,25 @@ void bit_preservation()
         check(std::equal(bytes.begin(), bytes.end(), conversion.sink->bytes().begin()),
               "Identity conversion preserves every bit, including NaNs and padding");
     }
-    const PortSpec native(rate, 1), wire(rate, 1, SampleFormat::F32LE);
-    Conversion encode(native, wire), decode(wire, native);
-    std::vector<float> values(240);
-    const std::uint32_t words[] = {0x80000000u, 0x7fc12345u, 0x7f800000u, 0xff800000u};
-    for (std::size_t i = 0; i < 4; ++i)
-        std::memcpy(&values[i], &words[i], 4);
-    const auto input = float_bytes(values);
-    encode.run({input.data(), input.size()});
-    decode.run(encode.sink->bytes());
-    check(std::equal(input.begin(), input.end(), decode.sink->bytes().begin()),
-          "Float layout conversion preserves signed zero and NaN payloads");
+    for (const std::size_t channels : {1, 2})
+    {
+        const PortSpec native(rate, channels, SampleFormat::F32P), wire(rate, channels, SampleFormat::F32LE);
+        Conversion encode(native, wire), decode(wire, native);
+        const auto frames = native.max_frames(period);
+        std::vector<float> values(frames * channels);
+        const std::uint32_t words[] = {0x80000000u, 0x7fc12345u, 0x7f800001u, 0xff800000u};
+        for (std::size_t i = 0; i < sizeof(words) / sizeof(words[0]); ++i)
+            std::memcpy(&values[(i % channels) * frames + i / channels], &words[i], sizeof(words[0]));
+        const auto input = float_bytes(values);
+        encode.run({input.data(), input.size()});
+        decode.run(encode.sink->bytes());
+        check(std::equal(input.begin(), input.end(), decode.sink->bytes().begin()),
+              "Float layout conversion preserves signed zero and NaN payloads");
+    }
 }
 void unaligned_pcm()
 {
-    const PortSpec pcm(rate, 1, SampleFormat::F32LE), planar(rate, 1);
+    const PortSpec pcm(rate, 1, SampleFormat::F32LE), planar(rate, 1, SampleFormat::F32P);
     Conversion conversion(pcm, planar);
     std::vector<std::uint8_t> bytes(961);
     write_f32le(bytes.data() + 1, 0.375f);
@@ -95,14 +111,15 @@ void unaligned_pcm()
 }
 void converter_validation()
 {
-    const PortSpec mono(rate, 1), stereo(rate, 2);
+    const PortSpec mono(rate, 1, SampleFormat::F32P), stereo(rate, 2, SampleFormat::F32P);
     expect_exception<std::invalid_argument>([&] { Convert invalid(mono, stereo); });
     expect_exception<std::invalid_argument>([&] { Convert invalid(PortSpec(rate, 1, static_cast<SampleFormat>(99)), mono); });
-    expect_exception<std::invalid_argument>([&] { Convert invalid(mono, PortSpec(static_cast<SampleRate>(1), 1)); });
+    expect_exception<std::invalid_argument>(
+        [&] { Convert invalid(mono, PortSpec(static_cast<SampleRate>(1), 1, SampleFormat::F32P)); });
 }
 void integer_limits()
 {
-    const PortSpec planar(rate, 1), pcm(rate, 1, SampleFormat::S16LE);
+    const PortSpec planar(rate, 1, SampleFormat::F32P), pcm(rate, 1, SampleFormat::S16LE);
     Conversion conversion(planar, pcm);
     std::vector<float> values(240);
     values[0] = std::numeric_limits<float>::quiet_NaN();
@@ -117,7 +134,7 @@ void integer_limits()
 }
 void empty_blocks()
 {
-    const PortSpec input(rate, 1), output(rate, 1, SampleFormat::S16LE);
+    const PortSpec input(rate, 1, SampleFormat::F32P), output(rate, 1, SampleFormat::S16LE);
     Convert convert(input, output);
     checked(convert.prepare(period));
     const float value = 0.5f;
@@ -132,6 +149,7 @@ int main(int argc, char **argv)
 {
     return run_tests(argc, argv,
                      {{"pcm_formats", pcm_formats},
+                      {"pcm_to_pcm", pcm_to_pcm},
                       {"float_layout", float_layout},
                       {"bit_preservation", bit_preservation},
                       {"unaligned_pcm", unaligned_pcm},

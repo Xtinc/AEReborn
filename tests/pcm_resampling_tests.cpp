@@ -14,8 +14,9 @@ std::vector<float> resample(SampleRate from, SampleRate to, double frequency)
             return static_cast<float>(std::sin(two_pi * frequency * frame / static_cast<std::uint32_t>(from)) *
                                       (ch ? -0.5 : 1));
         }));
-    const auto converter = checked(engine.emplace_node<Convert>(PortSpec(from, 2), PortSpec(to, 2)));
-    const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(to, 2)));
+    const PortSpec input(from, 2, SampleFormat::F32P), output(to, 2, SampleFormat::F32P);
+    const auto converter = checked(engine.emplace_node<Convert>(input, output));
+    const auto sink = checked(engine.emplace_node<PacketSink>(output));
     checked(engine.connect({source}, {converter}));
     checked(engine.connect({converter}, {sink}));
     checked(engine.commit());
@@ -25,7 +26,7 @@ std::vector<float> resample(SampleRate from, SampleRate to, double frequency)
     for (std::size_t tick = 0; tick < 40; ++tick)
     {
         clock.advance();
-        check(out->frames == PortSpec(to, 2).frames(period, tick),
+        check(out->frames == output.frames(period, tick),
               "Fractional output sizes follow the engine timeline");
         for (std::size_t frame = 0; frame < out->frames; ++frame)
         {
@@ -81,14 +82,15 @@ void late_join()
     const auto source = checked(
         engine.emplace_node<FloatSource>(input_rate, 1, [](std::uint64_t frame, std::size_t)
                                          { return static_cast<float>(std::sin(two_pi * 997 * frame / 11025)); }));
-    const auto original = checked(engine.emplace_node<Convert>(PortSpec(input_rate, 1), PortSpec(rate, 1)));
-    const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1)));
+    const PortSpec input(input_rate, 1, SampleFormat::F32P), output(rate, 1, SampleFormat::F32P);
+    const auto original = checked(engine.emplace_node<Convert>(input, output));
+    const auto sink = checked(engine.emplace_node<PacketSink>(output));
     checked(engine.connect({source}, {original}));
     checked(engine.connect({original}, {sink}));
     checked(engine.commit());
     clock.start(); // Submit while the first, longer input block is in flight.
-    const auto added = checked(engine.emplace_node<Convert>(PortSpec(input_rate, 1), PortSpec(rate, 1)));
-    const auto monitor = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1)));
+    const auto added = checked(engine.emplace_node<Convert>(input, output));
+    const auto monitor = checked(engine.emplace_node<PacketSink>(output));
     checked(engine.connect({source}, {added}));
     checked(engine.connect({added}, {monitor}));
     clock.commit();

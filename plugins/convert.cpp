@@ -12,39 +12,34 @@ namespace aereborn
 namespace
 {
 
-constexpr std::size_t order = 48;
-constexpr std::size_t taps = 2 * order;
-constexpr std::uint32_t phase_steps = 100;
-constexpr double pi = 3.141592653589793;
-
-std::uint32_t read_le(const std::uint8_t *input, std::size_t bytes) noexcept
+template <std::size_t Bytes> std::uint32_t read_le(const std::uint8_t *input) noexcept
 {
     std::uint32_t raw = 0;
-    for (std::size_t i = 0; i < bytes; ++i)
+    for (std::size_t i = 0; i < Bytes; ++i)
     {
         raw |= static_cast<std::uint32_t>(input[i]) << (8 * i);
     }
     return raw;
 }
 
-void write_le(std::uint32_t raw, std::uint8_t *output, std::size_t bytes) noexcept
+template <std::size_t Bytes> void write_le(std::uint32_t raw, std::uint8_t *output) noexcept
 {
-    for (std::size_t i = 0; i < bytes; ++i)
+    for (std::size_t i = 0; i < Bytes; ++i)
     {
         output[i] = static_cast<std::uint8_t>(raw >> (8 * i));
     }
 }
 
-float decode_integer(std::uint32_t raw, unsigned int bits) noexcept
+template <unsigned int Bits> float decode_integer(std::uint32_t raw) noexcept
 {
-    const auto scale = std::int64_t{1} << (bits - 1);
+    constexpr auto scale = std::int64_t{1} << (Bits - 1);
     const auto value = std::int64_t{raw} & (2 * scale - 1);
     return static_cast<float>(value >= scale ? value - 2 * scale : value) / static_cast<float>(scale);
 }
 
-std::uint32_t encode_integer(float sample, unsigned int bits) noexcept
+template <unsigned int Bits> std::uint32_t encode_integer(float sample) noexcept
 {
-    const auto scale = std::int64_t{1} << (bits - 1);
+    constexpr auto scale = std::int64_t{1} << (Bits - 1);
     const auto normalized = std::isnan(sample) ? 0.0f : std::max(-1.0f, std::min(1.0f, sample));
     const auto rounded = static_cast<std::int64_t>(std::round(static_cast<double>(normalized) * scale));
     const auto value = std::min(scale - 1, rounded);
@@ -58,8 +53,10 @@ bool native_f32le() noexcept
     return std::memcmp(&one, one_le, sizeof(one)) == 0;
 }
 
-void copy_f32le(const std::uint8_t *pcm, OFBlock output) noexcept
+void decode_f32le(const std::uint8_t *pcm, OFBlock output) noexcept
 {
+    if (output.frames() == 0)
+        return;
     if (output.channels() == 1 && native_f32le())
     {
         std::memcpy(output.channel(0), pcm, output.frames() * sizeof(float));
@@ -69,14 +66,16 @@ void copy_f32le(const std::uint8_t *pcm, OFBlock output) noexcept
     {
         for (std::size_t ch = 0; ch < output.channels(); ++ch, pcm += sizeof(float))
         {
-            const auto raw = read_le(pcm, sizeof(float));
+            const auto raw = read_le<sizeof(float)>(pcm);
             std::memcpy(output.channel(ch) + frame, &raw, sizeof(raw));
         }
     }
 }
 
-void copy_f32le(IFBlock input, std::uint8_t *pcm) noexcept
+void encode_f32le(IFBlock input, std::uint8_t *pcm) noexcept
 {
+    if (input.frames() == 0)
+        return;
     if (input.channels() == 1 && native_f32le())
     {
         std::memcpy(pcm, input.channel(0), input.frames() * sizeof(float));
@@ -88,42 +87,33 @@ void copy_f32le(IFBlock input, std::uint8_t *pcm) noexcept
         {
             std::uint32_t raw;
             std::memcpy(&raw, input.channel(ch) + frame, sizeof(raw));
-            write_le(raw, pcm, sizeof(raw));
+            write_le<sizeof(raw)>(raw, pcm);
         }
     }
 }
 
-void decode_pcm(SampleFormat format, const std::uint8_t *source, OFBlock output) noexcept
+template <SampleFormat Format> void decode_pcm(const std::uint8_t *source, OFBlock output) noexcept
 {
-    if (output.frames() == 0)
-        return;
-    if (format == SampleFormat::F32LE)
-    {
-        copy_f32le(source, output);
-        return;
-    }
-    const auto width = sample_bytes(format);
-    const auto bits = sample_bits(format);
+    constexpr auto width = sample_bytes(Format);
+    constexpr auto bits = sample_bits(Format);
     for (std::size_t frame = 0; frame < output.frames(); ++frame)
         for (std::size_t ch = 0; ch < output.channels(); ++ch, source += width)
-            output.channel(ch)[frame] = decode_integer(read_le(source, width), bits);
+            output.channel(ch)[frame] = decode_integer<bits>(read_le<width>(source));
 }
 
-void encode_pcm(SampleFormat format, IFBlock input, std::uint8_t *destination) noexcept
+template <SampleFormat Format> void encode_pcm(IFBlock input, std::uint8_t *destination) noexcept
 {
-    if (input.frames() == 0)
-        return;
-    if (format == SampleFormat::F32LE)
-    {
-        copy_f32le(input, destination);
-        return;
-    }
-    const auto width = sample_bytes(format);
-    const auto bits = sample_bits(format);
+    constexpr auto width = sample_bytes(Format);
+    constexpr auto bits = sample_bits(Format);
     for (std::size_t frame = 0; frame < input.frames(); ++frame)
         for (std::size_t ch = 0; ch < input.channels(); ++ch, destination += width)
-            write_le(encode_integer(input.channel(ch)[frame], bits), destination, width);
+            write_le<width>(encode_integer<bits>(input.channel(ch)[frame]), destination);
 }
+
+constexpr std::size_t order = 48;
+constexpr std::size_t taps = 2 * order;
+constexpr std::uint32_t phase_steps = 100;
+constexpr double pi = 3.141592653589793;
 
 // Window and cutoff ported from AudioDriver's SincInterpolator.
 double sinc_kernel(double x, double cutoff) noexcept
@@ -199,7 +189,10 @@ class SincResampler
         }
         return {};
     }
-    void reset() noexcept { history_.clear(); }
+    void reset() noexcept
+    {
+        history_.clear();
+    }
     void process(IFBlock input, OFBlock output, BlockPeriod period, std::uint64_t tick) noexcept;
 
   private:
@@ -213,8 +206,7 @@ void SincResampler::process(IFBlock input, OFBlock output, BlockPeriod period, s
 {
     const auto past = history_.block(taps);
     // src_pos is in units of 1 / the output sample rate; the first taps frames address history.
-    const auto rounding = [period, tick](std::uint32_t rate)
-    {
+    const auto rounding = [period, tick](std::uint32_t rate) {
         const auto remainder =
             (tick % 1000) * ((std::uint64_t{rate} * static_cast<std::uint32_t>(period)) % 1000) % 1000;
         return static_cast<std::int64_t>((1000 - remainder) % 1000);
@@ -247,14 +239,36 @@ void SincResampler::process(IFBlock input, OFBlock output, BlockPeriod period, s
 
 } // namespace
 
+Convert::Codec Convert::codec_for(SampleFormat format) noexcept
+{
+    switch (format)
+    {
+    case SampleFormat::S16LE:
+        return {decode_pcm<SampleFormat::S16LE>, encode_pcm<SampleFormat::S16LE>};
+    case SampleFormat::S24_3LE:
+        return {decode_pcm<SampleFormat::S24_3LE>, encode_pcm<SampleFormat::S24_3LE>};
+    case SampleFormat::S24LE:
+        return {decode_pcm<SampleFormat::S24LE>, encode_pcm<SampleFormat::S24LE>};
+    case SampleFormat::S32LE:
+        return {decode_pcm<SampleFormat::S32LE>, encode_pcm<SampleFormat::S32LE>};
+    case SampleFormat::F32LE:
+        return {decode_f32le, encode_f32le};
+    case SampleFormat::F32P:
+        break;
+    }
+    return {nullptr, nullptr};
+}
+
 struct Convert::State
 {
-    State(SampleRate input, SampleRate output) : resampler(input, output) {}
+    State(SampleRate input, SampleRate output) : resampler(input, output)
+    {
+    }
 
     RetCode prepare(PortSpec input, PortSpec output, BlockPeriod period)
     {
         const bool resampling = input.sample_rate != output.sample_rate;
-        if (input.format != SampleFormat::F32P && (resampling || output.format != SampleFormat::F32P))
+        if (input.format != SampleFormat::F32P)
         {
             const auto code = decoded.resize(input.channels, input.max_frames(period));
             if (!code)
@@ -276,18 +290,22 @@ struct Convert::State
     SincResampler resampler;
 };
 
-Convert::Convert(PortSpec input, PortSpec output) : NodeT({{input}}, {{output}})
+Convert::Convert(PortSpec input, PortSpec output)
+    : NodeT({input}, {output}), decode_(codec_for(input.format).first), encode_(codec_for(output.format).second)
 {
     if (!input.valid() || !output.valid())
         throw std::invalid_argument("Invalid converter port specification");
     if (input.channels != output.channels)
         throw std::invalid_argument("Converter input and output channel counts must match");
 }
+
 Convert::~Convert() = default;
+
 RetCode Convert::prepare(BlockPeriod period)
 {
     const auto input = inputs()[0], output = outputs()[0];
-    if (input == output)
+    const bool same_rate = input.sample_rate == output.sample_rate;
+    if (input == output || (same_rate && (!decode_ || !encode_)))
         return {};
     auto next = std::make_unique<State>(input.sample_rate, output.sample_rate);
     const auto code = next->prepare(input, output, period);
@@ -295,11 +313,13 @@ RetCode Convert::prepare(BlockPeriod period)
         state_.swap(next);
     return code;
 }
+
 void Convert::reset() noexcept
 {
     if (state_)
         state_->resampler.reset();
 }
+
 void Convert::process(const ProcessContext &context) noexcept
 {
     const auto input = context.inputs[0];
@@ -314,25 +334,23 @@ void Convert::process(const ProcessContext &context) noexcept
         return;
     }
 
-    auto &state = *state_;
     const bool resampling = input_spec.sample_rate != output_spec.sample_rate;
-    const bool planar_output = output_spec.format == SampleFormat::F32P;
     IFBlock samples;
-    if (input_spec.format == SampleFormat::F32P)
+    if (!decode_)
         samples = input.f32p_view();
     else
     {
-        const auto decoded = planar_output && !resampling ? output.f32p_view() : state.decoded.block(input.frames());
-        decode_pcm(input_spec.format, input.byte_view().data(), decoded);
+        const auto decoded = resampling || encode_ ? state_->decoded.block(input.frames()) : output.f32p_view();
+        decode_(input.byte_view().data(), decoded);
         samples = decoded;
     }
     if (resampling)
     {
-        const auto converted = planar_output ? output.f32p_view() : state.converted.block(output.frames());
-        state.resampler.process(samples, converted, context.block_period, context.tick_position);
+        const auto converted = encode_ ? state_->converted.block(output.frames()) : output.f32p_view();
+        state_->resampler.process(samples, converted, context.block_period, context.tick_position);
         samples = converted;
     }
-    if (!planar_output)
-        encode_pcm(output_spec.format, samples, output.byte_view().data());
+    if (encode_)
+        encode_(samples, output.byte_view().data());
 }
 } // namespace aereborn

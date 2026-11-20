@@ -3,7 +3,7 @@
 #include <stdexcept>
 namespace aereborn
 {
-Capture::Capture(PortSpec spec) : NodeT({}, {{spec}})
+Capture::Capture(PortSpec spec) : NodeT({}, {spec})
 {
     if (!spec.valid())
         throw std::invalid_argument("Invalid capture port specification");
@@ -31,7 +31,7 @@ void Capture::reset() noexcept
 {
     buffer_.reset();
 }
-Playback::Playback(PortSpec spec) : NodeT({{spec}}, {})
+Playback::Playback(PortSpec spec) : NodeT({spec}, {})
 {
     if (!spec.valid())
         throw std::invalid_argument("Invalid playback port specification");

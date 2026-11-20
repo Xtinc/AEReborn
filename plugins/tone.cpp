@@ -5,7 +5,7 @@
 namespace aereborn
 {
 Tone::Tone(SampleRate rate, std::size_t channels, double frequency, float amplitude)
-    : NodeT({}, {{PortSpec(rate, channels)}}), frequency_(frequency), amplitude_(amplitude)
+    : NodeT({}, {PortSpec(rate, channels, SampleFormat::F32P)}), frequency_(frequency), amplitude_(amplitude)
 {
     if (!outputs()[0].valid() || !(frequency >= 0 && frequency < static_cast<std::uint32_t>(rate) / 2.0) ||
         !std::isfinite(amplitude))

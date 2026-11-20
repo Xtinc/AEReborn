@@ -16,8 +16,8 @@ void explicit_mix_and_fanout()
     const auto mix = checked(engine.emplace_node<Mixer>(rate, 2, 2));
     const auto matrix =
         checked(engine.emplace_node<Matrix>(rate, 2, 2, std::initializer_list<float>{0, 1, 1, 0}, 0.5f));
-    const auto first = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 2)));
-    const auto second = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 2)));
+    const auto first = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 2, SampleFormat::F32P)));
+    const auto second = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 2, SampleFormat::F32P)));
     checked(engine.connect({a}, {mix, 0}));
     checked(engine.connect({b}, {mix, 1}));
     checked(engine.connect({mix}, {matrix}));
@@ -44,11 +44,10 @@ class Algorithm final : public NodeT<1, 1>
 {
   public:
     Algorithm()
-        : NodeT({{PortSpec(SampleRate::Hz16000, 1, SampleFormat::S16LE)}},
-                {{PortSpec(SampleRate::Hz16000, 1, SampleFormat::S16LE)}})
+        : NodeT({PortSpec(SampleRate::Hz16000, 1, SampleFormat::S16LE)},
+                {PortSpec(SampleRate::Hz16000, 1, SampleFormat::S16LE)})
     {
     }
-    RetCode prepare(BlockPeriod) override { return {}; }
     void process(const ProcessContext &context) noexcept override
     {
         const auto input = context.inputs[0].byte_view();
@@ -70,7 +69,7 @@ void algorithm_chain()
 {
     Engine engine(period);
     ClockedGraph clock(engine);
-    const PortSpec bus(rate, 1), pcm(SampleRate::Hz16000, 1, SampleFormat::S16LE);
+    const PortSpec bus(rate, 1, SampleFormat::F32P), pcm(SampleRate::Hz16000, 1, SampleFormat::S16LE);
     const auto tone = checked(engine.emplace_node<Tone>(rate, 1, 1000, 0.25f));
     const auto mix = checked(engine.emplace_node<Mixer>(rate, 1, 1));
     const auto down = checked(engine.emplace_node<Convert>(bus, pcm));
@@ -107,7 +106,7 @@ void silence_and_pruning()
     ClockedGraph clock(engine);
     const auto source =
         checked(engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 1.0f; }));
-    const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1)));
+    const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1, SampleFormat::F32P)));
     checked(engine.commit());
     clock.start();
     clock.advance();
@@ -131,8 +130,9 @@ void shared_silence()
 {
     Engine engine(period);
     ClockedGraph clock(engine);
-    const PortSpec planar(rate, 1), pcm(rate, 1, SampleFormat::S16LE);
-    const PortSpec wide_planar(SampleRate::Hz44100, 2), wide_pcm(SampleRate::Hz44100, 3, SampleFormat::S24_3LE);
+    const PortSpec planar(rate, 1, SampleFormat::F32P), pcm(rate, 1, SampleFormat::S16LE);
+    const PortSpec wide_planar(SampleRate::Hz44100, 2, SampleFormat::F32P);
+    const PortSpec wide_pcm(SampleRate::Hz44100, 3, SampleFormat::S24_3LE);
     const auto source =
         checked(engine.emplace_node<FloatSource>(wide_planar.sample_rate, 2,
                                                  [](std::uint64_t, std::size_t ch) { return static_cast<float>(ch + 1); }));
@@ -167,9 +167,11 @@ void shared_silence()
 void format_validation()
 {
     Engine engine(period);
-    for (const auto spec : {PortSpec(static_cast<SampleRate>(0), 1), PortSpec(static_cast<SampleRate>(48001), 1),
-                            PortSpec(static_cast<SampleRate>(96001), 1),
-                            PortSpec(rate, 0), PortSpec(rate, 1, static_cast<SampleFormat>(99))})
+    for (const auto spec : {PortSpec(static_cast<SampleRate>(0), 1, SampleFormat::F32P),
+                            PortSpec(static_cast<SampleRate>(48001), 1, SampleFormat::F32P),
+                            PortSpec(static_cast<SampleRate>(96001), 1, SampleFormat::F32P),
+                            PortSpec(rate, 0, SampleFormat::F32P),
+                            PortSpec(rate, 1, static_cast<SampleFormat>(99))})
     {
         expect_exception<std::invalid_argument>([&] { engine.emplace_node<Capture>(spec); });
         expect_exception<std::invalid_argument>([&] { engine.emplace_node<Playback>(spec); });
@@ -177,7 +179,9 @@ void format_validation()
     }
     const auto source =
         checked(engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 0.0f; }));
-    for (const auto spec : {PortSpec(rate, 2), PortSpec(SampleRate::Hz16000, 1), PortSpec(rate, 1, SampleFormat::F32LE),
+    for (const auto spec : {PortSpec(rate, 2, SampleFormat::F32P),
+                            PortSpec(SampleRate::Hz16000, 1, SampleFormat::F32P),
+                            PortSpec(rate, 1, SampleFormat::F32LE),
                             PortSpec(rate, 1, SampleFormat::S16LE)})
     {
         const auto sink = checked(engine.emplace_node<PacketSink>(spec));
@@ -207,8 +211,8 @@ void channel_split_same_tick()
     const auto b =
         checked(engine.emplace_node<Matrix>(split_rate, 8, 4, View<const float>{right.data(), right.size()}));
     const auto mix = checked(engine.emplace_node<Mixer>(split_rate, 4, 2));
-    const auto first = checked(engine.emplace_node<PacketSink>(PortSpec(split_rate, 4)));
-    const auto second = checked(engine.emplace_node<PacketSink>(PortSpec(split_rate, 4)));
+    const auto first = checked(engine.emplace_node<PacketSink>(PortSpec(split_rate, 4, SampleFormat::F32P)));
+    const auto second = checked(engine.emplace_node<PacketSink>(PortSpec(split_rate, 4, SampleFormat::F32P)));
     checked(engine.connect({source}, {a}));
     checked(engine.connect({source}, {b}));
     checked(engine.connect({a}, {first}));

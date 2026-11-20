@@ -17,6 +17,10 @@ class Matrix final : public NodeT<1, 1>
            std::initializer_list<float> coefficients, float gain = 1.0f);
     // Thread-safe with process().
     RetCode set_gain(float gain) noexcept;
+    /// @brief Read the requested gain.
+    /// @return The most recently set gain target.
+    /// @note Safe to call concurrently with set_gain() and process().
+    float gain() const noexcept;
     RetCode prepare(BlockPeriod period) override;
     void process(const ProcessContext &context) noexcept override;
     void reset() noexcept override;

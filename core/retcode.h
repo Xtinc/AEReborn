@@ -16,13 +16,13 @@ enum class ErrorCode
     UnknownConn,
     InvalidPort,
     InvalidType,
-    FormatMismatch = 7,
+    FormatMismatch,
     DuplicateConn,
     InputConnected,
     Cycle,
     NotPrepared,
     Busy,
-    BufferFull = 14,
+    BufferFull,
     TooLarge
 };
 
@@ -32,13 +32,17 @@ class RetCode
     constexpr RetCode(ErrorCode code = ErrorCode::Ok) noexcept : code_(code)
     {
     }
-    constexpr ErrorCode code() const noexcept
-    {
-        return code_;
-    }
     constexpr explicit operator bool() const noexcept
     {
         return code_ == ErrorCode::Ok;
+    }
+    friend constexpr bool operator==(RetCode lhs, RetCode rhs) noexcept
+    {
+        return lhs.code_ == rhs.code_;
+    }
+    friend constexpr bool operator!=(RetCode lhs, RetCode rhs) noexcept
+    {
+        return lhs.code_ != rhs.code_;
     }
     const char *message() const noexcept
     {
@@ -101,6 +105,11 @@ template <class T> class Result
     explicit operator bool() const noexcept
     {
         return static_cast<bool>(ret_code_);
+    }
+    T &value() & noexcept
+    {
+        assert(ret_code_);
+        return value_;
     }
     const T &value() const & noexcept
     {

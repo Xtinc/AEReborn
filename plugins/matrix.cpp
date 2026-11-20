@@ -1,5 +1,6 @@
 #include "matrix.h"
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 namespace aereborn
 {
@@ -13,44 +14,51 @@ template <bool Accumulate> void write_scaled(float &dst, const float &src, float
         dst = src * gain;
 }
 
-template <bool Accumulate, class Ramp>
-void apply_gain(float *dst, const float *src, std::size_t frames, float coefficient, float target, bool steady,
-                const Ramp &ramp_gain) noexcept
+template <bool Accumulate> void apply_steady_gain(float *dst, const float *src, std::size_t frames, float gain) noexcept
 {
-    const auto scaled_target = Accumulate ? coefficient * target : target;
-    if (steady)
-    {
-        if (scaled_target != 0)
-            for (std::size_t frame = 0; frame < frames; ++frame)
-                write_scaled<Accumulate>(dst[frame], src[frame], scaled_target);
+    if (Accumulate && gain == 0)
         return;
-    }
+    for (std::size_t frame = 0; frame < frames; ++frame)
+        write_scaled<Accumulate>(dst[frame], src[frame], gain);
+}
 
-    const auto write_frame = [&](std::size_t frame, float gain) noexcept {
-        if (gain != 0)
-            write_scaled<Accumulate>(dst[frame], src[frame], gain);
-        else if (!Accumulate)
-            dst[frame] = 0.0f;
-    };
+template <bool Accumulate> void write_ramp_sample(float &dst, const float &src, float gain) noexcept
+{
+    if (gain != 0)
+        write_scaled<Accumulate>(dst, src, gain);
+    else if (!Accumulate)
+        dst = 0.0f;
+}
+
+template <bool Accumulate>
+void apply_ramping_gain(float *dst, const float *src, std::size_t frames, float coefficient, float start, float target,
+                        double scale) noexcept
+{
     const auto last = frames - 1;
+    const auto begin = static_cast<double>(start);
+    const auto end = static_cast<double>(target);
     for (std::size_t frame = 0; frame < last; ++frame)
     {
-        const auto gain = ramp_gain(frame);
-        write_frame(frame, Accumulate ? coefficient * gain : gain);
+        // Scale after adding the weighted endpoints so exact crossings stay zero with fused multiply-add.
+        const auto gain = static_cast<float>((begin * (last - frame) + end * (frame + 1)) * scale);
+        write_ramp_sample<Accumulate>(dst[frame], src[frame], Accumulate ? coefficient * gain : gain);
     }
-    write_frame(last, scaled_target);
+    write_ramp_sample<Accumulate>(dst[last], src[last], Accumulate ? coefficient * target : target);
 }
 } // namespace
 
 Matrix::Matrix(SampleRate rate, std::size_t channels, float gain)
-    : NodeT({{PortSpec(rate, channels)}}, {{PortSpec(rate, channels)}}), target_(gain), gain_(gain)
+    : NodeT({PortSpec(rate, channels, SampleFormat::F32P)}, {PortSpec(rate, channels, SampleFormat::F32P)}),
+      target_(gain), gain_(gain)
 {
     if (!inputs()[0].valid() || !std::isfinite(gain))
         throw std::invalid_argument("Invalid matrix specification");
 }
 Matrix::Matrix(SampleRate rate, std::size_t input_channels, std::size_t output_channels, View<const float> coefficients,
                float gain)
-    : NodeT({{PortSpec(rate, input_channels)}}, {{PortSpec(rate, output_channels)}}), target_(gain), gain_(gain)
+    : NodeT({PortSpec(rate, input_channels, SampleFormat::F32P)},
+            {PortSpec(rate, output_channels, SampleFormat::F32P)}),
+      target_(gain), gain_(gain)
 {
     if (!inputs()[0].valid() || !outputs()[0].valid() || !std::isfinite(gain))
         throw std::invalid_argument("Invalid matrix specification");
@@ -75,6 +83,10 @@ RetCode Matrix::set_gain(float gain) noexcept
     target_.store(gain, std::memory_order_release);
     return {};
 }
+float Matrix::gain() const noexcept
+{
+    return target_.load(std::memory_order_acquire);
+}
 RetCode Matrix::prepare(BlockPeriod)
 {
     reset();
@@ -86,7 +98,8 @@ void Matrix::reset() noexcept
 }
 void Matrix::process(const ProcessContext &context) noexcept
 {
-    const auto output = context.outputs[0].f32p_view();
+    const auto &output_block = context.outputs[0];
+    const auto output = output_block.f32p_view();
     const auto frames = output.frames();
     if (frames == 0)
         return;
@@ -97,30 +110,45 @@ void Matrix::process(const ProcessContext &context) noexcept
         output.clear();
         return;
     }
-    const auto input = context.inputs[0].f32p_view();
-    const auto last = frames - 1;
+    const auto &input_block = context.inputs[0];
+    const auto input = input_block.f32p_view();
     const auto scale = steady ? 0.0 : 1.0 / frames;
-    const auto ramp_gain = [start = static_cast<double>(gain_), end = static_cast<double>(target), last,
-                            scale](std::size_t frame) noexcept {
-        // Scale after adding the weighted endpoints so exact crossings stay zero with fused multiply-add.
-        return static_cast<float>((start * (last - frame) + end * (frame + 1)) * scale);
-    };
     if (coefficients_.empty())
     {
+        if (steady && target == 1.0f)
+        {
+            const auto bytes = input_block.byte_view();
+            std::memcpy(output_block.byte_view().data(), bytes.data(), bytes.size());
+            return;
+        }
         for (std::size_t ch = 0; ch < output.channels(); ++ch)
-            apply_gain<false>(output.channel(ch), input.channel(ch), frames, 1.0f, target, steady, ramp_gain);
+        {
+            auto *dst = output.channel(ch);
+            const auto *src = input.channel(ch);
+            if (steady)
+                apply_steady_gain<false>(dst, src, frames, target);
+            else
+                apply_ramping_gain<false>(dst, src, frames, 1.0f, gain_, target, scale);
+        }
     }
     else
     {
         output.clear();
+        const auto input_channels = input.channels();
         for (std::size_t dst_ch = 0; dst_ch < output.channels(); ++dst_ch)
         {
             auto *dst = output.channel(dst_ch);
-            for (std::size_t src_ch = 0; src_ch < input.channels(); ++src_ch)
+            const auto *row = coefficients_.data() + dst_ch * input_channels;
+            for (std::size_t src_ch = 0; src_ch < input_channels; ++src_ch)
             {
-                const auto coefficient = coefficients_[dst_ch * input.channels() + src_ch];
-                if (coefficient != 0)
-                    apply_gain<true>(dst, input.channel(src_ch), frames, coefficient, target, steady, ramp_gain);
+                const auto coefficient = row[src_ch];
+                if (coefficient == 0)
+                    continue;
+                const auto *src = input.channel(src_ch);
+                if (steady)
+                    apply_steady_gain<true>(dst, src, frames, coefficient * target);
+                else
+                    apply_ramping_gain<true>(dst, src, frames, coefficient, gain_, target, scale);
             }
         }
     }

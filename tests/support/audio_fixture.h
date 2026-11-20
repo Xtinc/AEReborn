@@ -22,7 +22,7 @@ class FloatSource : public NodeT<0, 1>
   public:
     using Generator = std::function<float(std::uint64_t, std::size_t)>;
     FloatSource(SampleRate rate, std::size_t channels, Generator generate)
-        : NodeT({}, {{PortSpec(rate, channels)}}), generate_(std::move(generate))
+        : NodeT({}, {PortSpec(rate, channels, SampleFormat::F32P)}), generate_(std::move(generate))
     {
     }
     RetCode prepare(BlockPeriod) override
@@ -48,7 +48,7 @@ class FloatSource : public NodeT<0, 1>
 class PacketSink final : public NodeT<1, 0>
 {
   public:
-    explicit PacketSink(PortSpec spec) : NodeT({{spec}}, {}) {}
+    explicit PacketSink(PortSpec spec) : NodeT({spec}, {}) {}
     RetCode prepare(BlockPeriod period) override
     {
         const auto spec = inputs()[0];

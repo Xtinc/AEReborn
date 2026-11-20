@@ -97,7 +97,7 @@ void buffer_resize_rollback()
 
 void conversion_rollback()
 {
-    const PortSpec input(rate, 1, SampleFormat::F32LE), output(SampleRate::Hz16000, 1);
+    const PortSpec input(rate, 1, SampleFormat::F32LE), output(SampleRate::Hz16000, 1, SampleFormat::F32P);
     std::array<std::uint8_t, 960> bytes{};
     const IPortBlock input_block(bytes.data(), input, 240);
     const auto fill_input = [&](std::size_t first) {
@@ -130,34 +130,37 @@ void conversion_rollback()
         check(actual_samples == reference_samples, "Failed converter preparation retains filter history and buffers");
     }
 }
-void identity_needs_no_workspace()
+void direct_conversion_needs_no_workspace()
 {
-    for (const auto format : {SampleFormat::F32P, SampleFormat::S16LE})
+    for (const auto input_format : {SampleFormat::F32P, SampleFormat::S16LE})
     {
-        const PortSpec spec(rate, 2, format);
-        Convert convert(spec, spec);
-        RetCode code;
-        const bool failed = allocation_fails_after(0, [&] { code = convert.prepare(period); });
-        check(!failed, "Identity conversion needs no allocated conversion state or workspace");
-        checked(code);
+        for (const auto output_format : {SampleFormat::F32P, SampleFormat::S16LE})
+        {
+            Convert convert(PortSpec(rate, 2, input_format), PortSpec(rate, 2, output_format));
+            RetCode code;
+            const bool failed = allocation_fails_after(0, [&] { code = convert.prepare(period); });
+            check(!failed, "Direct conversion needs no allocated conversion state or workspace");
+            checked(code);
+        }
     }
 }
 void plan_allocation_rollback()
 {
+    const PortSpec input(rate, 1, SampleFormat::F32P);
+    const PortSpec output(SampleRate::Hz16000, 1, SampleFormat::F32P);
     for (long failure = 0;; ++failure)
     {
         Engine engine(period);
         ClockedGraph clock(engine);
         const auto source =
             checked(engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 1.0f; }));
-        const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1)));
+        const auto sink = checked(engine.emplace_node<PacketSink>(input));
         checked(engine.connect({source}, {sink}));
         checked(engine.commit());
         clock.start();
         clock.advance();
-        const auto converter =
-            checked(engine.emplace_node<Convert>(PortSpec(rate, 1), PortSpec(SampleRate::Hz16000, 1)));
-        const auto added = checked(engine.emplace_node<PacketSink>(PortSpec(SampleRate::Hz16000, 1)));
+        const auto converter = checked(engine.emplace_node<Convert>(input, output));
+        const auto added = checked(engine.emplace_node<PacketSink>(output));
         checked(engine.connect({source}, {converter}));
         checked(engine.connect({converter}, {added}));
         RetCode code;
@@ -183,8 +186,7 @@ void plan_allocation_rollback()
 class HeapProbe final : public NodeT<1, 0>
 {
   public:
-    explicit HeapProbe(bool begin) : NodeT({{PortSpec(rate, 1)}}, {}), begin_(begin) {}
-    RetCode prepare(BlockPeriod) override { return {}; }
+    explicit HeapProbe(bool begin) : NodeT({PortSpec(rate, 1, SampleFormat::F32P)}, {}), begin_(begin) {}
     void process(const ProcessContext &context) noexcept override
     {
         if (begin_ && context.tick_position == 0)
@@ -211,10 +213,12 @@ void render_uses_prepared_buffers()
     checked(engine.emplace_node<HeapProbe>(true));
     const auto source = checked(
         engine.emplace_node<FloatSource>(SampleRate::Hz44100, 1, [](std::uint64_t, std::size_t) { return 0.25f; }));
-    const auto converter = checked(engine.emplace_node<Convert>(PortSpec(SampleRate::Hz44100, 1), PortSpec(rate, 1)));
+    const PortSpec input(SampleRate::Hz44100, 1, SampleFormat::F32P);
+    const PortSpec output(rate, 1, SampleFormat::F32P);
+    const auto converter = checked(engine.emplace_node<Convert>(input, output));
     const auto mixer = checked(engine.emplace_node<Mixer>(rate, 1, 1));
     const auto matrix = checked(engine.emplace_node<Matrix>(rate, 1));
-    const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1)));
+    const auto sink = checked(engine.emplace_node<PacketSink>(output));
     checked(engine.connect({source}, {converter}));
     checked(engine.connect({converter}, {mixer}));
     checked(engine.connect({mixer}, {matrix}));
@@ -235,7 +239,7 @@ int main(int argc, char **argv)
     return run_tests(argc, argv,
                      {{"buffer_resize_rollback", buffer_resize_rollback},
                       {"conversion_rollback", conversion_rollback},
-                      {"identity_needs_no_workspace", identity_needs_no_workspace},
+                      {"direct_conversion_needs_no_workspace", direct_conversion_needs_no_workspace},
                       {"plan_allocation_rollback", plan_allocation_rollback},
                       {"render_uses_prepared_buffers", render_uses_prepared_buffers}});
 }

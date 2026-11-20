@@ -24,10 +24,9 @@ template <class T> T checked(Result<T> result)
 class Meter final : public NodeT<1, 0>
 {
   public:
-    explicit Meter(std::atomic<float> &level) : NodeT({{PortSpec(SampleRate::Hz48000, 1)}}, {}), level_(level) {}
-    RetCode prepare(BlockPeriod) override
+    explicit Meter(std::atomic<float> &level)
+        : NodeT({PortSpec(SampleRate::Hz48000, 1, SampleFormat::F32P)}, {}), level_(level)
     {
-        return {};
     }
     void process(const ProcessContext &context) noexcept override
     {

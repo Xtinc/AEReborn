@@ -60,7 +60,7 @@ class VirtualNode : public NodeT<I, O>
     template <std::size_t N> static std::array<PortSpec, N> ports(std::size_t channels)
     {
         std::array<PortSpec, N> result{};
-        result.fill(PortSpec(render_rate, channels));
+        result.fill(PortSpec(render_rate, channels, SampleFormat::F32P));
         return result;
     }
     const float gain_;

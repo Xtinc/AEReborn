@@ -95,8 +95,14 @@ constexpr std::size_t sample_bytes(SampleFormat format) noexcept
 /// per channel.
 struct PortSpec
 {
+    /// @brief Construct an empty placeholder with no valid rate or channel count.
     constexpr PortSpec() noexcept = default;
-    constexpr PortSpec(SampleRate sample_rate, std::size_t channels, SampleFormat format = SampleFormat::F32P) noexcept
+
+    /// @brief Specify the sample layout of one port.
+    /// @param sample_rate Port sample rate in hertz.
+    /// @param channels Number of channels per frame.
+    /// @param format Sample representation and layout.
+    constexpr PortSpec(SampleRate sample_rate, std::size_t channels, SampleFormat format) noexcept
         : channels(channels), sample_rate(sample_rate), format(format)
     {
     }
@@ -131,7 +137,7 @@ struct PortSpec
 
     std::size_t channels = 0;
     SampleRate sample_rate{};
-    SampleFormat format = SampleFormat::F32P;
+    SampleFormat format{};
 };
 
 /// @brief Borrow the current audio block of a port with its specification and frame count.

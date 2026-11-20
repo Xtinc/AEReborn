@@ -19,8 +19,7 @@ using namespace std::chrono_literals;
 class Signal final : public NodeT<0, 1>
 {
   public:
-    Signal() : NodeT({}, {{PortSpec(render_rate, 1)}}) {}
-    RetCode prepare(BlockPeriod) override { return {}; }
+    Signal() : NodeT({}, {PortSpec(render_rate, 1, SampleFormat::F32P)}) {}
     void process(const ProcessContext &context) noexcept override
     {
         const auto output = context.outputs[0].f32p_view();
@@ -31,10 +30,9 @@ class Signal final : public NodeT<0, 1>
 class Meter final : public NodeT<1, 0>
 {
   public:
-    Meter() : NodeT({{PortSpec(render_rate, 1)}}, {})
+    Meter() : NodeT({PortSpec(render_rate, 1, SampleFormat::F32P)}, {})
     {
     }
-    RetCode prepare(BlockPeriod) override { return {}; }
     void process(const ProcessContext &context) noexcept override
     {
         const auto input = context.inputs[0].f32p_view();
@@ -47,7 +45,7 @@ class LifetimeSink final : public NodeT<1, 0>
 {
   public:
     LifetimeSink(std::atomic<bool> &destroyed, std::atomic<bool> &on_control)
-        : NodeT({{PortSpec(render_rate, 1)}}, {}), destroyed_(destroyed), on_control_(on_control),
+        : NodeT({PortSpec(render_rate, 1, SampleFormat::F32P)}, {}), destroyed_(destroyed), on_control_(on_control),
           control_thread_(std::this_thread::get_id())
     {
     }
@@ -56,7 +54,6 @@ class LifetimeSink final : public NodeT<1, 0>
         on_control_.store(std::this_thread::get_id() == control_thread_);
         destroyed_.store(true);
     }
-    RetCode prepare(BlockPeriod) override { return {}; }
     void process(const ProcessContext &) noexcept override
     {
     }
@@ -144,11 +141,10 @@ class BlockingSink final : public NodeT<1, 0>
 {
   public:
     BlockingSink(ProcessGate &gate, std::atomic<bool> &destroyed)
-        : NodeT({{PortSpec(render_rate, 1)}}, {}), gate_(gate), destroyed_(destroyed)
+        : NodeT({PortSpec(render_rate, 1, SampleFormat::F32P)}, {}), gate_(gate), destroyed_(destroyed)
     {
     }
     ~BlockingSink() override { destroyed_.store(true); }
-    RetCode prepare(BlockPeriod) override { return {}; }
     void process(const ProcessContext &) noexcept override { gate_.hold(); }
 
   private:
@@ -186,23 +182,22 @@ class ReentrySink final : public NodeT<1, 0>
 {
   public:
     ReentrySink(Engine &engine, std::size_t &constructions)
-        : NodeT({{PortSpec(render_rate, 1)}}, {}), engine_(engine), constructions_(constructions)
+        : NodeT({PortSpec(render_rate, 1, SampleFormat::F32P)}, {}), engine_(engine), constructions_(constructions)
     {
         ++constructions_;
     }
-    RetCode prepare(BlockPeriod) override { return {}; }
     void process(const ProcessContext &) noexcept override
     {
-        commit_code = engine_.commit().code();
-        stop_code = engine_.stop().code();
-        add_code = engine_.add_node(nullptr).ret_code().code();
-        emplace_code = engine_.emplace_node<ReentrySink>(engine_, constructions_).ret_code().code();
+        commit_code = engine_.commit();
+        stop_code = engine_.stop();
+        add_code = engine_.add_node(nullptr).ret_code();
+        emplace_code = engine_.emplace_node<ReentrySink>(engine_, constructions_).ret_code();
     }
 
-    ErrorCode commit_code = ErrorCode::Ok;
-    ErrorCode stop_code = ErrorCode::Ok;
-    ErrorCode add_code = ErrorCode::Ok;
-    ErrorCode emplace_code = ErrorCode::Ok;
+    RetCode commit_code;
+    RetCode stop_code;
+    RetCode add_code;
+    RetCode emplace_code;
 
   private:
     Engine &engine_;

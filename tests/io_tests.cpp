@@ -93,7 +93,8 @@ void binding_period_change()
 }
 void topology_format_switch()
 {
-    const PortSpec planar(rate, 1), old_pcm(rate, 1, SampleFormat::S16LE), new_pcm(rate, 1, SampleFormat::F32LE);
+    const PortSpec planar(rate, 1, SampleFormat::F32P);
+    const PortSpec old_pcm(rate, 1, SampleFormat::S16LE), new_pcm(rate, 1, SampleFormat::F32LE);
     std::vector<std::uint8_t> old_bytes(480), new_bytes(960);
     Engine engine(period);
     ClockedGraph clock(engine);

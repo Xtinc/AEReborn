@@ -19,6 +19,14 @@ static_assert(std::is_convertible<OFBlock, IFBlock>::value, "Writable blocks bec
 static_assert(!std::is_convertible<IFBlock, OFBlock>::value, "Read-only blocks cannot become writable");
 static_assert(std::is_convertible<OPortBlock, IPortBlock>::value, "Port outputs become read-only inputs");
 static_assert(!std::is_convertible<IPortBlock, OPortBlock>::value, "An input cannot become a writable port output");
+static_assert(!std::is_constructible<PortSpec, SampleRate, std::size_t>::value,
+              "Specifying a port requires a sample format");
+constexpr RetCode busy(ErrorCode::Busy);
+static_assert(busy == RetCode(ErrorCode::Busy) && busy != RetCode{}, "Return codes compare by error code");
+static_assert(busy == ErrorCode::Busy && ErrorCode::Busy == busy, "Equality accepts an error code on either side");
+static_assert(busy != ErrorCode::Ok && ErrorCode::Ok != busy, "Inequality accepts an error code on either side");
+static_assert(std::is_same<decltype(std::declval<Result<NodeId> &>().value()), NodeId &>::value,
+              "A mutable result exposes its value by reference");
 
 void audio_block_layout()
 {
@@ -59,7 +67,7 @@ void engine_timing_validation()
         check(node->prepares == 0, "The engine rejects an invalid period before preparing nodes");
         expect_error(ErrorCode::NotPrepared, engine.start());
     }
-    const PortSpec spec(SampleRate::Hz44100, 2);
+    const PortSpec spec(SampleRate::Hz44100, 2, SampleFormat::F32P);
     check(spec.max_frames(render_period) == 221, "Capacity covers the longer fractional block");
     std::size_t total = 0;
     for (std::uint64_t tick = 0; tick < 200; ++tick)
@@ -74,7 +82,7 @@ void engine_timing_validation()
     check(spec.frames(render_period, large) == 221, "Per-block frame counts avoid tick multiplication overflow");
     Engine engine(render_period);
     check(engine.block_period() == render_period, "The engine exposes its configured block period");
-    check(PortSpec(SampleRate::Hz48000, 1).frames(engine.block_period(), large) == 240,
+    check(PortSpec(SampleRate::Hz48000, 1, SampleFormat::F32P).frames(engine.block_period(), large) == 240,
           "Integer frame counts are constant across the tick timeline");
 }
 

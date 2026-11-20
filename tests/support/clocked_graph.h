@@ -56,8 +56,7 @@ class ClockedGraph
     class Gate final : public NodeT<1, 0>
     {
       public:
-        Gate() : NodeT({{PortSpec(SampleRate::Hz48000, 1)}}, {}) {}
-        RetCode prepare(BlockPeriod) override { return {}; }
+        Gate() : NodeT({PortSpec(SampleRate::Hz48000, 1, SampleFormat::F32P)}, {}) {}
         void process(const ProcessContext &) noexcept override
         {
             std::unique_lock<std::mutex> lock(mutex_);

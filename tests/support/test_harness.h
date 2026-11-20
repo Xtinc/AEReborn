@@ -33,7 +33,7 @@ template <class T> T checked(Result<T> result)
 
 inline void expect_error(ErrorCode expected, RetCode code)
 {
-    check(code.code() == expected, code.message());
+    check(code == expected, code.message());
 }
 
 template <class T> void expect_error(ErrorCode expected, const Result<T> &result)
