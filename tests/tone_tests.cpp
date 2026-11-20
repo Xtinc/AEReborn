@@ -1,5 +1,5 @@
-#include "plugins/tone.h"
 #include "support/audio_fixture.h"
+#include "support/tone.h"
 #include <limits>
 namespace
 {
@@ -13,7 +13,7 @@ void tone_timeline()
     const PortSpec spec(SampleRate::Hz11025, 2, SampleFormat::F32P);
     const auto source = checked(engine.emplace_node<Tone>(spec.sample_rate, 2, 997, 0.25f));
     const auto sink = checked(engine.emplace_node<PacketSink>(spec));
-    checked(engine.connect({source}, {sink}));
+    checked(engine.connect(OPORT(source, 0), IPORT(sink, 0)));
     checked(engine.commit());
     auto *out = checked(engine.node<PacketSink>(sink));
     clock.start();

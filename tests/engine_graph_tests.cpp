@@ -95,19 +95,19 @@ void connection_validation()
     const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>());
     const auto sink = checked(engine.emplace_node<VirtualNode<1, 0>>());
     const auto stereo = checked(engine.emplace_node<VirtualNode<1, 0>>(2));
-    const auto connection = checked(engine.connect({source}, {sink}));
-    expect_error(ErrorCode::DuplicateConn, engine.connect({source}, {sink}));
+    const auto connection = checked(engine.connect(OPORT(source, 0), IPORT(sink, 0)));
+    expect_error(ErrorCode::DuplicateConn, engine.connect(OPORT(source, 0), IPORT(sink, 0)));
     const auto second = checked(engine.emplace_node<VirtualNode<0, 1>>());
-    expect_error(ErrorCode::InputConnected, engine.connect({second}, {sink}));
-    expect_error(ErrorCode::InvalidPort, engine.connect({sink}, {source}));
-    expect_error(ErrorCode::InvalidPort, engine.connect({source, 1}, {sink}));
-    expect_error(ErrorCode::InvalidPort, engine.connect({source}, {sink, 1}));
-    expect_error(ErrorCode::FormatMismatch, engine.connect({source}, {stereo}));
+    expect_error(ErrorCode::InputConnected, engine.connect(OPORT(second, 0), IPORT(sink, 0)));
+    expect_error(ErrorCode::InvalidPort, engine.connect(OPORT(sink, 0), IPORT(source, 0)));
+    expect_error(ErrorCode::InvalidPort, engine.connect(OPORT(source, 1), IPORT(sink, 0)));
+    expect_error(ErrorCode::InvalidPort, engine.connect(OPORT(source, 0), IPORT(sink, 1)));
+    expect_error(ErrorCode::FormatMismatch, engine.connect(OPORT(source, 0), IPORT(stereo, 0)));
     expect_error(ErrorCode::InvalidType, engine.node<VirtualNode<>>(source));
     Engine other(render_period);
     const auto foreign = checked(other.emplace_node<VirtualNode<>>());
-    expect_error(ErrorCode::UnknownNode, engine.connect({foreign}, {sink}));
-    expect_error(ErrorCode::UnknownNode, engine.connect({source}, {foreign}));
+    expect_error(ErrorCode::UnknownNode, engine.connect(OPORT(foreign, 0), IPORT(sink, 0)));
+    expect_error(ErrorCode::UnknownNode, engine.connect(OPORT(source, 0), IPORT(foreign, 0)));
     checked(engine.commit());
     clock.start();
     clock.advance(); // Rejected graph edits must not invalidate the prepared graph.
@@ -125,14 +125,14 @@ void feedback_rejection()
     const auto b = checked(engine.emplace_node<VirtualNode<>>());
     const auto c = checked(engine.emplace_node<VirtualNode<>>());
     const auto sink = checked(engine.emplace_node<VirtualNode<1, 0>>());
-    checked(engine.connect({a}, {b}));
-    checked(engine.connect({b}, {c}));
-    checked(engine.connect({c}, {sink}));
+    checked(engine.connect(OPORT(a, 0), IPORT(b, 0)));
+    checked(engine.connect(OPORT(b, 0), IPORT(c, 0)));
+    checked(engine.connect(OPORT(c, 0), IPORT(sink, 0)));
     checked(engine.commit());
-    expect_error(ErrorCode::Cycle, engine.connect({c}, {a, 1}));
-    expect_error(ErrorCode::Cycle, engine.connect({a, 1}, {a, 1}));
+    expect_error(ErrorCode::Cycle, engine.connect(OPORT(c, 0), IPORT(a, 1)));
+    expect_error(ErrorCode::Cycle, engine.connect(OPORT(a, 1), IPORT(a, 1)));
     checked(engine.set_paused(b, true));
-    expect_error(ErrorCode::Cycle, engine.connect({c}, {a, 1}));
+    expect_error(ErrorCode::Cycle, engine.connect(OPORT(c, 0), IPORT(a, 1)));
     checked(engine.set_paused(b, false));
     clock.start();
     clock.advance();
@@ -140,8 +140,8 @@ void feedback_rejection()
           "Rejected feedback leaves the valid graph executable");
     const auto x = checked(engine.emplace_node<VirtualNode<>>());
     const auto y = checked(engine.emplace_node<VirtualNode<>>());
-    checked(engine.connect({x}, {y}));
-    expect_error(ErrorCode::Cycle, engine.connect({y}, {x}));
+    checked(engine.connect(OPORT(x, 0), IPORT(y, 0)));
+    expect_error(ErrorCode::Cycle, engine.connect(OPORT(y, 0), IPORT(x, 0)));
 }
 
 void commit_retry()
@@ -155,7 +155,7 @@ void commit_retry()
     check(engine.tick_position() == 1, "A prepared graph advances one period");
     const auto processor = checked(engine.emplace_node<VirtualNode<>>());
     const auto sink = checked(engine.emplace_node<VirtualNode<1, 0>>());
-    checked(engine.connect({processor}, {sink}));
+    checked(engine.connect(OPORT(processor, 0), IPORT(sink, 0)));
     auto *node = checked(engine.node<VirtualNode<>>(processor));
     node->preparation = ErrorCode::InvalidArg;
     expect_error(ErrorCode::InvalidArg, engine.commit());
@@ -186,7 +186,7 @@ void buffer_pool_capacity()
     const auto channels = std::vector<float>{}.max_size() / (2 * render_frames) + 1;
     const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>(channels));
     const auto sink = checked(engine.emplace_node<VirtualNode<2, 0>>(channels));
-    checked(engine.connect({source}, {sink, 0}));
+    checked(engine.connect(OPORT(source, 0), IPORT(sink, 0)));
     expect_error(ErrorCode::TooLarge, engine.commit());
     checked(engine.remove_node(sink));
     checked(engine.commit());
@@ -231,8 +231,8 @@ void node_exception_propagation()
     const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>());
     const auto processor = checked(engine.emplace_node<ThrowingNode>());
     const auto sink = checked(engine.emplace_node<VirtualNode<1, 0>>());
-    checked(engine.connect({source}, {processor}));
-    checked(engine.connect({processor}, {sink}));
+    checked(engine.connect(OPORT(source, 0), IPORT(processor, 0)));
+    checked(engine.connect(OPORT(processor, 0), IPORT(sink, 0)));
     expect_exception<std::runtime_error>([&] { engine.commit(); });
     clock.advance();
     check(engine.tick_position() == 2, "The previous plan runs after a preparation exception");
@@ -251,7 +251,7 @@ void node_replacement()
     ClockedGraph clock(engine);
     const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>());
     const auto sink = checked(engine.emplace_node<VirtualNode<1, 0>>());
-    checked(engine.connect({source}, {sink}));
+    checked(engine.connect(OPORT(source, 0), IPORT(sink, 0)));
     checked(engine.commit());
     clock.start();
     clock.advance();
@@ -304,12 +304,12 @@ void handle_uniqueness()
     Engine engine(render_period);
     const auto a = checked(engine.emplace_node<VirtualNode<>>());
     const auto b = checked(engine.emplace_node<VirtualNode<>>());
-    const auto connection = checked(engine.connect({a}, {b}));
+    const auto connection = checked(engine.connect(OPORT(a, 0), IPORT(b, 0)));
 
     Engine other(BlockPeriod::Ms10);
     const auto x = checked(other.emplace_node<VirtualNode<>>());
     const auto y = checked(other.emplace_node<VirtualNode<>>());
-    const auto other_connection = checked(other.connect({x}, {y}));
+    const auto other_connection = checked(other.connect(OPORT(x, 0), IPORT(y, 0)));
     std::array<std::uint64_t, 6> ids{{a.value, b.value, connection.value, x.value, y.value, other_connection.value}};
     std::sort(ids.begin(), ids.end());
     check(ids.front() != 0 && std::adjacent_find(ids.begin(), ids.end()) == ids.end(),
@@ -317,7 +317,7 @@ void handle_uniqueness()
 
     checked(engine.remove_node(a));
     const auto replacement = checked(engine.emplace_node<VirtualNode<>>());
-    const auto replacement_connection = checked(engine.connect({replacement}, {b}));
+    const auto replacement_connection = checked(engine.connect(OPORT(replacement, 0), IPORT(b, 0)));
     check(replacement != a && replacement_connection != connection, "Removed identifiers are not reused");
 }
 

@@ -32,8 +32,8 @@ void matrix_mapping()
     const auto matrix =
         checked(engine.emplace_node<Matrix>(rate, 3, 2, std::initializer_list<float>{1, 0, -0.5f, 0, 2, 1}, 0.5f));
     const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 2, SampleFormat::F32P)));
-    checked(engine.connect({src}, {matrix}));
-    checked(engine.connect({matrix}, {sink}));
+    checked(engine.connect(OPORT(src, 0), IPORT(matrix, 0)));
+    checked(engine.connect(OPORT(matrix, 0), IPORT(sink, 0)));
     checked(engine.commit());
     clock.start();
     clock.advance();
@@ -66,8 +66,8 @@ void check_gain_ramp(bool identity)
     const auto matrix = checked(identity ? engine.emplace_node<Matrix>(rate, 1)
                                          : engine.emplace_node<Matrix>(rate, 1, 1, std::initializer_list<float>{2}));
     const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1, SampleFormat::F32P)));
-    checked(engine.connect({source}, {matrix}));
-    checked(engine.connect({matrix}, {sink}));
+    checked(engine.connect(OPORT(source, 0), IPORT(matrix, 0)));
+    checked(engine.connect(OPORT(matrix, 0), IPORT(sink, 0)));
     checked(engine.commit());
     clock.start();
     clock.advance();
@@ -105,9 +105,9 @@ void mixer_mute()
     const auto b = checked(engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 2.0f; }));
     const auto mix = checked(engine.emplace_node<Mixer>(rate, 1, 2));
     const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1, SampleFormat::F32P)));
-    checked(engine.connect({a}, {mix, 0}));
-    checked(engine.connect({b}, {mix, 1}));
-    checked(engine.connect({mix}, {sink}));
+    checked(engine.connect(OPORT(a, 0), IPORT(mix, 0)));
+    checked(engine.connect(OPORT(b, 0), IPORT(mix, 1)));
+    checked(engine.connect(OPORT(mix, 0), IPORT(sink, 0)));
     checked(engine.commit());
     clock.start();
     clock.advance();

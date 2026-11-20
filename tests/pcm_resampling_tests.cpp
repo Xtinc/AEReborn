@@ -17,8 +17,8 @@ std::vector<float> resample(SampleRate from, SampleRate to, double frequency)
     const PortSpec input(from, 2, SampleFormat::F32P), output(to, 2, SampleFormat::F32P);
     const auto converter = checked(engine.emplace_node<Convert>(input, output));
     const auto sink = checked(engine.emplace_node<PacketSink>(output));
-    checked(engine.connect({source}, {converter}));
-    checked(engine.connect({converter}, {sink}));
+    checked(engine.connect(OPORT(source, 0), IPORT(converter, 0)));
+    checked(engine.connect(OPORT(converter, 0), IPORT(sink, 0)));
     checked(engine.commit());
     auto *out = checked(engine.node<PacketSink>(sink));
     std::vector<float> result;
@@ -85,14 +85,14 @@ void late_join()
     const PortSpec input(input_rate, 1, SampleFormat::F32P), output(rate, 1, SampleFormat::F32P);
     const auto original = checked(engine.emplace_node<Convert>(input, output));
     const auto sink = checked(engine.emplace_node<PacketSink>(output));
-    checked(engine.connect({source}, {original}));
-    checked(engine.connect({original}, {sink}));
+    checked(engine.connect(OPORT(source, 0), IPORT(original, 0)));
+    checked(engine.connect(OPORT(original, 0), IPORT(sink, 0)));
     checked(engine.commit());
     clock.start(); // Submit while the first, longer input block is in flight.
     const auto added = checked(engine.emplace_node<Convert>(input, output));
     const auto monitor = checked(engine.emplace_node<PacketSink>(output));
-    checked(engine.connect({source}, {added}));
-    checked(engine.connect({added}, {monitor}));
+    checked(engine.connect(OPORT(source, 0), IPORT(added, 0)));
+    checked(engine.connect(OPORT(added, 0), IPORT(monitor, 0)));
     clock.commit();
     auto *a = checked(engine.node<PacketSink>(sink));
     auto *b = checked(engine.node<PacketSink>(monitor));

@@ -1,5 +1,5 @@
-#ifndef AEREBORN_PLUGINS_TONE_H
-#define AEREBORN_PLUGINS_TONE_H
+#ifndef AEREBORN_TESTS_TONE_H
+#define AEREBORN_TESTS_TONE_H
 #include "core/graph.h"
 namespace aereborn
 {

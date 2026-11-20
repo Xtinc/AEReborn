@@ -17,7 +17,7 @@ void buffer_binding()
                output = checked(engine.emplace_node<Playback>(spec));
     auto *capture = checked(engine.node<Capture>(input));
     auto *playback = checked(engine.node<Playback>(output));
-    checked(engine.connect({input}, {output}));
+    checked(engine.connect(OPORT(input, 0), IPORT(output, 0)));
     expect_error(ErrorCode::NotPrepared, capture->bind({bytes.data(), bytes.size()}, 0));
     checked(engine.commit());
     expect_error(ErrorCode::InvalidArg, capture->bind({bytes.data(), 440}, 0));
@@ -51,7 +51,7 @@ void future_binding()
     ClockedGraph clock(engine);
     const auto source = checked(engine.emplace_node<Capture>(spec)),
                sink = checked(engine.emplace_node<PacketSink>(spec));
-    checked(engine.connect({source}, {sink}));
+    checked(engine.connect(OPORT(source, 0), IPORT(sink, 0)));
     checked(engine.commit());
     auto *capture = checked(engine.node<Capture>(source));
     checked(capture->bind({bytes.data(), bytes.size()}, 1));
@@ -101,8 +101,8 @@ void topology_format_switch()
     auto input = checked(engine.emplace_node<Capture>(old_pcm));
     auto convert = checked(engine.emplace_node<Convert>(old_pcm, planar));
     const auto sink = checked(engine.emplace_node<PacketSink>(planar));
-    checked(engine.connect({input}, {convert}));
-    checked(engine.connect({convert}, {sink}));
+    checked(engine.connect(OPORT(input, 0), IPORT(convert, 0)));
+    checked(engine.connect(OPORT(convert, 0), IPORT(sink, 0)));
     checked(engine.commit());
     old_bytes[1] = 0x40;
     checked(checked(engine.node<Capture>(input))->bind({old_bytes.data(), old_bytes.size()}, 0));
@@ -115,8 +115,8 @@ void topology_format_switch()
     checked(engine.remove_node(convert));
     input = checked(engine.emplace_node<Capture>(new_pcm));
     convert = checked(engine.emplace_node<Convert>(new_pcm, planar));
-    checked(engine.connect({input}, {convert}));
-    checked(engine.connect({convert}, {sink}));
+    checked(engine.connect(OPORT(input, 0), IPORT(convert, 0)));
+    checked(engine.connect(OPORT(convert, 0), IPORT(sink, 0)));
     clock.commit();
     const auto tick = engine.tick_position();
     write_f32le(new_bytes.data(), -0.25f);

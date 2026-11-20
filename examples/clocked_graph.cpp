@@ -1,7 +1,7 @@
 #include "core/engine.h"
 #include "plugins/matrix.h"
 #include "plugins/mixer.h"
-#include "plugins/tone.h"
+#include "tests/support/tone.h"
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -51,9 +51,9 @@ int main()
         const auto mix = checked(engine.emplace_node<Mixer>(SampleRate::Hz48000, 1, 1));
         const auto matrix = checked(engine.emplace_node<Matrix>(SampleRate::Hz48000, 1));
         const auto sink = checked(engine.emplace_node<Meter>(level));
-        checked(engine.connect({tone}, {mix}));
-        checked(engine.connect({mix}, {matrix}));
-        checked(engine.connect({matrix}, {sink}));
+        checked(engine.connect(OPORT(tone, 0), IPORT(mix, 0)));
+        checked(engine.connect(OPORT(mix, 0), IPORT(matrix, 0)));
+        checked(engine.connect(OPORT(matrix, 0), IPORT(sink, 0)));
         auto *gain = checked(engine.node<Matrix>(matrix));
         checked(engine.commit());
         checked(engine.start());

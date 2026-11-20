@@ -31,11 +31,11 @@ Node A 的 OPort ── Connection ──> Node B 的 IPort
 | Port | 节点上的多声道音频入口或出口，固定声明采样率、声道数和格式 |
 | Connection | 将上游输出零拷贝地借给同规格的下游输入，只读 |
 
-`IPort` 和 `OPort` 用节点 ID 和从零开始的下标定位端口。`PortSpec` 固定声明采样率、声道数和 `SampleFormat`。连接两端必须完全一致，否则返回 `FormatMismatch`；需要转换时显式插入 Convert。一个输入端口只能接一个来源，重复占用返回 `InputConnected`，多路求和使用 Mixer 的不同输入。没有连接的输入得到该格式的零值静音。
+使用 `engine.connect(OPORT(source, 0), IPORT(destination, 0))` 将源节点的第一个输出连到目标节点的第一个输入。`IPORT()` 和 `OPORT()` 接受节点 ID 和从零开始的端口下标，`connect()` 校验下标。`PortSpec` 固定声明采样率、声道数和 `SampleFormat`。连接两端必须完全一致，否则返回 `FormatMismatch`；需要转换时显式插入 Convert。一个输入端口只能接一个来源，重复占用返回 `InputConnected`，多路求和使用 Mixer 的不同输入。没有连接的输入得到该格式的零值静音。
 一个 Port 表示一组声道，声道间的选择、复制和合并由 Matrix 表达。
 `NodeId` 标识图中的节点，替换节点实例时 ID 继续有效。`ConnId` 标识一次连接，重新连接相同端口会生成新的 ID。原型采用进程内不复用的唯一 ID。Node 不持有其他 Node 的共享所有权，也不各自维护连接列表或调度循环。
 
-Source、Processor、Mixer、Sink 是具体节点的用途。`plugins/` 中的 Capture、Playback 是设备缓冲交接节点，Convert 是格式与采样率转换节点。Mixer、Matrix 和 Tone 是只支持 planar float 的普通插件；算法节点可以声明自己需要的 PCM 格式。
+Source、Processor、Mixer、Sink 是具体节点的用途。Convert 负责格式与采样率转换。Mixer、Matrix 和 Tone 使用 planar float，算法节点可以声明自己需要的 PCM 格式。测试使用 Capture、Playback 模拟设备缓冲交接，使用 Tone 生成信号。
 
 | 用途 | 职责 | 当前实现 |
 | --- | --- | --- |
@@ -58,7 +58,7 @@ PCM 适配器和固定端口数量的自定义节点通常继承 `NodeT<I, O>`�
 
 ## 3. 引擎骨架
 
-core 提供 Node、端口描述、只读/可写块视图和 Engine。plugins 提供按功能命名的 Convert、Mixer、Matrix、Capture、Playback、Tone。
+`core/` 提供 Node、端口描述、只读/可写块视图和 Engine。`plugins/` 提供 Convert、Mixer、Matrix。`tests/support/` 提供设备缓冲交接节点 Capture、Playback 和信号源 Tone，时钟示例复用 Tone。
 
 Engine 持有编辑图和渲染计划。`commit()` 按依赖排序，从无输出的 Sink 遍历可达节点；未连接到 Sink 的分支不执行。每个可达节点每周期只执行一次。
 
@@ -72,7 +72,7 @@ Engine 持有编辑图和渲染计划。`commit()` 按依赖排序，从无输�
 
 ## 4. 执行与时钟
 
-每个运行中的 Engine 由一条内置软件时钟线程串行执行渲染。设备通过边界适配器交换数据。当前 Capture / Playback 每次交接一个基础周期的数据，后端负责将实际硬件收发整理为这个粒度。跨周期拼拆包留待后续实现。
+每个运行中的 Engine 由一条内置软件时钟线程串行执行渲染。设备通过边界适配器交换数据。测试节点 Capture / Playback 每次交接一个基础周期的数据，后端负责将实际硬件收发整理为这个粒度。跨周期拼拆包留待后续实现。
 
 Engine(BlockPeriod) 固定推进周期。调用方可用 block_period() 查询周期，节点可从 ProcessContext 读取周期。tick_position() 返回已完成的周期数，停止后重启继续计数，reset() 归零。每个 process() 收到本周期开始时的 tick_position。
 
@@ -187,7 +187,7 @@ Convert 在构造时按端口格式选择编解码实现。相同规格按字节
 
 ### 构建与验证
 
-项目使用 C++14，core 通过 CMake 链接 Threads::Threads。应用链接 aereborn::plugins，单独使用核心可链接 aereborn::core。
+项目使用 C++14，core 通过 CMake 链接 Threads::Threads。应用链接 aereborn::plugins，单独使用核心可链接 aereborn::core。只构建这两个库时，可在配置时设置 `-DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF`。
 
 ~~~powershell
 cmake -S . -B build -DBUILD_TESTING=ON

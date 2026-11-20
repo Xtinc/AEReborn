@@ -1,5 +1,5 @@
-#ifndef AEREBORN_PLUGINS_IO_H
-#define AEREBORN_PLUGINS_IO_H
+#ifndef AEREBORN_TESTS_IO_H
+#define AEREBORN_TESTS_IO_H
 #include "core/graph.h"
 #include <limits>
 namespace aereborn

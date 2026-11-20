@@ -1,5 +1,5 @@
 add_executable(clocked_graph clocked_graph.cpp)
-target_link_libraries(clocked_graph PRIVATE aereborn::plugins)
+target_link_libraries(clocked_graph PRIVATE aereborn::plugins aereborn_test_plugins)
 if(BUILD_TESTING)
     add_test(NAME example.clocked_graph COMMAND clocked_graph)
     set_tests_properties(example.clocked_graph PROPERTIES LABELS example TIMEOUT 20)

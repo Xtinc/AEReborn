@@ -23,18 +23,19 @@ add_library(aereborn_plugins STATIC
     plugins/convert.cpp
     plugins/matrix.cpp
     plugins/mixer.cpp
-    plugins/io.cpp
-    plugins/tone.cpp
 )
 add_library(aereborn::plugins ALIAS aereborn_plugins)
 target_link_libraries(aereborn_plugins PUBLIC aereborn::core)
 
 include(CTest)
+option(BUILD_EXAMPLES "Build AEReborn examples" ON)
+
+if(BUILD_TESTING OR BUILD_EXAMPLES)
+    add_subdirectory(tests/support)
+endif()
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()
-
-option(BUILD_EXAMPLES "Build AEReborn examples" ON)
 if(BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()

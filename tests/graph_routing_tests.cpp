@@ -1,7 +1,7 @@
 #include "plugins/matrix.h"
 #include "plugins/mixer.h"
-#include "plugins/tone.h"
 #include "support/audio_fixture.h"
+#include "support/tone.h"
 #include <array>
 namespace
 {
@@ -18,11 +18,11 @@ void explicit_mix_and_fanout()
         checked(engine.emplace_node<Matrix>(rate, 2, 2, std::initializer_list<float>{0, 1, 1, 0}, 0.5f));
     const auto first = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 2, SampleFormat::F32P)));
     const auto second = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 2, SampleFormat::F32P)));
-    checked(engine.connect({a}, {mix, 0}));
-    checked(engine.connect({b}, {mix, 1}));
-    checked(engine.connect({mix}, {matrix}));
-    checked(engine.connect({matrix}, {first}));
-    checked(engine.connect({matrix}, {second}));
+    checked(engine.connect(OPORT(a, 0), IPORT(mix, 0)));
+    checked(engine.connect(OPORT(b, 0), IPORT(mix, 1)));
+    checked(engine.connect(OPORT(mix, 0), IPORT(matrix, 0)));
+    checked(engine.connect(OPORT(matrix, 0), IPORT(first, 0)));
+    checked(engine.connect(OPORT(matrix, 0), IPORT(second, 0)));
     checked(engine.commit());
     auto *one = checked(engine.node<PacketSink>(first));
     auto *two = checked(engine.node<PacketSink>(second));
@@ -76,12 +76,12 @@ void algorithm_chain()
     const auto algorithm = checked(engine.emplace_node<Algorithm>());
     const auto up = checked(engine.emplace_node<Convert>(pcm, bus));
     const auto sink = checked(engine.emplace_node<PacketSink>(bus));
-    expect_error(ErrorCode::FormatMismatch, engine.connect({mix}, {algorithm}));
-    checked(engine.connect({tone}, {mix}));
-    checked(engine.connect({mix}, {down}));
-    checked(engine.connect({down}, {algorithm}));
-    checked(engine.connect({algorithm}, {up}));
-    checked(engine.connect({up}, {sink}));
+    expect_error(ErrorCode::FormatMismatch, engine.connect(OPORT(mix, 0), IPORT(algorithm, 0)));
+    checked(engine.connect(OPORT(tone, 0), IPORT(mix, 0)));
+    checked(engine.connect(OPORT(mix, 0), IPORT(down, 0)));
+    checked(engine.connect(OPORT(down, 0), IPORT(algorithm, 0)));
+    checked(engine.connect(OPORT(algorithm, 0), IPORT(up, 0)));
+    checked(engine.connect(OPORT(up, 0), IPORT(sink, 0)));
     checked(engine.commit());
     auto *output = checked(engine.node<PacketSink>(sink));
     auto *algo = checked(engine.node<Algorithm>(algorithm));
@@ -114,7 +114,7 @@ void silence_and_pruning()
     auto *output = checked(engine.node<PacketSink>(sink));
     check(input->calls == 0 && input->prepares == 0 && output->sample(0) == 0,
           "Orphan sources are pruned and disconnected inputs are silence");
-    const auto conn = checked(engine.connect({source}, {sink}));
+    const auto conn = checked(engine.connect(OPORT(source, 0), IPORT(sink, 0)));
     clock.commit();
     const auto connected_calls = input->calls;
     clock.advance();
@@ -142,7 +142,7 @@ void shared_silence()
     const auto *a = add_sink(planar), *b = add_sink(wide_planar), *c = add_sink(pcm), *d = add_sink(wide_pcm);
     const auto connected = checked(engine.emplace_node<PacketSink>(wide_planar));
     const auto *output = checked(engine.node<PacketSink>(connected));
-    checked(engine.connect({source}, {connected}));
+    checked(engine.connect(OPORT(source, 0), IPORT(connected, 0)));
     checked(engine.commit());
     clock.start();
     for (std::uint64_t tick = 0; tick < 2; ++tick)
@@ -185,11 +185,11 @@ void format_validation()
                             PortSpec(rate, 1, SampleFormat::S16LE)})
     {
         const auto sink = checked(engine.emplace_node<PacketSink>(spec));
-        expect_error(ErrorCode::FormatMismatch, engine.connect({source}, {sink}));
+        expect_error(ErrorCode::FormatMismatch, engine.connect(OPORT(source, 0), IPORT(sink, 0)));
     }
     const auto mixer = checked(engine.emplace_node<Mixer>(rate, 1, 1));
     const auto raw = checked(engine.emplace_node<Capture>(PortSpec(rate, 1, SampleFormat::S16LE)));
-    expect_error(ErrorCode::FormatMismatch, engine.connect({raw}, {mixer}));
+    expect_error(ErrorCode::FormatMismatch, engine.connect(OPORT(raw, 0), IPORT(mixer, 0)));
 }
 void channel_split_same_tick()
 {
@@ -213,12 +213,12 @@ void channel_split_same_tick()
     const auto mix = checked(engine.emplace_node<Mixer>(split_rate, 4, 2));
     const auto first = checked(engine.emplace_node<PacketSink>(PortSpec(split_rate, 4, SampleFormat::F32P)));
     const auto second = checked(engine.emplace_node<PacketSink>(PortSpec(split_rate, 4, SampleFormat::F32P)));
-    checked(engine.connect({source}, {a}));
-    checked(engine.connect({source}, {b}));
-    checked(engine.connect({a}, {first}));
-    checked(engine.connect({b}, {mix, 0}));
-    checked(engine.connect({other}, {mix, 1}));
-    checked(engine.connect({mix}, {second}));
+    checked(engine.connect(OPORT(source, 0), IPORT(a, 0)));
+    checked(engine.connect(OPORT(source, 0), IPORT(b, 0)));
+    checked(engine.connect(OPORT(a, 0), IPORT(first, 0)));
+    checked(engine.connect(OPORT(b, 0), IPORT(mix, 0)));
+    checked(engine.connect(OPORT(other, 0), IPORT(mix, 1)));
+    checked(engine.connect(OPORT(mix, 0), IPORT(second, 0)));
     checked(engine.commit());
     const auto *input = checked(engine.node<FloatSource>(source));
     const auto *out_a = checked(engine.node<PacketSink>(first));

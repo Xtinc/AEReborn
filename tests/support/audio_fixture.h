@@ -1,9 +1,9 @@
 #ifndef AEREBORN_TESTS_AUDIO_FIXTURE_H
 #define AEREBORN_TESTS_AUDIO_FIXTURE_H
 #include "clocked_graph.h"
+#include "io.h"
 #include "pcm_reference.h"
 #include "plugins/convert.h"
-#include "plugins/io.h"
 #include "test_harness.h"
 #include <algorithm>
 #include <cmath>
@@ -90,8 +90,8 @@ struct Conversion
         const auto input_id = checked(engine.emplace_node<Capture>(input));
         const auto convert_id = checked(engine.emplace_node<Convert>(input, output));
         const auto sink_id = checked(engine.emplace_node<PacketSink>(output));
-        checked(engine.connect({input_id}, {convert_id}));
-        checked(engine.connect({convert_id}, {sink_id}));
+        checked(engine.connect(OPORT(input_id, 0), IPORT(convert_id, 0)));
+        checked(engine.connect(OPORT(convert_id, 0), IPORT(sink_id, 0)));
         checked(engine.commit());
         capture = checked(engine.node<Capture>(input_id));
         sink = checked(engine.node<PacketSink>(sink_id));

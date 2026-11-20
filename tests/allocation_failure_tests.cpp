@@ -155,14 +155,14 @@ void plan_allocation_rollback()
         const auto source =
             checked(engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 1.0f; }));
         const auto sink = checked(engine.emplace_node<PacketSink>(input));
-        checked(engine.connect({source}, {sink}));
+        checked(engine.connect(OPORT(source, 0), IPORT(sink, 0)));
         checked(engine.commit());
         clock.start();
         clock.advance();
         const auto converter = checked(engine.emplace_node<Convert>(input, output));
         const auto added = checked(engine.emplace_node<PacketSink>(output));
-        checked(engine.connect({source}, {converter}));
-        checked(engine.connect({converter}, {added}));
+        checked(engine.connect(OPORT(source, 0), IPORT(converter, 0)));
+        checked(engine.connect(OPORT(converter, 0), IPORT(added, 0)));
         RetCode code;
         clock.resume();
         const bool failed = allocation_fails_after(failure, [&] { code = engine.commit(); });
@@ -219,10 +219,10 @@ void render_uses_prepared_buffers()
     const auto mixer = checked(engine.emplace_node<Mixer>(rate, 1, 1));
     const auto matrix = checked(engine.emplace_node<Matrix>(rate, 1));
     const auto sink = checked(engine.emplace_node<PacketSink>(output));
-    checked(engine.connect({source}, {converter}));
-    checked(engine.connect({converter}, {mixer}));
-    checked(engine.connect({mixer}, {matrix}));
-    checked(engine.connect({matrix}, {sink}));
+    checked(engine.connect(OPORT(source, 0), IPORT(converter, 0)));
+    checked(engine.connect(OPORT(converter, 0), IPORT(mixer, 0)));
+    checked(engine.connect(OPORT(mixer, 0), IPORT(matrix, 0)));
+    checked(engine.connect(OPORT(matrix, 0), IPORT(sink, 0)));
     checked(engine.commit());
     clock.start();
     const auto probe = checked(engine.emplace_node<HeapProbe>(false));

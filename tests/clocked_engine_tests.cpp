@@ -80,13 +80,13 @@ void plan_switch()
     ClockedGraph clock(engine);
     const auto source = checked(engine.emplace_node<Signal>());
     const auto sink = checked(engine.emplace_node<Meter>());
-    checked(engine.connect({source}, {sink}));
+    checked(engine.connect(OPORT(source, 0), IPORT(sink, 0)));
     checked(engine.commit());
     clock.start();
     clock.advance();
     const auto added = checked(engine.emplace_node<Meter>());
     const auto *new_meter = checked(engine.node<Meter>(added));
-    checked(engine.connect({source}, {added}));
+    checked(engine.connect(OPORT(source, 0), IPORT(added, 0)));
     clock.commit();
     clock.advance();
     check(new_meter->last == 1, "Blocks after commit render the submitted plan");
@@ -247,9 +247,9 @@ void live_graph_edits()
     const auto source = checked(engine.emplace_node<Signal>());
     const auto bus = checked(engine.emplace_node<VirtualNode<>>());
     const auto output = checked(engine.node<VirtualNode<>>(bus));
-    checked(engine.connect({source}, {bus}));
+    checked(engine.connect(OPORT(source, 0), IPORT(bus, 0)));
     const auto endpoint = checked(engine.emplace_node<Meter>());
-    checked(engine.connect({bus}, {endpoint}));
+    checked(engine.connect(OPORT(bus, 0), IPORT(endpoint, 0)));
     checked(engine.commit());
     checked(engine.start());
     wait_until([&] { return engine.tick_position() >= 1; });
@@ -263,7 +263,7 @@ void live_graph_edits()
             checked(engine.remove_node(sink));
         }
         sink = checked(engine.emplace_node<Meter>());
-        checked(engine.connect({bus}, {sink}));
+        checked(engine.connect(OPORT(bus, 0), IPORT(sink, 0)));
         const auto *meter = checked(engine.node<Meter>(sink));
         checked(engine.commit());
         wait_until([&] { return meter->last == 1; });
@@ -286,9 +286,9 @@ void pause_shared_branch()
     const auto *branch = checked(engine.node<VirtualNode<>>(bus));
     const auto *endpoint = checked(engine.node<VirtualNode<1, 0>>(sink));
     const auto *other = checked(engine.node<Meter>(other_sink));
-    checked(engine.connect({source}, {bus}));
-    checked(engine.connect({bus}, {sink}));
-    checked(engine.connect({source}, {other_sink}));
+    checked(engine.connect(OPORT(source, 0), IPORT(bus, 0)));
+    checked(engine.connect(OPORT(bus, 0), IPORT(sink, 0)));
+    checked(engine.connect(OPORT(source, 0), IPORT(other_sink, 0)));
     checked(engine.commit());
     clock.start();
     clock.advance();
