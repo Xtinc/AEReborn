@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace aereborn
@@ -113,7 +114,14 @@ template <SampleFormat Format> void encode_pcm(IFBlock input, std::uint8_t *dest
 constexpr std::size_t order = 48;
 constexpr std::size_t taps = 2 * order;
 constexpr std::uint32_t phase_steps = 100;
+constexpr unsigned fraction_bits = 32;
+constexpr auto phase_unit = std::uint64_t{1} << fraction_bits;
 constexpr double pi = 3.141592653589793;
+
+std::uint64_t step_units(double step) noexcept
+{
+    return static_cast<std::uint64_t>(step * phase_unit + 0.5);
+}
 
 // Window and cutoff ported from AudioDriver's SincInterpolator.
 double sinc_kernel(double x, double cutoff) noexcept
@@ -132,11 +140,8 @@ double sinc_kernel(double x, double cutoff) noexcept
 
 using Coefficients = std::array<float, taps>;
 
-void calc_coffs(const float *kernel, std::uint32_t dst_fs, std::uint64_t src_pos, Coefficients &coffs) noexcept
+void calc_coffs(const float *kernel, std::size_t phase_index, float phase_frac, Coefficients &coffs) noexcept
 {
-    const auto phase_pos = (src_pos % dst_fs) * phase_steps;
-    const auto phase_index = phase_pos / dst_fs;
-    const auto phase_frac = static_cast<float>(phase_pos % dst_fs) / static_cast<float>(dst_fs);
     const auto *lo_coffs = kernel + phase_index * taps;
     const auto *hi_coffs = lo_coffs + taps;
     for (std::size_t i = 0; i < taps; ++i)
@@ -160,86 +165,62 @@ float interpolate(const float *history, const float *input, std::size_t history_
     return static_cast<float>(sum);
 }
 
-class SincResampler
+RetCode prepare_filter(Buffer &history, std::vector<float> &kernel, std::size_t channels, double cutoff)
 {
-  public:
-    SincResampler(SampleRate input, SampleRate output) noexcept
-        : src_fs_(static_cast<std::uint32_t>(input)), dst_fs_(static_cast<std::uint32_t>(output))
+    const auto code = history.resize(channels, taps);
+    if (!code)
+        return code;
+    kernel.resize((phase_steps + 1) * taps);
+    for (std::uint32_t phase = 0; phase <= phase_steps; ++phase)
     {
-    }
-    RetCode prepare(std::size_t channels)
-    {
-        const auto code = history_.resize(channels, taps);
-        if (!code)
-            return code;
-        kernel_.resize((phase_steps + 1) * taps);
-        const auto cutoff = std::min(1.0, static_cast<double>(dst_fs_) / src_fs_) * 0.98;
-        for (std::uint32_t phase = 0; phase <= phase_steps; ++phase)
+        auto *coffs = kernel.data() + phase * taps;
+        const auto fraction = static_cast<double>(phase) / phase_steps;
+        double scale = 0;
+        for (std::size_t i = 0; i < taps; ++i)
         {
-            auto *coffs = kernel_.data() + phase * taps;
-            const auto fraction = static_cast<double>(phase) / phase_steps;
-            double scale = 0;
-            for (std::size_t i = 0; i < taps; ++i)
-            {
-                coffs[i] = static_cast<float>(sinc_kernel(fraction + order - 1 - i, cutoff));
-                scale += coffs[i];
-            }
-            for (std::size_t i = 0; i < taps; ++i)
-                coffs[i] = static_cast<float>(coffs[i] / scale);
+            coffs[i] = static_cast<float>(sinc_kernel(fraction + order - 1 - i, cutoff));
+            scale += coffs[i];
         }
-        return {};
+        for (std::size_t i = 0; i < taps; ++i)
+            coffs[i] = static_cast<float>(coffs[i] / scale);
     }
-    void reset() noexcept
-    {
-        history_.clear();
-    }
-    void process(IFBlock input, OFBlock output, BlockPeriod period, std::uint64_t tick) noexcept;
+    return {};
+}
 
-  private:
-    const std::uint32_t src_fs_;
-    const std::uint32_t dst_fs_;
-    Buffer history_;
-    std::vector<float> kernel_;
-};
-
-void SincResampler::process(IFBlock input, OFBlock output, BlockPeriod period, std::uint64_t tick) noexcept
+void filter_frame(OFBlock past, const std::vector<float> &kernel, IFBlock input, OFBlock output,
+                  std::size_t out_frame, std::size_t through, std::size_t phase_index, float phase_fraction) noexcept
 {
-    const auto past = history_.block(taps);
-    // src_pos is in units of 1 / the output sample rate; the first taps frames address history.
-    const auto rounding = [period, tick](std::uint32_t rate) {
-        const auto remainder =
-            (tick % 1000) * ((std::uint64_t{rate} * static_cast<std::uint32_t>(period)) % 1000) % 1000;
-        return static_cast<std::int64_t>((1000 - remainder) % 1000);
-    };
-    const auto phase = (rounding(dst_fs_) * src_fs_ - rounding(src_fs_) * dst_fs_) / 1000;
-    auto src_pos = static_cast<std::uint64_t>(dst_fs_ + phase);
+    const auto history_offset = std::min(through, taps);
+    const auto input_offset = through - history_offset;
     Coefficients coffs;
-    for (std::size_t frame = 0; frame < output.frames(); ++frame, src_pos += src_fs_)
+    calc_coffs(kernel.data(), phase_index, phase_fraction, coffs);
+    for (std::size_t ch = 0; ch < output.channels(); ++ch)
     {
-        calc_coffs(kernel_.data(), dst_fs_, src_pos, coffs);
-        const auto frame_index = static_cast<std::size_t>(src_pos / dst_fs_);
-        const auto history_offset = std::min(frame_index, taps);
-        const auto input_offset = frame_index - history_offset;
-        for (std::size_t ch = 0; ch < output.channels(); ++ch)
-        {
-            output.channel(ch)[frame] = interpolate(past.channel(ch) + history_offset, input.channel(ch) + input_offset,
-                                                    taps - history_offset, coffs);
-        }
-    }
-
-    const auto copy_frames = std::min(input.frames(), taps);
-    const auto keep_frames = taps - copy_frames;
-    for (std::size_t ch = 0; ch < input.channels(); ++ch)
-    {
-        auto *history_samples = past.channel(ch);
-        std::memmove(history_samples, history_samples + copy_frames, keep_frames * sizeof(float));
-        std::copy_n(input.channel(ch) + input.frames() - copy_frames, copy_frames, history_samples + keep_frames);
+        const auto *samples = through ? input.channel(ch) + input_offset : nullptr;
+        output.channel(ch)[out_frame] =
+            interpolate(past.channel(ch) + history_offset, samples, taps - history_offset, coffs);
     }
 }
 
-} // namespace
+void remember(Buffer &history, IFBlock input, std::size_t consumed) noexcept
+{
+    if (!consumed)
+        return;
+    const auto past = history.block(taps);
+    const auto copy_frames = std::min(consumed, taps);
+    const auto keep_frames = taps - copy_frames;
+    for (std::size_t ch = 0; ch < past.channels(); ++ch)
+    {
+        auto *history_samples = past.channel(ch);
+        std::memmove(history_samples, history_samples + copy_frames, keep_frames * sizeof(float));
+        std::copy_n(input.channel(ch) + consumed - copy_frames, copy_frames, history_samples + keep_frames);
+    }
+}
 
-Convert::Codec Convert::codec_for(SampleFormat format) noexcept
+using DecodeFn = void (*)(const std::uint8_t *, OFBlock);
+using EncodeFn = void (*)(IFBlock, std::uint8_t *);
+
+std::pair<DecodeFn, EncodeFn> codec_for(SampleFormat format) noexcept
 {
     switch (format)
     {
@@ -259,98 +240,360 @@ Convert::Codec Convert::codec_for(SampleFormat format) noexcept
     return {nullptr, nullptr};
 }
 
-struct Convert::State
+template <class Byte> bool matches(ByteBlock<Byte> block, PortSpec spec) noexcept
 {
-    State(SampleRate input, SampleRate output) : resampler(input, output)
+    return block.spec() == spec;
+}
+
+template <class Float> bool matches(FloatBlock<Float> block, PortSpec spec) noexcept
+{
+    return spec.format == SampleFormat::F32P && block.channels() == spec.channels;
+}
+
+template <class Byte> bool valid_block(ByteBlock<Byte> block) noexcept
+{
+    return !block.frames() || block.byte_view().data() != nullptr;
+}
+
+template <class Float> bool valid_block(FloatBlock<Float> block) noexcept
+{
+    return block.valid();
+}
+
+constexpr auto frame_limit = std::numeric_limits<std::size_t>::max() / 16;
+
+bool valid_offset(double offset) noexcept
+{
+    return offset >= 0.0 && offset < 0.5;
+}
+
+bool needs_fir(PortSpec input, PortSpec output, double offset) noexcept
+{
+    return input.sample_rate != output.sample_rate || offset > 0;
+}
+
+double nominal_step(PortSpec input, PortSpec output) noexcept
+{
+    return static_cast<double>(static_cast<std::uint32_t>(input.sample_rate)) /
+           static_cast<std::uint32_t>(output.sample_rate);
+}
+
+Result<std::size_t> workspace_bound(PortSpec input, PortSpec output, std::size_t frames, double offset,
+                                    bool bound_input) noexcept
+{
+    if (!input.valid() || !output.valid() || !valid_offset(offset))
+        return ErrorCode::InvalidArg;
+    if (input.channels != output.channels)
+        return ErrorCode::FormatMismatch;
+    if (frames > frame_limit)
+        return ErrorCode::TooLarge;
+    if (!frames || !needs_fir(input, output, offset))
+        return frames;
+
+    const auto nominal = nominal_step(input, output);
+    const auto step = nominal * (bound_input ? 1 + offset : 1 - offset);
+    const auto fixed = static_cast<long double>(step_units(step)) / phase_unit;
+    // Cover both the nominal rate envelope and the actual quantized stream step.
+    const auto edge = bound_input ? std::max<long double>(step, fixed) : std::min<long double>(step, fixed);
+    const auto ratio = bound_input ? edge : 1 / edge;
+    // After a capped upsampling call the next output may use the last source frame in history.
+    const auto history = bound_input ? 0.0L : std::max(0.0L, 1 - edge);
+    const auto count = static_cast<long double>(frames) + history;
+    auto scaled = count * ratio;
+    // For exceptionally large bounds, round outward even when long double has double precision.
+    const auto precision_limit = std::ldexp(1.0L, std::numeric_limits<long double>::digits - 3);
+    if (count >= precision_limit || scaled >= precision_limit)
     {
+        const auto infinity = std::numeric_limits<long double>::infinity();
+        scaled = std::nextafter(std::nextafter(count, infinity) * std::nextafter(ratio, infinity), infinity);
+    }
+    const auto rounded = std::ceil(scaled);
+    if (rounded >= static_cast<long double>(frame_limit))
+        return ErrorCode::TooLarge;
+    return static_cast<std::size_t>(rounded) + 1;
+}
+} // namespace
+
+template <class Byte, class Float> struct Convert::NativeBlock
+{
+    NativeBlock(ByteBlock<Byte> block) noexcept : frames(block.frames())
+    {
+        if (block.spec().format == SampleFormat::F32P)
+            planar = block.f32p_view();
+        else
+            pcm = block.byte_view().data();
     }
 
-    RetCode prepare(PortSpec input, PortSpec output, BlockPeriod period)
-    {
-        const bool resampling = input.sample_rate != output.sample_rate;
-        if (input.format != SampleFormat::F32P)
-        {
-            const auto code = decoded.resize(input.channels, input.max_frames(period));
-            if (!code)
-                return code;
-        }
-        if (!resampling)
-            return {};
-        if (output.format != SampleFormat::F32P)
-        {
-            const auto code = converted.resize(output.channels, output.max_frames(period));
-            if (!code)
-                return code;
-        }
-        return resampler.prepare(input.channels);
-    }
+    NativeBlock(FloatBlock<Float> block) noexcept : planar(block), frames(block.frames()) {}
 
-    Buffer decoded;
-    Buffer converted;
-    SincResampler resampler;
+    FloatBlock<Float> f32p_view() const noexcept { return planar.subblock(0, frames); }
+
+    FloatBlock<Float> planar;
+    std::size_t frames;
+    Byte *pcm = nullptr;
 };
 
-Convert::Convert(PortSpec input, PortSpec output)
-    : NodeT({input}, {output}), decode_(codec_for(input.format).first), encode_(codec_for(output.format).second)
+void Convert::Position::advance(std::uint64_t step, std::uint64_t unit) noexcept
+{
+    const auto next = fraction + step;
+    through += static_cast<std::size_t>(next / unit);
+    fraction = next % unit;
+}
+
+Convert::Position Convert::tick_position(std::uint32_t src_fs, std::uint32_t dst_fs, const ProcessContext &context) noexcept
+{
+    // Express the difference between the two rounded block starts in 1 / dst_fs units.
+    const auto rounding = [&context](std::uint32_t rate) {
+        const auto period = static_cast<std::uint32_t>(context.block_period);
+        const auto rem = (context.tick_position % 1000) * ((std::uint64_t{rate} * period) % 1000) % 1000;
+        return static_cast<std::int64_t>((1000 - rem) % 1000);
+    };
+    const auto phase = (rounding(dst_fs) * src_fs - rounding(src_fs) * dst_fs) / 1000;
+    const auto start = static_cast<std::uint64_t>(dst_fs + phase);
+    return {static_cast<std::size_t>(start / dst_fs), start % dst_fs};
+}
+
+RetCode Convert::check_output(std::size_t frames, double scale) const noexcept
+{
+    if (!max_output_frames_)
+        return ErrorCode::NotPrepared;
+    if (!(scale >= 1 - max_rate_offset_ && scale <= 1 + max_rate_offset_))
+        return ErrorCode::InvalidArg;
+    return frames <= max_output_frames_ ? RetCode{} : RetCode{ErrorCode::TooLarge};
+}
+
+Result<std::size_t> Convert::required_input(std::size_t frames, double scale) const noexcept
+{
+    const auto code = check_output(frames, scale);
+    if (!code)
+        return code;
+    if (!frames)
+        return std::size_t{0};
+
+    auto needed = static_cast<std::uint64_t>(frames);
+    if (need_fir_)
+    {
+        const auto step = step_units(nominal_ * scale);
+        const auto whole = step >> fraction_bits;
+        const auto count = static_cast<std::uint64_t>(frames - 1);
+        // Up to 18 source frames per output are possible at the allowed offset limit.
+        if (whole && count > max_input_frames_ / whole)
+            return ErrorCode::TooLarge;
+        const auto frac = std::uint64_t{static_cast<std::uint32_t>(step)};
+        const auto low = position_.fraction + frac * static_cast<std::uint32_t>(count);
+        needed = position_.through + count * whole + (count >> fraction_bits) * frac + (low >> fraction_bits);
+    }
+    if (needed > max_input_frames_)
+        return ErrorCode::TooLarge;
+    return static_cast<std::size_t>(needed);
+}
+
+Convert::Transfer Convert::run(NativeBlock<const std::uint8_t, const float> input, NativeBlock<std::uint8_t, float> output,
+             double scale, const ProcessContext *tick) noexcept
+{
+    if (!need_fir_)
+    {
+        input.frames = output.frames = std::min(input.frames, output.frames);
+        if (!input.frames)
+            return {};
+        if (same_spec_)
+        {
+            if (encode_)
+                std::memcpy(output.pcm, input.pcm, input.frames * inputs()[0].channels * sample_bytes(inputs()[0].format));
+            else
+                for (std::size_t ch = 0; ch < input.planar.channels(); ++ch)
+                    std::memcpy(output.planar.channel(ch), input.planar.channel(ch), input.frames * sizeof(float));
+            return {input.frames, output.frames};
+        }
+    }
+    else if (!output.frames && !tick)
+        return {};
+
+    IFBlock samples;
+    if (decode_)
+    {
+        const auto workspace = need_fir_ || encode_ ? workspace_.decoded.block(input.frames) : output.f32p_view();
+        decode_(input.pcm, workspace);
+        samples = workspace;
+    }
+    else
+        samples = input.f32p_view();
+
+    if (!need_fir_)
+    {
+        if (encode_)
+            encode_(samples, output.pcm);
+        return {input.frames, output.frames};
+    }
+
+    Position phase;
+    std::uint64_t step, unit;
+    if (tick)
+    {
+        const auto src_fs = static_cast<std::uint32_t>(tick->inputs[0].spec().sample_rate);
+        const auto dst_fs = static_cast<std::uint32_t>(tick->outputs[0].spec().sample_rate);
+        phase = tick_position(src_fs, dst_fs, *tick);
+        step = src_fs;
+        unit = dst_fs;
+    }
+    else
+    {
+        phase = position_;
+        step = step_units(nominal_ * scale);
+        unit = phase_unit;
+    }
+
+    const auto dest = encode_ ? workspace_.converted.block(output.frames) : output.f32p_view();
+    const auto past = workspace_.history.block(taps);
+    Transfer result;
+    std::size_t last = 0;
+    while (result.produced < output.frames && phase.through <= input.frames)
+    {
+        last = phase.through;
+        const auto phase_pos = phase.fraction * phase_steps;
+        const auto index = static_cast<std::size_t>(phase_pos / unit);
+        const auto blend = static_cast<float>(phase_pos % unit) / static_cast<float>(unit);
+        filter_frame(past, workspace_.kernel, samples, dest, result.produced, last, index, blend);
+        ++result.produced;
+        phase.advance(step, unit);
+    }
+
+    // The graph supplies a new block every tick. A stream keeps unconsumed input with the caller.
+    result.consumed = input.frames;
+    if (!tick)
+    {
+        const auto skipped = phase.through ? phase.through - 1 : 0;
+        result.consumed = std::min(input.frames, std::max(last, skipped));
+        position_ = {phase.through - result.consumed, phase.fraction};
+    }
+    remember(workspace_.history, samples, result.consumed);
+    if (encode_ && result.produced)
+        encode_(workspace_.converted.block(result.produced), output.pcm);
+    return result;
+}
+
+Convert::Convert(PortSpec input, PortSpec output) : NodeT({input}, {output})
 {
     if (!input.valid() || !output.valid())
         throw std::invalid_argument("Invalid converter port specification");
     if (input.channels != output.channels)
         throw std::invalid_argument("Converter input and output channel counts must match");
+    decode_ = codec_for(input.format).first;
+    encode_ = codec_for(output.format).second;
+    same_spec_ = input == output;
+    nominal_ = nominal_step(input, output);
 }
 
-Convert::~Convert() = default;
+RetCode Convert::prepare(std::size_t max_in, std::size_t max_out, double offset)
+{
+    if (!max_in || !max_out || !valid_offset(offset))
+        return ErrorCode::InvalidArg;
+    const auto input = inputs()[0], output = outputs()[0];
+    const auto limit = std::numeric_limits<std::size_t>::max();
+    if (max_in > frame_limit || max_out > frame_limit || max_in > limit / sample_bytes(input.format) / input.channels ||
+        max_out > limit / sample_bytes(output.format) / output.channels)
+        return ErrorCode::TooLarge;
+    if (offset != max_rate_offset_ || max_in > alloc_input_frames_ || max_out > alloc_output_frames_)
+    {
+        const auto fir = needs_fir(input, output, offset);
+        Workspace next;
+        if (decode_ && (fir || (encode_ && !same_spec_)))
+        {
+            const auto code = next.decoded.resize(input.channels, max_in);
+            if (!code)
+                return code;
+        }
+        if (fir)
+        {
+            if (encode_)
+            {
+                const auto code = next.converted.resize(output.channels, max_out);
+                if (!code)
+                    return code;
+            }
+            const auto cutoff = static_cast<double>(static_cast<std::uint32_t>(output.sample_rate)) /
+                                static_cast<std::uint32_t>(input.sample_rate) / (1 + offset);
+            const auto code = prepare_filter(next.history, next.kernel, input.channels, std::min(1.0, cutoff) * 0.98);
+            if (!code)
+                return code;
+        }
+        workspace_ = std::move(next);
+        need_fir_ = fir;
+        max_rate_offset_ = offset;
+        alloc_input_frames_ = max_in;
+        alloc_output_frames_ = max_out;
+    }
+    max_input_frames_ = max_in;
+    max_output_frames_ = max_out;
+    reset();
+    return {};
+}
 
 RetCode Convert::prepare(BlockPeriod period)
 {
-    const auto input = inputs()[0], output = outputs()[0];
-    const bool same_rate = input.sample_rate == output.sample_rate;
-    if (input == output || (same_rate && (!decode_ || !encode_)))
-        return {};
-    auto next = std::make_unique<State>(input.sample_rate, output.sample_rate);
-    const auto code = next->prepare(input, output, period);
-    if (code)
-        state_.swap(next);
-    return code;
+    if (!is_block_period(period))
+        return ErrorCode::InvalidArg;
+    return prepare(inputs()[0].max_frames(period), outputs()[0].max_frames(period));
 }
 
 void Convert::reset() noexcept
 {
-    if (state_)
-        state_->resampler.reset();
+    position_ = {};
+    workspace_.history.clear();
 }
 
 void Convert::process(const ProcessContext &context) noexcept
 {
-    const auto input = context.inputs[0];
-    const auto output = context.outputs[0];
-    const auto input_spec = input.spec();
-    const auto output_spec = output.spec();
-    if (input_spec == output_spec)
-    {
-        const auto bytes = input.byte_view();
-        if (!bytes.empty())
-            std::memcpy(output.byte_view().data(), bytes.data(), bytes.size());
-        return;
-    }
-
-    const bool resampling = input_spec.sample_rate != output_spec.sample_rate;
-    IFBlock samples;
-    if (!decode_)
-        samples = input.f32p_view();
-    else
-    {
-        const auto decoded = resampling || encode_ ? state_->decoded.block(input.frames()) : output.f32p_view();
-        decode_(input.byte_view().data(), decoded);
-        samples = decoded;
-    }
-    if (resampling)
-    {
-        const auto converted = encode_ ? state_->converted.block(output.frames()) : output.f32p_view();
-        state_->resampler.process(samples, converted, context.block_period, context.tick_position);
-        samples = converted;
-    }
-    if (encode_)
-        encode_(samples, output.byte_view().data());
+    const auto transfer = run(context.inputs[0], context.outputs[0], 1, &context);
+    assert(transfer.produced == context.outputs[0].frames());
+    (void)transfer;
 }
+
+template <class Input, class Output>
+Result<Convert::Transfer> Convert::process_blocks(Input input, Output output, double scale) noexcept
+{
+    const auto code = check_output(output.frames(), scale);
+    if (!code)
+        return code;
+    if (!matches(input, inputs()[0]) || !matches(output, outputs()[0]))
+        return ErrorCode::FormatMismatch;
+    if (input.frames() > max_input_frames_)
+        return ErrorCode::TooLarge;
+    if (!valid_block(input) || !valid_block(output))
+        return ErrorCode::InvalidArg;
+    return run(input, output, scale);
+}
+
+Result<Convert::Transfer> Convert::process(IBBlock input, OBBlock output, double scale) noexcept
+{
+    return process_blocks(input, output, scale);
+}
+
+Result<Convert::Transfer> Convert::process(IBBlock input, OFBlock output, double scale) noexcept
+{
+    return process_blocks(input, output, scale);
+}
+
+Result<Convert::Transfer> Convert::process(IFBlock input, OBBlock output, double scale) noexcept
+{
+    return process_blocks(input, output, scale);
+}
+
+Result<Convert::Transfer> Convert::process(IFBlock input, OFBlock output, double scale) noexcept
+{
+    return process_blocks(input, output, scale);
+}
+
+Result<std::size_t> Convert::max_output_frames(PortSpec input, PortSpec output, std::size_t frames,
+                                               double offset) noexcept
+{
+    return workspace_bound(input, output, frames, offset, false);
+}
+
+Result<std::size_t> Convert::max_input_frames(PortSpec input, PortSpec output, std::size_t frames,
+                                              double offset) noexcept
+{
+    return workspace_bound(input, output, frames, offset, true);
+}
+
 } // namespace aereborn

@@ -3,6 +3,8 @@
 #include <stdexcept>
 namespace aereborn
 {
+namespace test
+{
 Capture::Capture(PortSpec spec) : NodeT({}, {spec})
 {
     if (!spec.valid())
@@ -55,4 +57,5 @@ void Playback::reset() noexcept
 {
     buffer_.reset();
 }
+} // namespace test
 } // namespace aereborn

@@ -1,4 +1,5 @@
 #include "core/engine.h"
+#include "core/fring.h"
 #include "support/clocked_graph.h"
 #include "support/test_harness.h"
 #include "support/test_node.h"
@@ -17,8 +18,8 @@ using namespace aereborn;
 using namespace aereborn::test;
 static_assert(std::is_convertible<OFBlock, IFBlock>::value, "Writable blocks become read-only views");
 static_assert(!std::is_convertible<IFBlock, OFBlock>::value, "Read-only blocks cannot become writable");
-static_assert(std::is_convertible<OPortBlock, IPortBlock>::value, "Port outputs become read-only inputs");
-static_assert(!std::is_convertible<IPortBlock, OPortBlock>::value, "An input cannot become a writable port output");
+static_assert(std::is_convertible<OBBlock, IBBlock>::value, "Port outputs become read-only inputs");
+static_assert(!std::is_convertible<IBBlock, OBBlock>::value, "An input cannot become a writable port output");
 static_assert(!std::is_constructible<PortSpec, SampleRate, std::size_t>::value,
               "Specifying a port requires a sample format");
 constexpr RetCode busy(ErrorCode::Busy);
@@ -27,6 +28,39 @@ static_assert(busy == ErrorCode::Busy && ErrorCode::Busy == busy, "Equality acce
 static_assert(busy != ErrorCode::Ok && ErrorCode::Ok != busy, "Inequality accepts an error code on either side");
 static_assert(std::is_same<decltype(std::declval<Result<NodeId> &>().value()), NodeId &>::value,
               "A mutable result exposes its value by reference");
+
+void frame_ring()
+{
+    FrameRing ring;
+    checked(ring.prepare(2, 5));
+    std::array<float, 16> samples{}, played{};
+    const OFBlock input(samples.data(), 2, 8, 8), output(played.data(), 2, 8, 8);
+    for (std::size_t ch = 0; ch < 2; ++ch)
+        for (std::size_t frame = 0; frame < input.frames(); ++frame)
+            input.channel(ch)[frame] = static_cast<float>(100 * ch + frame + 1);
+    check(ring.write(input.subblock(0, 1)) == 1 && ring.read(output.subblock(0, 1)) == 1,
+          "The ring can start subsequent transfers at a nonzero physical offset");
+    for (int pass = 0; pass < 6; ++pass)
+    {
+        check(ring.write(input.subblock(1, 4)) == 4 && ring.write(input.subblock(5, 2)) == 1,
+              "Ring stores complete frames up to capacity");
+        check(ring.write(input) == 0 && ring.available() == 5, "A full ring keeps its old samples");
+        expect_error(ErrorCode::TooLarge, ring.prepare(2, std::numeric_limits<std::size_t>::max()));
+        played.fill(-1.0f);
+        check(ring.read(output.subblock(2, 6)) == 5 && ring.read(output) == 0,
+              "Reading drains only available frames after a rejected prepare");
+        for (std::size_t ch = 0; ch < 2; ++ch)
+        {
+            check(std::equal(input.channel(ch) + 1, input.channel(ch) + 6,
+                             output.channel(ch) + 2),
+                  "Both channels retain their order across cursor wraps");
+            check(output.channel(ch)[1] == -1 && output.channel(ch)[7] == -1,
+                  "Raw ring reads leave surrounding frames alone");
+        }
+        check(ring.read(OFBlock{nullptr, 2, 0, 0}) == 0 && ring.write(IFBlock{nullptr, 2, 0, 0}) == 0,
+              "Empty views do not touch sample storage");
+    }
+}
 
 void audio_block_layout()
 {
@@ -67,23 +101,39 @@ void engine_timing_validation()
         check(node->prepares == 0, "The engine rejects an invalid period before preparing nodes");
         expect_error(ErrorCode::NotPrepared, engine.start());
     }
-    const PortSpec spec(SampleRate::Hz44100, 2, SampleFormat::F32P);
-    check(spec.max_frames(render_period) == 221, "Capacity covers the longer fractional block");
-    std::size_t total = 0;
-    for (std::uint64_t tick = 0; tick < 200; ++tick)
+    const struct
     {
-        const auto frames = spec.frames(render_period, tick);
-        check(frames == (tick % 2 ? 220 : 221), "Fractional frames follow the shared tick timeline");
-        total += frames;
-        check(total == spec.frame_position(render_period, tick + 1), "No cumulative rounding drift");
-    }
-    check(total == 44100, "One second contains exactly 44100 frames");
+        BlockPeriod period;
+        std::uint64_t ticks_per_second;
+        std::uint64_t fractional_cycle_ticks;
+        std::size_t short_frames;
+        std::size_t integer_frames;
+    } cases[] = {{BlockPeriod::Ms02, 500, 5, 88, 96}, {render_period, 200, 2, 220, 240}};
+    const PortSpec fractional(SampleRate::Hz44100, 2, SampleFormat::F32P);
+    const PortSpec integer(SampleRate::Hz48000, 1, SampleFormat::F32P);
     const auto large = std::numeric_limits<std::uint64_t>::max() - 1;
-    check(spec.frames(render_period, large) == 221, "Per-block frame counts avoid tick multiplication overflow");
-    Engine engine(render_period);
-    check(engine.block_period() == render_period, "The engine exposes its configured block period");
-    check(PortSpec(SampleRate::Hz48000, 1, SampleFormat::F32P).frames(engine.block_period(), large) == 240,
-          "Integer frame counts are constant across the tick timeline");
+    for (const auto &test : cases)
+    {
+        Engine engine(test.period);
+        checked(engine.commit());
+        check(engine.block_period() == test.period, "The engine exposes its configured block period");
+        check(fractional.max_frames(test.period) == test.short_frames + 1,
+              "Capacity covers the longer fractional block");
+        std::size_t total = 0;
+        for (std::uint64_t tick = 0; tick < test.ticks_per_second; ++tick)
+        {
+            const auto frames = fractional.frames(test.period, tick);
+            check(frames == test.short_frames + (tick % test.fractional_cycle_ticks == 0),
+                  "Fractional frames follow the shared tick timeline");
+            total += frames;
+            check(total == fractional.frame_position(test.period, tick + 1), "No cumulative rounding drift");
+        }
+        check(total == 44100, "One second contains exactly 44100 frames");
+        check(fractional.frames(test.period, large) == test.short_frames + (large % test.fractional_cycle_ticks == 0),
+              "Per-block frame counts avoid tick multiplication overflow");
+        check(integer.frames(test.period, large) == test.integer_frames,
+              "Integer frame counts are constant across the tick timeline");
+    }
 }
 
 void connection_validation()
@@ -327,6 +377,7 @@ int main(int argc, char **argv)
 {
     return aereborn::test::run_tests(argc, argv,
                                      {{"audio_block_layout", audio_block_layout},
+                                      {"frame_ring", frame_ring},
                                       {"engine_timing_validation", engine_timing_validation},
                                       {"connection_validation", connection_validation},
                                       {"feedback_rejection", feedback_rejection},

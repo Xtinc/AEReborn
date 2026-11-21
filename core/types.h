@@ -25,6 +25,7 @@ enum class SampleRate : std::uint32_t
 /// @brief Supported durations of one engine tick, in milliseconds.
 enum class BlockPeriod : std::uint32_t
 {
+    Ms02 = 2,
     Ms05 = 5,
     Ms10 = 10,
     Ms20 = 20,
@@ -65,8 +66,8 @@ constexpr bool is_sample_rate(SampleRate sample_rate) noexcept
 }
 constexpr bool is_block_period(BlockPeriod period) noexcept
 {
-    return period == BlockPeriod::Ms05 || period == BlockPeriod::Ms10 || period == BlockPeriod::Ms20 ||
-           period == BlockPeriod::Ms40;
+    return period == BlockPeriod::Ms02 || period == BlockPeriod::Ms05 || period == BlockPeriod::Ms10 ||
+           period == BlockPeriod::Ms20 || period == BlockPeriod::Ms40;
 }
 constexpr unsigned int sample_bits(SampleFormat format) noexcept
 {
@@ -140,29 +141,30 @@ struct PortSpec
     SampleFormat format{};
 };
 
-/// @brief Borrow the current audio block of a port with its specification and frame count.
+/// @brief Borrow audio through a byte view carrying the port specification and frame count.
 /// @tparam Byte Use std::uint8_t for writable bytes or const std::uint8_t for read-only bytes.
+/// @note The port specification determines how to interpret the samples.
 ///
 /// The render plan owns the storage provided to a node. Use its views only for the
 /// duration of the process call.
-template <class Byte> class PortBlock
+template <class Byte> class ByteBlock
 {
-    template <class> friend class PortBlock;
+    template <class> friend class ByteBlock;
     using Float = typename std::conditional<std::is_const<Byte>::value, const float, float>::type;
 
   public:
-    PortBlock() noexcept = default;
+    ByteBlock() noexcept = default;
 
     /// @brief Interpret a borrowed buffer according to the port specification.
     /// @param data Address of the buffer.
     /// @param spec Sample rate, channel count, and format of the buffer.
     /// @param frames Number of frames available in the buffer for this block.
     /// @pre A nonempty block refers to storage large enough for the specified frames.
-    PortBlock(Byte *data, PortSpec spec, std::size_t frames) noexcept : data_(data), spec_(spec), frames_(frames)
+    ByteBlock(Byte *data, PortSpec spec, std::size_t frames) noexcept : data_(data), spec_(spec), frames_(frames)
     {
     }
     template <class OtherByte, typename std::enable_if<std::is_convertible<OtherByte *, Byte *>::value, int>::type = 0>
-    PortBlock(PortBlock<OtherByte> other) noexcept : data_(other.data_), spec_(other.spec_), frames_(other.frames_)
+    ByteBlock(ByteBlock<OtherByte> other) noexcept : data_(other.data_), spec_(other.spec_), frames_(other.frames_)
     {
     }
     PortSpec spec() const noexcept
@@ -188,8 +190,8 @@ template <class Byte> class PortBlock
     std::size_t frames_ = 0;
 };
 
-using IPortBlock = PortBlock<const std::uint8_t>;
-using OPortBlock = PortBlock<std::uint8_t>;
+using IBBlock = ByteBlock<const std::uint8_t>;
+using OBBlock = ByteBlock<std::uint8_t>;
 
 /// @brief Stable identity of a node in the graph, including across instance replacement.
 /// @note Zero is the empty ID. The engine resolves nonzero IDs against the graph.
@@ -273,9 +275,15 @@ struct ProcessContext
 {
     BlockPeriod block_period;       ///< Duration of the current engine tick.
     std::uint64_t tick_position;    ///< Zero-based position of the current tick.
-    View<const IPortBlock> inputs;  ///< Read-only input blocks in port index order.
-    View<const OPortBlock> outputs; ///< Output blocks with writable samples in port index order.
+    View<const IBBlock> inputs;  ///< Read-only input blocks in port index order.
+    View<const OBBlock> outputs; ///< Output blocks with writable samples in port index order.
 };
 
 } // namespace aereborn
+
+/// @brief Address an input port by node ID and zero-based index.
+#define IPORT(node_id, port_index) ::aereborn::IPort{(node_id), (port_index)}
+/// @brief Address an output port by node ID and zero-based index.
+#define OPORT(node_id, port_index) ::aereborn::OPort{(node_id), (port_index)}
+
 #endif

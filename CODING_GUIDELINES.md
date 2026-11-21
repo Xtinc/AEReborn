@@ -7,7 +7,8 @@
 | 场景 | 写法 |
 | --- | --- |
 | 连接 | 单独指一个连接时用 `connection`。组合词可用 `conn`，如 `conn_id`、`conn_count`。 |
-| 端口 | 成对的类型使用等长的 `I` / `O` 方向前缀和相同的后缀，例如 `IPort` / `OPort`、`IPortBlock` / `OPortBlock`。 |
+| 端口 | 成对的类型使用等长的 `I` / `O` 方向前缀和相同的后缀，例如 `IPort` / `OPort`。 |
+| 数据块 | 使用 `I` / `O` 表示方向，`B` / `F` 表示字节视图或浮点视图。字节块为 `IBBlock` / `OBBlock`，平面浮点块为 `IFBlock` / `OFBlock`。 |
 | 声道 | 声道循环的索引用 `ch`。声明端口时用 `channels` 表示声道数，用 `input_channels`、`output_channels` 区分方向。 |
 | 采样率 | 配置和公开接口用 `sample_rate`。重采样内部可以用常见的 DSP 记号 `src_fs`、`dst_fs`。 |
 | 帧、采样点、字节 | 根据单位使用 `frames`、`samples`、`bytes`。含义可能混淆时，用 `frame_offset`、`byte_offset` 或 `period_ms` 写明单位。 |

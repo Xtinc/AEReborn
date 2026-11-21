@@ -18,8 +18,8 @@ void matrix_identity_bits()
     const std::uint32_t words[]{0x80000000u, 0x00000001u, 0x7f800001u, 0x80000001u, 0x7fc12345u, 0x3f800000u};
     float samples[6], result[6]{};
     std::memcpy(samples, words, sizeof(samples));
-    const IPortBlock input{reinterpret_cast<const std::uint8_t *>(samples), spec, 3};
-    const OPortBlock output{reinterpret_cast<std::uint8_t *>(result), spec, 3};
+    const IBBlock input{reinterpret_cast<const std::uint8_t *>(samples), spec, 3};
+    const OBBlock output{reinterpret_cast<std::uint8_t *>(result), spec, 3};
     matrix.process({period, 0, {&input, 1}, {&output, 1}});
     check(std::memcmp(result, words, sizeof(result)) == 0, "Unity gain preserves every sample bit");
 }
@@ -144,11 +144,11 @@ void empty_block_ramps()
     float result[4]{};
     for (auto *plugin : plugins)
     {
-        const IPortBlock empty_input{reinterpret_cast<const std::uint8_t *>(samples), spec, 0};
-        const OPortBlock empty_output{reinterpret_cast<std::uint8_t *>(result), spec, 0};
+        const IBBlock empty_input{reinterpret_cast<const std::uint8_t *>(samples), spec, 0};
+        const OBBlock empty_output{reinterpret_cast<std::uint8_t *>(result), spec, 0};
         plugin->process({period, 0, {&empty_input, 1}, {&empty_output, 1}});
-        const IPortBlock input{reinterpret_cast<const std::uint8_t *>(samples), spec, 2};
-        const OPortBlock output{reinterpret_cast<std::uint8_t *>(result), spec, 2};
+        const IBBlock input{reinterpret_cast<const std::uint8_t *>(samples), spec, 2};
+        const OBBlock output{reinterpret_cast<std::uint8_t *>(result), spec, 2};
         plugin->process({period, 1, {&input, 1}, {&output, 1}});
         check(result[0] == 0.5f && result[1] == 0 && result[2] == 1.0f && result[3] == 0,
               "An empty block preserves both channels' ramp and the zero-gain endpoint suppresses NaN");

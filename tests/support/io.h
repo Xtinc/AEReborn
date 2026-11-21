@@ -4,6 +4,8 @@
 #include <limits>
 namespace aereborn
 {
+namespace test
+{
 namespace detail
 {
 template <class Byte> class TickBuffer
@@ -82,5 +84,6 @@ class Playback final : public NodeT<1, 0>
   private:
     detail::TickBuffer<std::uint8_t> buffer_;
 };
+} // namespace test
 } // namespace aereborn
 #endif

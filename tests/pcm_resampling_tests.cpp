@@ -3,9 +3,9 @@ namespace
 {
 using namespace aereborn;
 using namespace aereborn::test;
-std::vector<float> resample(SampleRate from, SampleRate to, double frequency)
+std::vector<float> resample(SampleRate from, SampleRate to, double frequency, BlockPeriod block_period = period)
 {
-    Engine engine(period);
+    Engine engine(block_period);
     ClockedGraph clock(engine);
     const auto source = checked(engine.emplace_node<FloatSource>(
         from, 2,
@@ -26,7 +26,7 @@ std::vector<float> resample(SampleRate from, SampleRate to, double frequency)
     for (std::size_t tick = 0; tick < 40; ++tick)
     {
         clock.advance();
-        check(out->frames == output.frames(period, tick),
+        check(out->frames == output.frames(block_period, tick),
               "Fractional output sizes follow the engine timeline");
         for (std::size_t frame = 0; frame < out->frames; ++frame)
         {
@@ -52,13 +52,18 @@ void rate_continuity()
                                    {SampleRate::Hz11025, rate},
                                    {SampleRate::Hz8000, SampleRate::Hz96000},
                                    {SampleRate::Hz96000, SampleRate::Hz8000}};
-    for (const auto &pair : pairs)
+    for (const auto block_period : {BlockPeriod::Ms02, period})
     {
-        const auto from = static_cast<std::uint32_t>(pair[0]), to = static_cast<std::uint32_t>(pair[1]);
-        const auto samples = resample(pair[0], pair[1], 1000);
-        for (std::size_t i = 96 * to / from + 1; i < samples.size(); ++i)
-            check(std::abs(samples[i] - std::sin(two_pi * 1000 * (static_cast<double>(i) / to - 48.0 / from))) < 0.01,
-                  "Resampling remains phase-continuous after the FIR delay");
+        for (const auto &pair : pairs)
+        {
+            const auto from = static_cast<std::uint32_t>(pair[0]), to = static_cast<std::uint32_t>(pair[1]);
+            const auto samples = resample(pair[0], pair[1], 1000, block_period);
+            for (std::size_t i = 96 * to / from + 1; i < samples.size(); ++i)
+            {
+                const auto expected = std::sin(two_pi * 1000 * (static_cast<double>(i) / to - 48.0 / from));
+                check(std::abs(samples[i] - expected) < 0.01, "Resampling remains phase-continuous after the FIR delay");
+            }
+        }
     }
 }
 void antialias_filter()

@@ -21,6 +21,9 @@ target_link_libraries(aereborn_core PRIVATE Threads::Threads)
 
 add_library(aereborn_plugins STATIC
     plugins/convert.cpp
+    plugins/device_stream.cpp
+    plugins/drift.cpp
+    plugins/io.cpp
     plugins/matrix.cpp
     plugins/mixer.cpp
 )

@@ -450,7 +450,7 @@ class Engine::Runner
     };
     struct Plan
     {
-        OPortBlock block(PortSpec spec, std::size_t frames, std::size_t offset) noexcept
+        OBBlock block(PortSpec spec, std::size_t frames, std::size_t offset) noexcept
         {
             auto *data = spec.format == SampleFormat::F32P
                              ? reinterpret_cast<std::uint8_t *>(float_pool.data() + offset)
@@ -481,8 +481,8 @@ class Engine::Runner
         // The zero-filled prefix of each pool is shared by unconnected inputs.
         std::vector<float> float_pool;
         std::vector<std::uint8_t> byte_pool;
-        std::vector<IPortBlock> inputs;
-        std::vector<OPortBlock> outputs;
+        std::vector<IBBlock> inputs;
+        std::vector<OBBlock> outputs;
         std::vector<Step> steps;
         std::vector<std::shared_ptr<NodeEntry>> owners;
     };

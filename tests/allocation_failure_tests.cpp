@@ -1,3 +1,4 @@
+#include "plugins/device_stream.h"
 #include "plugins/matrix.h"
 #include "plugins/mixer.h"
 #include "support/audio_fixture.h"
@@ -99,7 +100,7 @@ void conversion_rollback()
 {
     const PortSpec input(rate, 1, SampleFormat::F32LE), output(SampleRate::Hz16000, 1, SampleFormat::F32P);
     std::array<std::uint8_t, 960> bytes{};
-    const IPortBlock input_block(bytes.data(), input, 240);
+    const IBBlock input_block(bytes.data(), input, 240);
     const auto fill_input = [&](std::size_t first) {
         for (std::size_t i = 0; i < 240; ++i)
             write_f32le(bytes.data() + 4 * i, static_cast<float>(std::sin(two_pi * 997 * (first + i) / 48000)));
@@ -110,14 +111,14 @@ void conversion_rollback()
         checked(actual.prepare(period));
         checked(reference.prepare(period));
         std::array<float, 80> actual_samples{}, reference_samples{};
-        const OPortBlock actual_block(reinterpret_cast<std::uint8_t *>(actual_samples.data()), output, 80);
-        const OPortBlock reference_block(reinterpret_cast<std::uint8_t *>(reference_samples.data()), output, 80);
+        const OBBlock actual_block(reinterpret_cast<std::uint8_t *>(actual_samples.data()), output, 80);
+        const OBBlock reference_block(reinterpret_cast<std::uint8_t *>(reference_samples.data()), output, 80);
         fill_input(0);
         actual.process({period, 0, {&input_block, 1}, {&actual_block, 1}});
         reference.process({period, 0, {&input_block, 1}, {&reference_block, 1}});
 
         RetCode code;
-        const bool failed = allocation_fails_after(failure, [&] { code = actual.prepare(period); });
+        const bool failed = allocation_fails_after(failure, [&] { code = actual.prepare(BlockPeriod::Ms10); });
         if (!failed)
         {
             checked(code);
@@ -139,7 +140,7 @@ void direct_conversion_needs_no_workspace()
             Convert convert(PortSpec(rate, 2, input_format), PortSpec(rate, 2, output_format));
             RetCode code;
             const bool failed = allocation_fails_after(0, [&] { code = convert.prepare(period); });
-            check(!failed, "Direct conversion needs no allocated conversion state or workspace");
+            check(!failed, "Direct conversion prepares without heap allocation");
             checked(code);
         }
     }
@@ -233,6 +234,60 @@ void render_uses_prepared_buffers()
     check(checked(engine.node<HeapProbe>(probe))->heap_calls == 0,
           "Plan switching and rendering perform no heap operations on the clock thread");
 }
+
+void endpoint_uses_prepared_buffers()
+{
+    constexpr auto graph_period = BlockPeriod::Ms02;
+    const PortSpec port(rate, 1, SampleFormat::F32P);
+    const PortSpec native(rate, 1, SampleFormat::F32LE);
+    aereborn::Capture capture(port.sample_rate, port.channels, std::chrono::microseconds(2667));
+    aereborn::Playback playback(port.sample_rate, port.channels, std::chrono::microseconds(2667));
+    CaptureStream input(capture);
+    PlaybackStream output(playback);
+    checked(capture.prepare(graph_period));
+    checked(playback.prepare(graph_period));
+    checked(input.prepare(native, 128));
+    checked(output.prepare(native, 128));
+    std::array<std::uint8_t, 128 * 4> input_bytes{}, output_bytes{};
+    std::array<float, 96> graph_samples{};
+    const IBBlock recorded(input_bytes.data(), native, 128);
+    const OBBlock played(output_bytes.data(), native, 128);
+    const OBBlock graph_output(reinterpret_cast<std::uint8_t *>(graph_samples.data()), port, 96);
+    const IBBlock graph_input = graph_output;
+
+    allocation_test::heap_calls = 0;
+    allocation_test::measure_heap = true;
+    bool succeeded = true;
+    for (int restart = 0; restart < 3; ++restart)
+    {
+        const std::size_t frames = restart == 0 ? 96 : 128;
+        if (restart == 2)
+        {
+            input.reset();
+            output.reset();
+            succeeded &= input.correction() == 0 && output.correction() == 0;
+        }
+        else
+        {
+            succeeded &= static_cast<bool>(input.prepare(native, frames));
+            succeeded &= static_cast<bool>(output.prepare(native, frames));
+        }
+        succeeded &= static_cast<bool>(capture.set_online(true));
+        succeeded &= static_cast<bool>(playback.set_online(true));
+        for (std::uint64_t tick = 0; tick < 16; ++tick)
+        {
+            succeeded &= static_cast<bool>(input.transfer({recorded.byte_view().data(), native, frames}));
+            capture.process({graph_period, tick, {}, {&graph_output, 1}});
+            playback.process({graph_period, tick, {&graph_input, 1}, {}});
+            succeeded &= static_cast<bool>(output.transfer({played.byte_view().data(), native, frames}));
+        }
+        succeeded &= static_cast<bool>(capture.set_online(false));
+        succeeded &= static_cast<bool>(playback.set_online(false));
+    }
+    allocation_test::measure_heap = false;
+    check(succeeded && allocation_test::heap_calls == 0,
+          "Device conversion, queue access and compatible restart reuse prepared storage");
+}
 } // namespace
 int main(int argc, char **argv)
 {
@@ -241,6 +296,7 @@ int main(int argc, char **argv)
                       {"conversion_rollback", conversion_rollback},
                       {"direct_conversion_needs_no_workspace", direct_conversion_needs_no_workspace},
                       {"plan_allocation_rollback", plan_allocation_rollback},
-                      {"render_uses_prepared_buffers", render_uses_prepared_buffers}});
+                      {"render_uses_prepared_buffers", render_uses_prepared_buffers},
+                      {"endpoint_uses_prepared_buffers", endpoint_uses_prepared_buffers}});
 }
 #endif

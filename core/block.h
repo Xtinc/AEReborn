@@ -133,9 +133,27 @@ template <class T> class FloatBlock
         return frames_;
     }
 
+    /// @brief Check the view geometry. The caller owns the backing storage.
+    bool valid() const noexcept
+    {
+        constexpr auto limit = std::numeric_limits<std::size_t>::max() / sizeof(float);
+        return frames_ == 0 || (data_ && channels_ && frames_ <= channel_stride_ && frames_ <= limit &&
+                               channels_ - 1 <= (limit - frames_) / channel_stride_);
+    }
+
+    /// @brief Borrow a frame range with the original channel stride.
+    /// @pre The requested range lies in this block.
+    FloatBlock subblock(std::size_t offset, std::size_t frames) const noexcept
+    {
+        assert(offset <= frames_ && frames <= frames_ - offset);
+        return {data_ ? data_ + offset : nullptr, channels_, frames, channel_stride_};
+    }
+
     /// @brief Zero the processing span of each channel in a writable block.
     template <class U = T, typename std::enable_if<!std::is_const<U>::value, int>::type = 0> void clear() const noexcept
     {
+        if (!frames_)
+            return;
         for (std::size_t ch = 0; ch < channels_; ++ch)
         {
             std::fill_n(channel(ch), frames_, 0.0f);
