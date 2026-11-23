@@ -21,10 +21,11 @@ class VirtualNode : public NodeT<I, O>
         : NodeT<I, O>(ports<I>(channels), ports<O>(channels)), gain_(gain)
     {
     }
-    RetCode prepare(BlockPeriod) override
+    void prepare(BlockPeriod) override
     {
         ++prepares;
-        return preparation;
+        if (preparation != ErrorCode::Ok)
+            throw Error(preparation);
     }
     void process(const ProcessContext &context) noexcept override
     {
@@ -51,7 +52,7 @@ class VirtualNode : public NodeT<I, O>
         ++resets;
     }
 
-    RetCode preparation;
+    ErrorCode preparation = ErrorCode::Ok;
     std::size_t prepares = 0;
     std::size_t calls = 0;
     std::size_t resets = 0;

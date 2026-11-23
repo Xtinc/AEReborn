@@ -1,4 +1,5 @@
-#include "plugins/device_stream.h"
+#include "plugins/endpoint.h"
+#include "support/test_backend.h"
 #include "plugins/matrix.h"
 #include "plugins/mixer.h"
 #include "support/audio_fixture.h"
@@ -20,6 +21,7 @@ namespace allocation_test
 thread_local long fail_after = -1;
 thread_local bool measure_heap = false;
 thread_local std::size_t heap_calls = 0;
+std::atomic<std::size_t> worker_heap_calls{0};
 } // namespace allocation_test
 
 // Fail each allocation in prepare(), including failures after workspace preparation.
@@ -86,13 +88,13 @@ template <class Operation> bool allocation_fails_after(long allocations, Operati
 void buffer_resize_rollback()
 {
     Buffer buffer;
-    checked(buffer.resize(1, 8));
+    buffer.resize(1, 8);
     buffer.block(8).channel(0)[7] = 1.0f;
     const bool failed = allocation_fails_after(0, [&] { buffer.resize(2, 32); });
     const auto retained = buffer.block(8);
     check(failed && retained.channels() == 1 && retained.channel(0)[7] == 1.0f,
           "A failed growth preserves the buffer's layout and contents");
-    checked(buffer.resize(2, 32));
+    buffer.resize(2, 32);
     check(buffer.block(32).channel(0)[7] == 0.0f, "A successful resize clears existing samples");
 }
 
@@ -108,8 +110,8 @@ void conversion_rollback()
     for (long failure = 0;; ++failure)
     {
         Convert actual(input, output), reference(input, output);
-        checked(actual.prepare(period));
-        checked(reference.prepare(period));
+        actual.prepare(period);
+        reference.prepare(period);
         std::array<float, 80> actual_samples{}, reference_samples{};
         const OBBlock actual_block(reinterpret_cast<std::uint8_t *>(actual_samples.data()), output, 80);
         const OBBlock reference_block(reinterpret_cast<std::uint8_t *>(reference_samples.data()), output, 80);
@@ -117,11 +119,9 @@ void conversion_rollback()
         actual.process({period, 0, {&input_block, 1}, {&actual_block, 1}});
         reference.process({period, 0, {&input_block, 1}, {&reference_block, 1}});
 
-        RetCode code;
-        const bool failed = allocation_fails_after(failure, [&] { code = actual.prepare(BlockPeriod::Ms10); });
+        const bool failed = allocation_fails_after(failure, [&] { actual.prepare(BlockPeriod::Ms10); });
         if (!failed)
         {
-            checked(code);
             check(failure > 0, "Fault injection visits converter allocations");
             break;
         }
@@ -138,10 +138,8 @@ void direct_conversion_needs_no_workspace()
         for (const auto output_format : {SampleFormat::F32P, SampleFormat::S16LE})
         {
             Convert convert(PortSpec(rate, 2, input_format), PortSpec(rate, 2, output_format));
-            RetCode code;
-            const bool failed = allocation_fails_after(0, [&] { code = convert.prepare(period); });
+            const bool failed = allocation_fails_after(0, [&] { convert.prepare(period); });
             check(!failed, "Direct conversion prepares without heap allocation");
-            checked(code);
         }
     }
 }
@@ -154,29 +152,27 @@ void plan_allocation_rollback()
         Engine engine(period);
         ClockedGraph clock(engine);
         const auto source =
-            checked(engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 1.0f; }));
-        const auto sink = checked(engine.emplace_node<PacketSink>(input));
-        checked(engine.connect(OPORT(source, 0), IPORT(sink, 0)));
-        checked(engine.commit());
+            engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 1.0f; });
+        const auto sink = engine.emplace_node<PacketSink>(input);
+        engine.connect(OPORT(source, 0), IPORT(sink, 0));
+        engine.commit();
         clock.start();
         clock.advance();
-        const auto converter = checked(engine.emplace_node<Convert>(input, output));
-        const auto added = checked(engine.emplace_node<PacketSink>(output));
-        checked(engine.connect(OPORT(source, 0), IPORT(converter, 0)));
-        checked(engine.connect(OPORT(converter, 0), IPORT(added, 0)));
-        RetCode code;
+        const auto converter = engine.emplace_node<Convert>(input, output);
+        const auto added = engine.emplace_node<PacketSink>(output);
+        engine.connect(OPORT(source, 0), IPORT(converter, 0));
+        engine.connect(OPORT(converter, 0), IPORT(added, 0));
         clock.resume();
-        const bool failed = allocation_fails_after(failure, [&] { code = engine.commit(); });
+        const bool failed = allocation_fails_after(failure, [&] { engine.commit(); });
         clock.advance();
         if (!failed)
         {
-            checked(code);
             check(failure > 0, "Fault injection visits plan allocations");
             break;
         }
-        auto *new_sink = checked(engine.node<PacketSink>(added));
+        auto *new_sink = engine.node<PacketSink>(added);
         clock.advance();
-        check(new_sink->frames == 0 && checked(engine.node<PacketSink>(sink))->sample(0) == 1,
+        check(new_sink->frames == 0 && engine.node<PacketSink>(sink)->sample(0) == 1,
               "Failed plan construction preserves the running graph");
         clock.commit();
         clock.advance();
@@ -211,28 +207,51 @@ void render_uses_prepared_buffers()
 {
     Engine engine(period);
     ClockedGraph clock(engine);
-    checked(engine.emplace_node<HeapProbe>(true));
-    const auto source = checked(
-        engine.emplace_node<FloatSource>(SampleRate::Hz44100, 1, [](std::uint64_t, std::size_t) { return 0.25f; }));
+    engine.emplace_node<HeapProbe>(true);
+    const auto source =
+        engine.emplace_node<FloatSource>(SampleRate::Hz44100, 1, [](std::uint64_t, std::size_t) { return 0.25f; });
     const PortSpec input(SampleRate::Hz44100, 1, SampleFormat::F32P);
     const PortSpec output(rate, 1, SampleFormat::F32P);
-    const auto converter = checked(engine.emplace_node<Convert>(input, output));
-    const auto mixer = checked(engine.emplace_node<Mixer>(rate, 1, 1));
-    const auto matrix = checked(engine.emplace_node<Matrix>(rate, 1));
-    const auto sink = checked(engine.emplace_node<PacketSink>(output));
-    checked(engine.connect(OPORT(source, 0), IPORT(converter, 0)));
-    checked(engine.connect(OPORT(converter, 0), IPORT(mixer, 0)));
-    checked(engine.connect(OPORT(mixer, 0), IPORT(matrix, 0)));
-    checked(engine.connect(OPORT(matrix, 0), IPORT(sink, 0)));
-    checked(engine.commit());
+    const auto converter = engine.emplace_node<Convert>(input, output);
+    const auto mixer = engine.emplace_node<Mixer>(rate, 1, 1);
+    const auto matrix = engine.emplace_node<Matrix>(rate, 1);
+    const auto sink = engine.emplace_node<PacketSink>(output);
+    engine.connect(OPORT(source, 0), IPORT(converter, 0));
+    engine.connect(OPORT(converter, 0), IPORT(mixer, 0));
+    engine.connect(OPORT(mixer, 0), IPORT(matrix, 0));
+    engine.connect(OPORT(matrix, 0), IPORT(sink, 0));
+    engine.commit();
     clock.start();
-    const auto probe = checked(engine.emplace_node<HeapProbe>(false));
-    checked(checked(engine.node<Matrix>(matrix))->set_gain(0.5f));
-    checked(checked(engine.node<Mixer>(mixer))->set_muted(0, true));
+    const auto probe = engine.emplace_node<HeapProbe>(false);
+    engine.node<Matrix>(matrix)->set_gain(0.5f);
+    engine.node<Mixer>(mixer)->set_muted(0, true);
     clock.commit();
     clock.advance();
-    check(checked(engine.node<HeapProbe>(probe))->heap_calls == 0,
+    check(engine.node<HeapProbe>(probe)->heap_calls == 0,
           "Plan switching and rendering perform no heap operations on the clock thread");
+}
+
+void backend_binding_rollback()
+{
+    const PortSpec device(rate, 1, SampleFormat::F32LE);
+    aereborn::Capture capture(rate, 1, std::chrono::microseconds(2667));
+    capture.prepare(BlockPeriod::Ms02);
+    BackendCalls calls;
+    TestBackend source(device, 128, &calls), replacement(device, 128);
+    for (long failure = 0;; ++failure)
+    {
+        const auto failed = allocation_fails_after(failure, [&] { source.bind(capture); });
+        if (!failed)
+        {
+            check(failure > 0, "Fault injection reaches bind-time workspace allocations");
+            source.unbind();
+            break;
+        }
+        check(!source.bound() && calls.opens == calls.closes,
+              "A bind exception closes the device and leaves the backend unbound");
+        replacement.bind(capture);
+        replacement.unbind();
+    }
 }
 
 void endpoint_uses_prepared_buffers()
@@ -242,51 +261,48 @@ void endpoint_uses_prepared_buffers()
     const PortSpec native(rate, 1, SampleFormat::F32LE);
     aereborn::Capture capture(port.sample_rate, port.channels, std::chrono::microseconds(2667));
     aereborn::Playback playback(port.sample_rate, port.channels, std::chrono::microseconds(2667));
-    CaptureStream input(capture);
-    PlaybackStream output(playback);
-    checked(capture.prepare(graph_period));
-    checked(playback.prepare(graph_period));
-    checked(input.prepare(native, 128));
-    checked(output.prepare(native, 128));
-    std::array<std::uint8_t, 128 * 4> input_bytes{}, output_bytes{};
+    capture.prepare(graph_period);
+    playback.prepare(graph_period);
+    TestBackend input(native, 128);
+    TestBackend output(native, 128);
+    const auto measure_worker = [](bool active) {
+        if (active)
+            allocation_test::heap_calls = 0;
+        else
+            allocation_test::worker_heap_calls.fetch_add(allocation_test::heap_calls, std::memory_order_relaxed);
+        allocation_test::measure_heap = active;
+    };
+    input.gated = output.gated = true;
+    input.measure_io = output.measure_io = measure_worker;
+    input.bind(capture);
+    output.bind(playback);
     std::array<float, 96> graph_samples{};
-    const IBBlock recorded(input_bytes.data(), native, 128);
-    const OBBlock played(output_bytes.data(), native, 128);
     const OBBlock graph_output(reinterpret_cast<std::uint8_t *>(graph_samples.data()), port, 96);
     const IBBlock graph_input = graph_output;
 
     allocation_test::heap_calls = 0;
-    allocation_test::measure_heap = true;
+    allocation_test::worker_heap_calls.store(0, std::memory_order_relaxed);
     bool succeeded = true;
     for (int restart = 0; restart < 3; ++restart)
     {
-        const std::size_t frames = restart == 0 ? 96 : 128;
-        if (restart == 2)
-        {
-            input.reset();
-            output.reset();
-            succeeded &= input.correction() == 0 && output.correction() == 0;
-        }
-        else
-        {
-            succeeded &= static_cast<bool>(input.prepare(native, frames));
-            succeeded &= static_cast<bool>(output.prepare(native, frames));
-        }
-        succeeded &= static_cast<bool>(capture.set_online(true));
-        succeeded &= static_cast<bool>(playback.set_online(true));
+        input.start();
+        output.start();
+        check(input.wait_for_io() && output.wait_for_io(), "Both workers reach their first batch");
+        allocation_test::measure_heap = true;
         for (std::uint64_t tick = 0; tick < 16; ++tick)
         {
-            succeeded &= static_cast<bool>(input.transfer({recorded.byte_view().data(), native, frames}));
+            succeeded &= input.run_batch();
             capture.process({graph_period, tick, {}, {&graph_output, 1}});
             playback.process({graph_period, tick, {&graph_input, 1}, {}});
-            succeeded &= static_cast<bool>(output.transfer({played.byte_view().data(), native, frames}));
+            succeeded &= output.run_batch();
         }
-        succeeded &= static_cast<bool>(capture.set_online(false));
-        succeeded &= static_cast<bool>(playback.set_online(false));
+        allocation_test::measure_heap = false;
+        input.stop();
+        output.stop();
+        succeeded &= input.last_error() == ErrorCode::Ok && output.last_error() == ErrorCode::Ok;
     }
-    allocation_test::measure_heap = false;
-    check(succeeded && allocation_test::heap_calls == 0,
-          "Device conversion, queue access and compatible restart reuse prepared storage");
+    check(succeeded && allocation_test::heap_calls == 0 && allocation_test::worker_heap_calls.load() == 0,
+          "The graph and device worker paths reuse prepared storage across restarts");
 }
 } // namespace
 int main(int argc, char **argv)
@@ -297,6 +313,7 @@ int main(int argc, char **argv)
                       {"direct_conversion_needs_no_workspace", direct_conversion_needs_no_workspace},
                       {"plan_allocation_rollback", plan_allocation_rollback},
                       {"render_uses_prepared_buffers", render_uses_prepared_buffers},
+                      {"backend_binding_rollback", backend_binding_rollback},
                       {"endpoint_uses_prepared_buffers", endpoint_uses_prepared_buffers}});
 }
 #endif

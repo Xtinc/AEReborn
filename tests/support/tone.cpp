@@ -1,7 +1,6 @@
 #include "tone.h"
 #include <cmath>
 #include <cstring>
-#include <stdexcept>
 namespace aereborn
 {
 Tone::Tone(SampleRate rate, std::size_t channels, double frequency, float amplitude)
@@ -9,7 +8,7 @@ Tone::Tone(SampleRate rate, std::size_t channels, double frequency, float amplit
 {
     if (!outputs()[0].valid() || !(frequency >= 0 && frequency < static_cast<std::uint32_t>(rate) / 2.0) ||
         !std::isfinite(amplitude))
-        throw std::invalid_argument("Invalid tone specification");
+        throw Error(ErrorCode::InvalidArg, "Invalid tone specification");
 }
 void Tone::process(const ProcessContext &context) noexcept
 {

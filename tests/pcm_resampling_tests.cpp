@@ -7,20 +7,20 @@ std::vector<float> resample(SampleRate from, SampleRate to, double frequency, Bl
 {
     Engine engine(block_period);
     ClockedGraph clock(engine);
-    const auto source = checked(engine.emplace_node<FloatSource>(
+    const auto source = engine.emplace_node<FloatSource>(
         from, 2,
         [=](std::uint64_t frame, std::size_t ch)
         {
             return static_cast<float>(std::sin(two_pi * frequency * frame / static_cast<std::uint32_t>(from)) *
                                       (ch ? -0.5 : 1));
-        }));
+        });
     const PortSpec input(from, 2, SampleFormat::F32P), output(to, 2, SampleFormat::F32P);
-    const auto converter = checked(engine.emplace_node<Convert>(input, output));
-    const auto sink = checked(engine.emplace_node<PacketSink>(output));
-    checked(engine.connect(OPORT(source, 0), IPORT(converter, 0)));
-    checked(engine.connect(OPORT(converter, 0), IPORT(sink, 0)));
-    checked(engine.commit());
-    auto *out = checked(engine.node<PacketSink>(sink));
+    const auto converter = engine.emplace_node<Convert>(input, output);
+    const auto sink = engine.emplace_node<PacketSink>(output);
+    engine.connect(OPORT(source, 0), IPORT(converter, 0));
+    engine.connect(OPORT(converter, 0), IPORT(sink, 0));
+    engine.commit();
+    auto *out = engine.node<PacketSink>(sink);
     std::vector<float> result;
     clock.start();
     for (std::size_t tick = 0; tick < 40; ++tick)
@@ -37,7 +37,7 @@ std::vector<float> resample(SampleRate from, SampleRate to, double frequency, Bl
         }
     }
     clock.stop();
-    checked(engine.reset());
+    engine.reset();
     clock.start();
     clock.advance();
     for (std::size_t frame = 0; frame < out->frames; ++frame)
@@ -84,23 +84,23 @@ void late_join()
     Engine engine(BlockPeriod::Ms10);
     ClockedGraph clock(engine);
     constexpr auto input_rate = SampleRate::Hz11025;
-    const auto source = checked(
-        engine.emplace_node<FloatSource>(input_rate, 1, [](std::uint64_t frame, std::size_t)
-                                         { return static_cast<float>(std::sin(two_pi * 997 * frame / 11025)); }));
+    const auto source = engine.emplace_node<FloatSource>(input_rate, 1, [](std::uint64_t frame, std::size_t) {
+        return static_cast<float>(std::sin(two_pi * 997 * frame / 11025));
+    });
     const PortSpec input(input_rate, 1, SampleFormat::F32P), output(rate, 1, SampleFormat::F32P);
-    const auto original = checked(engine.emplace_node<Convert>(input, output));
-    const auto sink = checked(engine.emplace_node<PacketSink>(output));
-    checked(engine.connect(OPORT(source, 0), IPORT(original, 0)));
-    checked(engine.connect(OPORT(original, 0), IPORT(sink, 0)));
-    checked(engine.commit());
+    const auto original = engine.emplace_node<Convert>(input, output);
+    const auto sink = engine.emplace_node<PacketSink>(output);
+    engine.connect(OPORT(source, 0), IPORT(original, 0));
+    engine.connect(OPORT(original, 0), IPORT(sink, 0));
+    engine.commit();
     clock.start(); // Submit while the first, longer input block is in flight.
-    const auto added = checked(engine.emplace_node<Convert>(input, output));
-    const auto monitor = checked(engine.emplace_node<PacketSink>(output));
-    checked(engine.connect(OPORT(source, 0), IPORT(added, 0)));
-    checked(engine.connect(OPORT(added, 0), IPORT(monitor, 0)));
+    const auto added = engine.emplace_node<Convert>(input, output);
+    const auto monitor = engine.emplace_node<PacketSink>(output);
+    engine.connect(OPORT(source, 0), IPORT(added, 0));
+    engine.connect(OPORT(added, 0), IPORT(monitor, 0));
     clock.commit();
-    auto *a = checked(engine.node<PacketSink>(sink));
-    auto *b = checked(engine.node<PacketSink>(monitor));
+    auto *a = engine.node<PacketSink>(sink);
+    auto *b = engine.node<PacketSink>(monitor);
     clock.advance();
     clock.advance();
     check(a->frames == 480 && b->frames == 480, "Resamplers use the configured 10 ms block period");

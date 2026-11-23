@@ -1,7 +1,6 @@
 #include "matrix.h"
 #include <cmath>
 #include <cstring>
-#include <stdexcept>
 namespace aereborn
 {
 namespace
@@ -52,7 +51,7 @@ Matrix::Matrix(SampleRate rate, std::size_t channels, float gain)
       target_(gain), gain_(gain)
 {
     if (!inputs()[0].valid() || !std::isfinite(gain))
-        throw std::invalid_argument("Invalid matrix specification");
+        throw Error(ErrorCode::InvalidArg, "Invalid matrix specification");
 }
 Matrix::Matrix(SampleRate rate, std::size_t input_channels, std::size_t output_channels, View<const float> coefficients,
                float gain)
@@ -61,14 +60,14 @@ Matrix::Matrix(SampleRate rate, std::size_t input_channels, std::size_t output_c
       target_(gain), gain_(gain)
 {
     if (!inputs()[0].valid() || !outputs()[0].valid() || !std::isfinite(gain))
-        throw std::invalid_argument("Invalid matrix specification");
+        throw Error(ErrorCode::InvalidArg, "Invalid matrix specification");
     if (output_channels > coefficients_.max_size() / input_channels)
-        throw std::length_error("Channel matrix exceeds supported size");
+        throw Error(ErrorCode::TooLarge, "Channel matrix exceeds supported size");
     if (coefficients.size() != input_channels * output_channels)
-        throw std::invalid_argument("Channel matrix dimensions do not match coefficients");
+        throw Error(ErrorCode::InvalidArg, "Channel matrix dimensions do not match coefficients");
     for (const auto value : coefficients)
         if (!std::isfinite(value))
-            throw std::invalid_argument("Matrix coefficients must be finite");
+            throw Error(ErrorCode::InvalidArg, "Matrix coefficients must be finite");
     coefficients_.assign(coefficients.begin(), coefficients.end());
 }
 Matrix::Matrix(SampleRate rate, std::size_t input_channels, std::size_t output_channels,
@@ -76,21 +75,19 @@ Matrix::Matrix(SampleRate rate, std::size_t input_channels, std::size_t output_c
     : Matrix(rate, input_channels, output_channels, {coefficients.begin(), coefficients.size()}, gain)
 {
 }
-RetCode Matrix::set_gain(float gain) noexcept
+void Matrix::set_gain(float gain)
 {
     if (!std::isfinite(gain))
-        return ErrorCode::InvalidArg;
+        throw Error(ErrorCode::InvalidArg);
     target_.store(gain, std::memory_order_release);
-    return {};
 }
 float Matrix::gain() const noexcept
 {
     return target_.load(std::memory_order_acquire);
 }
-RetCode Matrix::prepare(BlockPeriod)
+void Matrix::prepare(BlockPeriod)
 {
     reset();
-    return {};
 }
 void Matrix::reset() noexcept
 {

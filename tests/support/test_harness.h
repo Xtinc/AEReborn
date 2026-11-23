@@ -6,6 +6,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 
 namespace aereborn
 {
@@ -20,25 +21,18 @@ inline void check(bool condition, const char *message)
     }
 }
 
-inline void checked(RetCode status)
+template <class Fn> void expect_error(ErrorCode expected, Fn &&fn)
 {
-    check(static_cast<bool>(status), status.message());
-}
-
-template <class T> T checked(Result<T> result)
-{
-    checked(result.ret_code());
-    return std::move(result).value();
-}
-
-inline void expect_error(ErrorCode expected, RetCode code)
-{
-    check(code == expected, code.message());
-}
-
-template <class T> void expect_error(ErrorCode expected, const Result<T> &result)
-{
-    expect_error(expected, result.ret_code());
+    try
+    {
+        std::forward<Fn>(fn)();
+    }
+    catch (const Error &error)
+    {
+        check(error.code() == expected, error.what());
+        return;
+    }
+    check(false, "Expected aereborn::Error was not thrown");
 }
 
 template <class Exception, class Operation> void expect_exception(Operation operation)

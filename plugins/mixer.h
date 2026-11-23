@@ -15,28 +15,33 @@ class Mixer final : public Node
     /// @param rate Sample rate of every port.
     /// @param channels Channel count of every port.
     /// @param inputs Number of input ports.
-    /// @throws std::invalid_argument If the port specification is invalid or inputs is zero.
+    /// @throws Error InvalidArg If the port specification is invalid or inputs is zero.
+    /// @throws Error TooLarge if the input count exceeds storage limits.
     Mixer(SampleRate rate, std::size_t channels, std::size_t inputs);
 
     /// @copydoc Node::inputs
+    /// @note The view borrows port specifications from this mixer and remains valid until destruction.
     View<const PortSpec> inputs() const noexcept override;
     /// @copydoc Node::outputs
+    /// @note The view borrows the port specification from this mixer and remains valid until destruction.
     View<const PortSpec> outputs() const noexcept override;
 
     /// @brief Set whether one input is muted.
     /// @param input Zero-based input port index.
     /// @param muted True to mute the input, false to unmute it.
-    /// @return Success or `InvalidPort` if the index is out of range.
+    /// @throws Error InvalidPort if the index is out of range.
     /// @note Safe to call concurrently with process(). Each non-empty input block uses one mute value.
-    RetCode set_muted(std::size_t input, bool muted) noexcept;
+    void set_muted(std::size_t input, bool muted);
 
     /// @brief Read the requested mute state of one input.
     /// @param input Zero-based input port index.
-    /// @return The mute value or `InvalidPort` if the index is out of range.
+    /// @return The mute value.
+    /// @throws Error InvalidPort if the index is out of range.
     /// @note Safe to call concurrently with set_muted() and process().
-    Result<bool> muted(std::size_t input) const noexcept;
+    bool muted(std::size_t input) const;
 
     /// @copydoc Node::process
+    /// @note Sums unmuted inputs, leaving silence when every input is muted.
     void process(const ProcessContext &context) noexcept override;
 
   private:

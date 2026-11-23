@@ -1,5 +1,4 @@
 #include "mixer.h"
-#include <stdexcept>
 namespace aereborn
 {
 namespace
@@ -8,7 +7,9 @@ PortSpec mixer_output(SampleRate rate, std::size_t channels, std::size_t inputs)
 {
     const PortSpec spec(rate, channels, SampleFormat::F32P);
     if (!spec.valid() || inputs == 0)
-        throw std::invalid_argument("Mixer needs valid ports and at least one input");
+        throw Error(ErrorCode::InvalidArg, "Mixer needs valid ports and at least one input");
+    if (inputs > std::vector<PortSpec>{}.max_size())
+        throw Error(ErrorCode::TooLarge);
     return spec;
 }
 } // namespace
@@ -26,17 +27,16 @@ View<const PortSpec> Mixer::outputs() const noexcept
 {
     return {&output_, 1};
 }
-RetCode Mixer::set_muted(std::size_t input, bool muted) noexcept
+void Mixer::set_muted(std::size_t input, bool muted)
 {
     if (input >= inputs_.size())
-        return ErrorCode::InvalidPort;
+        throw Error(ErrorCode::InvalidPort);
     muted_[input].store(muted, std::memory_order_release);
-    return {};
 }
-Result<bool> Mixer::muted(std::size_t input) const noexcept
+bool Mixer::muted(std::size_t input) const
 {
     if (input >= inputs_.size())
-        return ErrorCode::InvalidPort;
+        throw Error(ErrorCode::InvalidPort);
     return muted_[input].load(std::memory_order_acquire);
 }
 void Mixer::process(const ProcessContext &context) noexcept

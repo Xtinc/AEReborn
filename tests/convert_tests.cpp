@@ -112,9 +112,9 @@ void unaligned_pcm()
 void converter_validation()
 {
     const PortSpec mono(rate, 1, SampleFormat::F32P), stereo(rate, 2, SampleFormat::F32P);
-    expect_exception<std::invalid_argument>([&] { Convert invalid(mono, stereo); });
-    expect_exception<std::invalid_argument>([&] { Convert invalid(PortSpec(rate, 1, static_cast<SampleFormat>(99)), mono); });
-    expect_exception<std::invalid_argument>(
+    expect_error(ErrorCode::InvalidArg, [&] { Convert invalid(mono, stereo); });
+    expect_error(ErrorCode::InvalidArg, [&] { Convert invalid(PortSpec(rate, 1, static_cast<SampleFormat>(99)), mono); });
+    expect_error(ErrorCode::InvalidArg,
         [&] { Convert invalid(mono, PortSpec(static_cast<SampleRate>(1), 1, SampleFormat::F32P)); });
 }
 void integer_limits()
@@ -136,7 +136,7 @@ void empty_blocks()
 {
     const PortSpec input(rate, 1, SampleFormat::F32P), output(rate, 1, SampleFormat::S16LE);
     Convert convert(input, output);
-    checked(convert.prepare(period));
+    convert.prepare(period);
     const float value = 0.5f;
     std::uint8_t bytes[]{0xcd, 0xcd};
     const IBBlock empty_input{reinterpret_cast<const std::uint8_t *>(&value), input, 0};
@@ -153,16 +153,11 @@ void fixed_slices()
     std::array<float, 10> samples;
     samples.fill(-2.0f);
     const OBBlock output(reinterpret_cast<std::uint8_t *>(samples.data()), planar, 5);
-    Convert decode(pcm, planar), copy(planar, planar);
-    expect_error(ErrorCode::NotPrepared, decode.required_input(1));
-    expect_error(ErrorCode::NotPrepared, decode.process(input, output));
-    checked(decode.prepare(3, 3));
-    checked(copy.prepare(3, 3));
-    check(checked(decode.required_input(3)) == 3, "Fixed same-rate conversion needs one input per output");
-    const auto decoded = checked(decode.process(IBBlock{input.byte_view().data() + 4, pcm, 2},
-                                                output.f32p_view().subblock(2, 3)));
-    check(decoded.consumed == 2 && decoded.produced == 2 &&
-              samples == std::array<float, 10>{{-2, -2, 0.25f, 0.5f, -2, -2, -2, -0.5f, 0.125f, -2}},
+    SincResampler copy;
+    copy.prepare(2, rate, rate);
+    check(copy.required_input(3) == 3, "Fixed same-rate conversion needs one input per output");
+    decode_pcm({input.byte_view().data() + 4, pcm, 2}, output.f32p_view().subblock(2, 2));
+    check(samples == std::array<float, 10>{{-2, -2, 0.25f, 0.5f, -2, -2, -2, -0.5f, 0.125f, -2}},
           "Sliced PCM decode preserves both channel strides and the unwritten tail");
 
     const std::uint32_t nan = 0x7fc12345;
@@ -171,7 +166,7 @@ void fixed_slices()
     std::array<float, 12> copied;
     copied.fill(-3.0f);
     const OBBlock dest(reinterpret_cast<std::uint8_t *>(copied.data()), planar, 6);
-    const auto passthrough = checked(copy.process(output.f32p_view().subblock(2, 2), dest.f32p_view().subblock(1, 2)));
+    const auto passthrough = copy.process(output.f32p_view().subblock(2, 2), dest.f32p_view().subblock(1, 2));
     check(passthrough.consumed == 2 && passthrough.produced == 2 &&
               std::memcmp(copied.data() + 1, samples.data() + 2, 2 * sizeof(float)) == 0 &&
               std::memcmp(copied.data() + 7, samples.data() + 7, 2 * sizeof(float)) == 0 &&
@@ -188,9 +183,9 @@ void stereo_short_fir_output()
     const IBBlock input(reinterpret_cast<const std::uint8_t *>(samples.data()), planar, 256);
     std::array<float, 200> reference{};
     const OBBlock expected(reinterpret_cast<std::uint8_t *>(reference.data()), planar, 100);
-    Convert to_planar(planar, planar);
-    checked(to_planar.prepare(256, 256, 0.002));
-    check(checked(to_planar.process(input.f32p_view().subblock(4, 100), expected.f32p_view())).produced == 100,
+    SincResampler resampler;
+    resampler.prepare(2, rate, rate, 0.002);
+    check(resampler.process(input.f32p_view().subblock(4, 100), expected.f32p_view()).produced == 100,
           "Planar reference includes filter startup and steady output");
     for (const auto format : {SampleFormat::S16LE, SampleFormat::S24_3LE})
     {
@@ -198,10 +193,11 @@ void stereo_short_fir_output()
         const auto width = sample_bytes(format);
         std::vector<std::uint8_t> bytes(110 * 2 * width, 0xcd);
         const OBBlock output(bytes.data(), pcm, 110);
-        Convert convert(planar, pcm);
-        checked(convert.prepare(256, 256, 0.002));
-        const auto transfer = checked(convert.process(input.f32p_view().subblock(4, 100),
-                                                       OBBlock{output.byte_view().data() + 10 * width, pcm, 100}));
+        resampler.reset();
+        Buffer workspace;
+        workspace.resize(2, 256);
+        const auto transfer = resampler.process(input.f32p_view().subblock(4, 100), workspace.block(100));
+        encode_pcm(workspace.block(transfer.produced), {output.byte_view().data() + 10 * width, pcm, 100});
         check(transfer.consumed == 100 && transfer.produced == 100, "Short block fits the prepared FIR workspace");
         const auto scale = static_cast<double>(std::uint32_t{1} << (sample_bits(format) - 1));
         for (std::size_t frame = 0; frame < 100; ++frame)
@@ -223,40 +219,37 @@ void stereo_short_fir_output()
 
 void frame_bounds()
 {
-    const PortSpec slow(SampleRate::Hz8000, 1, SampleFormat::F32P);
-    const PortSpec fast(SampleRate::Hz96000, 1, SampleFormat::F32P);
+    constexpr auto slow = SampleRate::Hz8000;
+    constexpr auto fast = SampleRate::Hz96000;
     const auto limit = std::numeric_limits<std::size_t>::max() / 16;
-    check(checked(Convert::max_output_frames(slow, slow, 100)) == 100 &&
-              checked(Convert::max_input_frames(slow, slow, 100)) == 100 &&
-              checked(Convert::max_output_frames(slow, fast, 0, 0.25)) == 0,
+    check(SincResampler::max_output_frames(slow, slow, 100) == 100 &&
+              SincResampler::max_input_frames(slow, slow, 100) == 100 &&
+              SincResampler::max_output_frames(slow, fast, 0, 0.25) == 0,
           "A zero batch or same-rate passthrough needs no extra workspace frames");
-    check(checked(Convert::max_output_frames(slow, fast, 100, 0.25)) == 1616 &&
-              checked(Convert::max_input_frames(fast, slow, 100, 0.25)) == 1501,
+    check(SincResampler::max_output_frames(slow, fast, 100, 0.25) == 1616 &&
+              SincResampler::max_input_frames(fast, slow, 100, 0.25) == 1501,
           "Frame bounds include rate correction and pending upsampling output from history");
-    expect_error(ErrorCode::InvalidArg, Convert::max_output_frames(slow, fast, 100, 0.5));
-    expect_error(ErrorCode::FormatMismatch,
-                 Convert::max_input_frames(slow, PortSpec(rate, 2, SampleFormat::F32P), 100));
-    expect_error(ErrorCode::TooLarge, Convert::max_output_frames(slow, fast, limit, 0.25));
-    expect_error(ErrorCode::TooLarge, Convert::max_input_frames(fast, slow, limit, 0.25));
+    expect_error(ErrorCode::InvalidArg, [&] { SincResampler::max_output_frames(slow, fast, 100, 0.5); });
+    expect_error(ErrorCode::InvalidArg, [&] { SincResampler::max_input_frames(slow, SampleRate{}, 100); });
+    expect_error(ErrorCode::TooLarge, [&] { SincResampler::max_output_frames(slow, fast, limit, 0.25); });
+    expect_error(ErrorCode::TooLarge, [&] { SincResampler::max_input_frames(fast, slow, limit, 0.25); });
 
-    Convert convert(fast, slow);
-    checked(convert.prepare(16, limit, 0.25));
-    check(checked(convert.required_input(2, 1.25)) == 16, "The caller sets the allowed correction range");
-    expect_error(ErrorCode::TooLarge, convert.required_input(limit, 1.25));
-    expect_error(ErrorCode::InvalidArg, convert.prepare(16, 2, -0.01));
-    expect_error(ErrorCode::InvalidArg, convert.required_input(2, 1.26));
-    check(checked(convert.required_input(2, 1.25)) == 16, "Invalid calls preserve the active limits and phase");
+    SincResampler convert;
+    convert.prepare(1, fast, slow, 0.25);
+    check(convert.required_input(2, 1.25) == 16, "The caller sets the allowed correction range");
+    expect_error(ErrorCode::InvalidArg, [&] { convert.prepare(1, fast, slow, -0.01); });
+    check(convert.required_input(2, 1.25) == 16, "Rejected preparation preserves the active limits and phase");
 
-    Convert expand(slow, fast);
-    const auto max_out = checked(Convert::max_output_frames(slow, fast, 1, 0.25));
-    checked(expand.prepare(1, max_out, 0.25));
+    SincResampler expand;
+    const auto max_out = SincResampler::max_output_frames(slow, fast, 1, 0.25);
+    expand.prepare(1, slow, fast, 0.25);
     float sample = 0.25f;
     std::vector<float> expanded(max_out);
-    const IBBlock source(reinterpret_cast<const std::uint8_t *>(&sample), slow, 1);
-    const OBBlock dest(reinterpret_cast<std::uint8_t *>(expanded.data()), fast, max_out);
-    check(checked(expand.process(source.f32p_view(), dest.f32p_view().subblock(0, 1), 0.75)).consumed == 1,
+    const IFBlock source(&sample, 1, 1, 1);
+    const OFBlock dest(expanded.data(), 1, max_out, max_out);
+    check(expand.process(source, dest.subblock(0, 1), 0.75).consumed == 1,
           "The first capped call leaves additional output pending in history");
-    check(checked(expand.process(source, dest, 0.75)).produced == 31,
+    check(expand.process(source, dest, 0.75).produced == 31,
           "The output bound covers pending history and the new source frame in the same call");
 }
 } // namespace

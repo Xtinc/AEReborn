@@ -25,10 +25,9 @@ class FloatSource : public NodeT<0, 1>
         : NodeT({}, {PortSpec(rate, channels, SampleFormat::F32P)}), generate_(std::move(generate))
     {
     }
-    RetCode prepare(BlockPeriod) override
+    void prepare(BlockPeriod) override
     {
         ++prepares;
-        return {};
     }
     void process(const ProcessContext &context) noexcept override
     {
@@ -49,11 +48,10 @@ class PacketSink final : public NodeT<1, 0>
 {
   public:
     explicit PacketSink(PortSpec spec) : NodeT({spec}, {}) {}
-    RetCode prepare(BlockPeriod period) override
+    void prepare(BlockPeriod period) override
     {
         const auto spec = inputs()[0];
         bytes_.resize(spec.max_frames(period) * spec.channels * sample_bytes(spec.format));
-        return {};
     }
     void process(const ProcessContext &context) noexcept override
     {
@@ -87,19 +85,19 @@ struct Conversion
     Conversion(PortSpec input, PortSpec output, BlockPeriod period = test::period)
         : engine(period), clock(engine)
     {
-        const auto input_id = checked(engine.emplace_node<Capture>(input));
-        const auto convert_id = checked(engine.emplace_node<Convert>(input, output));
-        const auto sink_id = checked(engine.emplace_node<PacketSink>(output));
-        checked(engine.connect(OPORT(input_id, 0), IPORT(convert_id, 0)));
-        checked(engine.connect(OPORT(convert_id, 0), IPORT(sink_id, 0)));
-        checked(engine.commit());
-        capture = checked(engine.node<Capture>(input_id));
-        sink = checked(engine.node<PacketSink>(sink_id));
+        const auto input_id = engine.emplace_node<Capture>(input);
+        const auto convert_id = engine.emplace_node<Convert>(input, output);
+        const auto sink_id = engine.emplace_node<PacketSink>(output);
+        engine.connect(OPORT(input_id, 0), IPORT(convert_id, 0));
+        engine.connect(OPORT(convert_id, 0), IPORT(sink_id, 0));
+        engine.commit();
+        capture = engine.node<Capture>(input_id);
+        sink = engine.node<PacketSink>(sink_id);
         clock.start();
     }
     void run(View<const std::uint8_t> bytes)
     {
-        checked(capture->bind(bytes, engine.tick_position()));
+        capture->bind(bytes, engine.tick_position());
         clock.advance();
     }
     Engine engine;

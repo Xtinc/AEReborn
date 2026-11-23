@@ -1,6 +1,5 @@
 #include "io.h"
 #include <cstring>
-#include <stdexcept>
 namespace aereborn
 {
 namespace test
@@ -8,15 +7,15 @@ namespace test
 Capture::Capture(PortSpec spec) : NodeT({}, {spec})
 {
     if (!spec.valid())
-        throw std::invalid_argument("Invalid capture port specification");
+        throw Error(ErrorCode::InvalidArg, "Invalid capture port specification");
 }
-RetCode Capture::prepare(BlockPeriod period)
+void Capture::prepare(BlockPeriod period) noexcept
 {
-    return buffer_.prepare(period);
+    buffer_.prepare(period);
 }
-RetCode Capture::bind(View<const std::uint8_t> bytes, std::uint64_t tick) noexcept
+void Capture::bind(View<const std::uint8_t> bytes, std::uint64_t tick)
 {
-    return buffer_.bind(outputs()[0], bytes, tick);
+    buffer_.bind(outputs()[0], bytes, tick);
 }
 void Capture::process(const ProcessContext &context) noexcept
 {
@@ -36,15 +35,15 @@ void Capture::reset() noexcept
 Playback::Playback(PortSpec spec) : NodeT({spec}, {})
 {
     if (!spec.valid())
-        throw std::invalid_argument("Invalid playback port specification");
+        throw Error(ErrorCode::InvalidArg, "Invalid playback port specification");
 }
-RetCode Playback::prepare(BlockPeriod period)
+void Playback::prepare(BlockPeriod period) noexcept
 {
-    return buffer_.prepare(period);
+    buffer_.prepare(period);
 }
-RetCode Playback::bind(View<std::uint8_t> bytes, std::uint64_t tick) noexcept
+void Playback::bind(View<std::uint8_t> bytes, std::uint64_t tick)
 {
-    return buffer_.bind(inputs()[0], bytes, tick);
+    buffer_.bind(inputs()[0], bytes, tick);
 }
 void Playback::process(const ProcessContext &context) noexcept
 {

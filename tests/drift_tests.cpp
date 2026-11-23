@@ -1,191 +1,145 @@
-#include "plugins/drift.h"
-#include "plugins/io.h"
+#include "plugins/endpoint.h"
+#include "support/pcm_reference.h"
+#include "support/test_backend.h"
 #include "support/test_harness.h"
+#include <array>
+#include <cmath>
+#include <vector>
 
 namespace
 {
 using namespace aereborn;
 using namespace aereborn::test;
 
-struct Profile
+struct ToneMeasure
 {
-    BlockPeriod period;
-    SampleRate rate;
-    std::size_t packet_frames;
-};
-
-struct Observation
-{
-    std::size_t underruns = 0;
-    std::size_t overflows = 0;
-    double max_water_error = 0;
-    double first_water = 0;
-    double last_water = 0;
-    double correction = 0;
-};
-
-double noise(std::uint32_t &seed) noexcept
-{
-    seed = seed * 1664525u + 1013904223u;
-    return seed / 4294967296.0;
-}
-
-Observation simulate(Profile profile, bool capture, int ppm, unsigned seed, double jitter_ms, bool enabled)
-{
-    const PortSpec spec(profile.rate, 1, SampleFormat::F32P);
-    const auto rate = static_cast<std::uint32_t>(profile.rate);
-    const auto packet_us = (1000000 * profile.packet_frames + rate - 1) / rate;
-    Capture endpoint(spec.sample_rate, spec.channels, std::chrono::microseconds(packet_us));
-    checked(endpoint.prepare(profile.period));
-    const auto status = endpoint.status();
-    const auto capacity = status.capacity_frames;
-    const auto target = status.target_frames;
-
-    const auto graph_seconds = static_cast<std::uint32_t>(profile.period) / 1000.0;
-    const auto device_seconds = static_cast<double>(profile.packet_frames) / (rate * (1 + ppm * 1e-6));
-    const auto offset = device_seconds * (seed % 12) / 12;
-    const auto jitter = jitter_ms / 1000;
-    const auto jitter_origin = profile.period == BlockPeriod::Ms05 ? -jitter * 0.5 : 0;
-    auto graph_seed = std::uint32_t{47365039} + 8453 * seed;
-    auto device_seed = std::uint32_t{43702139} + 7621 * seed;
-    const auto graph_offset = [&] { return jitter_origin + jitter * noise(graph_seed); };
-    const auto device_offset = [&](std::size_t n) {
-        if (jitter_ms >= 0)
-            return jitter_origin + jitter * noise(device_seed);
-        const double pattern[] = {0, -0.001, 0.001, 0.0005, -0.0005};
-        return pattern[n % 5];
-    };
-
-    std::uint64_t graph_tick = 0;
-    std::size_t device_tick = 0, fill = 0;
-    double graph_time = graph_seconds + (jitter_ms >= 0 ? graph_offset() : 0);
-    double device_time = device_seconds + offset + device_offset(0);
-    double fraction = 0;
-    double last = 0, integral = 0;
-    double correction_area = 0, correction_time = 0;
-    int window_end = 1;
-    bool steady = false;
-    aereborn::DriftController pi;
-    Observation result;
-    const auto push = [&](std::size_t frames) {
-        if (steady && frames > capacity - fill)
-            result.overflows += frames - (capacity - fill);
-        fill += std::min(frames, capacity - fill);
-    };
-    const auto pop = [&](std::size_t frames) {
-        if (frames > fill)
-            result.underruns += frames - fill;
-        fill -= std::min(frames, fill);
-    };
-
-    for (;;)
+    void observe(float sample, bool measure)
     {
-        const auto time = std::min(graph_time, device_time);
-        if (time > 300)
-            break;
-
-        if (time > 290)
+        check(sample > 0.125f && sample < 0.875f, "Steady resampling does not insert silence");
+        if (!measure)
+            return;
+        if (previous < 0.5f && sample >= 0.5f)
         {
-            const auto span = time - std::max(last, 290.0);
-            correction_area += pi.correction() * span;
-            correction_time += span;
+            // Interpolate the upward crossing to resolve sub-frame changes in the period.
+            const auto crossing = frames - 1 + (0.5 - previous) / (sample - previous);
+            if (crossings++ == 0)
+                first = crossing;
+            last = crossing;
         }
-        if (time >= window_end)
-        {
-            const auto average = integral + (window_end - last) * fill;
-            if (window_end == 11)
-                result.first_water = average;
-            if (window_end >= 11)
-                result.max_water_error = std::max(result.max_water_error, std::abs(average - target));
-            result.last_water = average;
-            last = window_end++;
-            integral = 0;
-        }
-        integral += (time - last) * fill;
-        last = time;
+        ++frames;
+        previous = sample;
+    }
 
-        if (graph_time <= device_time)
+    double scale(std::size_t period) const
+    {
+        check(crossings > 1, "The output contains the test tone");
+        return static_cast<double>((crossings - 1) * period) / (last - first);
+    }
+
+    std::size_t frames = 0;
+    std::size_t crossings = 0;
+    double first = 0;
+    double last = 0;
+    float previous = 0.5f;
+};
+
+void check_endpoint_drift(std::size_t packet_frames, double jitter_seconds)
+{
+    constexpr auto sample_rate = SampleRate::Hz8000;
+    constexpr auto period = BlockPeriod::Ms02;
+    const auto device_period = std::chrono::microseconds(packet_frames * 1000000 / static_cast<unsigned>(sample_rate));
+    const PortSpec logical(sample_rate, 1, SampleFormat::F32P), device(sample_rate, 1, SampleFormat::F32LE);
+    std::array<float, 16> tone{};
+    const auto radians = 2 * std::acos(-1.0) / tone.size();
+    for (std::size_t i = 0; i < tone.size(); ++i)
+        tone[i] = static_cast<float>(0.5 + 0.25 * std::sin(radians * i));
+    std::vector<std::uint8_t> device_input(packet_frames * sizeof(float));
+    for (std::size_t i = 0; i < packet_frames; ++i)
+        write_f32le(device_input.data() + i * sizeof(float), tone[i % tone.size()]);
+    constexpr double jitter[] = {-0.5, 1, 0, -1, 0.5};
+
+    for (const auto ppm : {-300, 300})
+    {
+        Capture capture(sample_rate, 1, device_period);
+        Playback playback(sample_rate, 1, device_period);
+        capture.prepare(period);
+        playback.prepare(period);
+        std::vector<std::uint8_t> device_output(packet_frames * sizeof(float));
+        TestBackend source(device, packet_frames);
+        TestBackend sink(device, packet_frames);
+        source.input = {device_input.data(), device, packet_frames};
+        sink.output = {device_output.data(), device, packet_frames};
+        source.gated = true;
+        sink.gated = true;
+        source.bind(capture);
+        sink.bind(playback);
+        source.start();
+        sink.start();
+        check(source.wait_for_io() && sink.wait_for_io(), "Device workers reach their first batch");
+
+        std::array<float, 16> samples{};
+        const OBBlock output(reinterpret_cast<std::uint8_t *>(samples.data()), logical, samples.size());
+        const IBBlock input(reinterpret_cast<const std::uint8_t *>(tone.data()), logical, tone.size());
+        const auto device_seconds = std::chrono::duration<double>(device_period).count() / (1 + ppm * 1e-6);
+        const auto graph_seconds = static_cast<unsigned>(period) / 1000.0;
+        std::uint64_t graph_tick = 0;
+        std::size_t device_tick = 0;
+        ToneMeasure captured, played;
+        for (;;)
         {
-            const auto frames = spec.frames(profile.period, graph_tick++);
-            graph_time = (graph_tick + 1) * graph_seconds + (jitter_ms >= 0 ? graph_offset() : 0);
-            if (capture)
+            const auto graph_time = (graph_tick + 1) * graph_seconds + jitter_seconds * jitter[graph_tick % 5];
+            const auto device_time = (device_tick + 1) * device_seconds + jitter_seconds * jitter[(device_tick + 2) % 5];
+            if (std::min(graph_time, device_time) > 100)
+                break;
+            if (graph_time <= device_time)
             {
-                steady = steady || fill >= target;
-                if (steady)
-                    pop(frames);
+                capture.process({period, graph_tick, {}, {&output, 1}});
+                playback.process({period, graph_tick++, {&input, 1}, {}});
+                if (graph_time > 2)
+                    for (const auto sample : samples)
+                        captured.observe(sample, graph_time > 70);
             }
             else
-                push(frames);
-        }
-        else
-        {
-            ++device_tick;
-            device_time = (device_tick + 1) * device_seconds + offset + device_offset(device_tick);
-            const auto before = fill;
-            const auto was_steady = steady;
-            if (!capture)
-                steady = steady || fill >= target;
-            if (capture || steady)
             {
-                const auto step = 1 + pi.correction();
-                fraction += capture ? profile.packet_frames / step : profile.packet_frames * step;
-                const auto frames = static_cast<std::size_t>(fraction);
-                fraction -= frames;
-                if (capture)
-                    push(frames);
-                else
-                    pop(frames);
+                check(source.run_batch() && sink.run_batch(), "Both backends complete the scheduled device batch");
+                ++device_tick;
+                if (device_time > 2)
+                    for (std::size_t i = 0; i < packet_frames; ++i)
+                        played.observe(read_f32le(device_output.data() + i * sizeof(float)), device_time > 70);
             }
-            if (enabled && was_steady)
-                pi.update(before, fill, target, profile.rate, profile.packet_frames, profile.rate);
         }
+        source.stop();
+        sink.stop();
+        check(source.last_error() == ErrorCode::Ok && sink.last_error() == ErrorCode::Ok,
+              "Both device workers finish the simulated clock run");
+        const auto expected = ppm * 1e-6;
+        const auto capture_scale = captured.scale(tone.size());
+        const auto playback_scale = played.scale(tone.size());
+        check(std::abs(capture_scale - 1 - expected) < 0.0002 &&
+                  std::abs(playback_scale - 1 + expected) < 0.0002,
+              "Actual capture and playback frame transfers compensate the device clock");
     }
-    result.correction = correction_area / correction_time;
-    return result;
 }
 
-void verify(Profile profile, double jitter)
+void endpoint_integration()
 {
-    for (const auto capture : {false, true})
-        for (const auto ppm : {-300, 300})
-            for (const auto seed : {0u, 5u, 100u, 107u})
-            {
-                const auto result = simulate(profile, capture, ppm, seed, jitter, true);
-                const auto allowable = PortSpec(profile.rate, 1, SampleFormat::F32P).max_frames(profile.period);
-                check(result.underruns == 0 && result.overflows == 0,
-                      "Drift and burst jitter must fit from the first steady transfer");
-                check(result.max_water_error <= allowable, "The one-second mean stays within one graph block of target");
-                const auto expected = (capture ? 1 : -1) * ppm * 1e-6;
-                check(std::abs(result.correction - expected) < 0.00035, "Watermark PI corrects the clock in the right direction");
-            }
+    check_endpoint_drift(128, 0);
 }
 
-void drift_profiles()
+void small_packet_jitter()
 {
-    for (const std::size_t packet : {128, 512, 960})
-    {
-        verify({BlockPeriod::Ms02, SampleRate::Hz48000, packet}, 1.0);
-        verify({BlockPeriod::Ms02, SampleRate::Hz48000, packet}, 1.5);
-    }
-    verify({BlockPeriod::Ms02, SampleRate::Hz44100, 512}, 1.5);
-    verify({BlockPeriod::Ms05, SampleRate::Hz44100, 128}, -1);
-    verify({BlockPeriod::Ms05, SampleRate::Hz44100, 128}, 2.0);
-    verify({BlockPeriod::Ms40, SampleRate::Hz44100, 128}, -1);
+    check_endpoint_drift(64, 0.00075);
 }
 
-void correction_disabled()
+void large_packet_jitter()
 {
-    const Profile profile{BlockPeriod::Ms02, SampleRate::Hz48000, 128};
-    const auto capture = simulate(profile, true, 300, 7, 1.0, false);
-    const auto playback = simulate(profile, false, 300, 7, 1.0, false);
-    check(capture.overflows && capture.last_water > capture.first_water,
-          "Without correction a fast capture device fills the queue");
-    check(playback.underruns && playback.last_water < playback.first_water,
-          "Without correction a fast playback device drains the queue");
+    check_endpoint_drift(256, 0.001);
 }
 } // namespace
 
 int main(int argc, char **argv)
 {
-    return run_tests(argc, argv, {{"drift_profiles", drift_profiles}, {"correction_disabled", correction_disabled}});
+    return run_tests(argc, argv, {{"small_packet_jitter", small_packet_jitter},
+                                  {"large_packet_jitter", large_packet_jitter},
+                                  {"endpoint_integration", endpoint_integration}});
 }

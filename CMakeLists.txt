@@ -10,6 +10,8 @@ find_package(Threads REQUIRED)
 
 add_library(aereborn_core STATIC
     core/engine.cpp
+    core/os.cpp
+    core/resampler.cpp
     core/types.cpp
 )
 add_library(aereborn::core ALIAS aereborn_core)
@@ -21,14 +23,14 @@ target_link_libraries(aereborn_core PRIVATE Threads::Threads)
 
 add_library(aereborn_plugins STATIC
     plugins/convert.cpp
-    plugins/device_stream.cpp
-    plugins/drift.cpp
-    plugins/io.cpp
+    plugins/endpoint.cpp
     plugins/matrix.cpp
     plugins/mixer.cpp
 )
 add_library(aereborn::plugins ALIAS aereborn_plugins)
 target_link_libraries(aereborn_plugins PUBLIC aereborn::core)
+
+add_subdirectory(backend)
 
 include(CTest)
 option(BUILD_EXAMPLES "Build AEReborn examples" ON)

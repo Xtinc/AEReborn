@@ -5,23 +5,18 @@
 namespace aereborn
 {
 
-RetCode Buffer::resize(std::size_t channels, std::size_t capacity_frames)
+void Buffer::resize(std::size_t channels, std::size_t capacity_frames)
 {
     if (channels == 0 || capacity_frames == 0)
-    {
-        return ErrorCode::InvalidArg;
-    }
+        throw Error(ErrorCode::InvalidArg);
     if (channels > samples_.max_size() / capacity_frames)
-    {
-        return ErrorCode::TooLarge;
-    }
+        throw Error(ErrorCode::TooLarge);
     const auto sample_count = channels * capacity_frames;
     const auto retained_samples = std::min(samples_.size(), sample_count);
     samples_.resize(sample_count);
     std::fill_n(samples_.begin(), retained_samples, 0.0f);
     channels_ = channels;
     capacity_frames_ = capacity_frames;
-    return {};
 }
 
 OFBlock Buffer::block(std::size_t frames) noexcept

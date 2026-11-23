@@ -24,15 +24,28 @@ aereborn_test_group(mix mix_tests.cpp aereborn::plugins
     matrix_identity_bits matrix_mapping matrix_validation gain_ramp_and_zero mixer_mute empty_block_ramps)
 aereborn_test_group(device io_tests.cpp "aereborn::plugins;aereborn_test_plugins"
     buffer_binding future_binding binding_period_change topology_format_switch)
-aereborn_test_group(endpoint endpoint_tests.cpp aereborn::plugins
+get_target_property(backend_definitions aereborn_backend INTERFACE_COMPILE_DEFINITIONS)
+set(platform_endpoint_tests)
+if("AEREBORN_HAS_ALSA=1" IN_LIST backend_definitions)
+    list(APPEND platform_endpoint_tests alsa_virtual)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    list(APPEND platform_endpoint_tests wasapi_open_rollback)
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND platform_endpoint_tests wav_write_errors)
+endif()
+aereborn_test_group(endpoint endpoint_tests.cpp aereborn::backend
     queue_ranges planar_playback stop_in_flight restart_graph streaming_ranges stream_step_changes
-    offline_capture playback_silence
-    virtual_device_audio)
-aereborn_test_group(drift drift_tests.cpp aereborn::plugins drift_profiles correction_disabled)
+    offline_capture playback_silence virtual_device_audio lifecycle thread_errors playback_stop sync_playback_restart io_timeout
+    empty_capture_timeout startup_empty_capture_timeout sync_playback_drain sync_capture_eos null_backends
+    wav_round_trip wav_reader wav_file_write wav_segments
+    ${platform_endpoint_tests})
+aereborn_test_group(drift drift_tests.cpp aereborn::backend small_packet_jitter large_packet_jitter endpoint_integration)
 aereborn_test_group(tone tone_tests.cpp aereborn_test_plugins tone_timeline tone_validation)
-aereborn_test_group(allocation allocation_failure_tests.cpp aereborn::plugins
+aereborn_test_group(allocation allocation_failure_tests.cpp aereborn::backend
     buffer_resize_rollback conversion_rollback direct_conversion_needs_no_workspace
-    plan_allocation_rollback render_uses_prepared_buffers endpoint_uses_prepared_buffers)
+    plan_allocation_rollback render_uses_prepared_buffers backend_binding_rollback endpoint_uses_prepared_buffers)
 set_tests_properties(allocation.buffer_resize_rollback allocation.conversion_rollback
     allocation.direct_conversion_needs_no_workspace allocation.plan_allocation_rollback
-    allocation.render_uses_prepared_buffers allocation.endpoint_uses_prepared_buffers PROPERTIES SKIP_RETURN_CODE 77)
+    allocation.render_uses_prepared_buffers allocation.backend_binding_rollback
+    allocation.endpoint_uses_prepared_buffers PROPERTIES SKIP_RETURN_CODE 77)

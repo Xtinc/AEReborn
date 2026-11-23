@@ -19,7 +19,7 @@ class ClockedGraph
 {
   public:
     explicit ClockedGraph(Engine &engine)
-        : engine_(engine), gate_(checked(engine.node<Gate>(checked(engine.emplace_node<Gate>()))))
+        : engine_(engine), gate_(engine.node<Gate>(engine.emplace_node<Gate>()))
     {
     }
     ~ClockedGraph() { stop(); }
@@ -29,7 +29,7 @@ class ClockedGraph
     void start()
     {
         gate_->arm();
-        checked(engine_.start());
+        engine_.start();
         require_block(gate_->wait_for_entry());
     }
 
@@ -40,7 +40,7 @@ class ClockedGraph
     void commit()
     {
         resume();
-        checked(engine_.commit());
+        engine_.commit();
         advance();
     }
 

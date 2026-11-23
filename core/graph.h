@@ -29,13 +29,10 @@ class Node
 
     /// @brief Prepare the node's processing resources on the control thread.
     /// @param period Block period validated by the engine.
-    /// @return Success when the node is ready to process, or a preparation error.
+    /// @throws Error If preparation fails.
     /// @note The default implementation succeeds without preparing any resources.
     /// @note The engine may retry after a failure.
-    virtual RetCode prepare(BlockPeriod /*period*/)
-    {
-        return {};
-    }
+    virtual void prepare(BlockPeriod /*period*/) {}
 
     /// @brief Process one block and write every output sample in its declared format.
     /// @param context Current period, tick position, and input and output block views.

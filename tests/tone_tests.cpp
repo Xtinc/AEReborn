@@ -11,11 +11,11 @@ void tone_timeline()
     Engine engine(tone_period);
     ClockedGraph clock(engine);
     const PortSpec spec(SampleRate::Hz11025, 2, SampleFormat::F32P);
-    const auto source = checked(engine.emplace_node<Tone>(spec.sample_rate, 2, 997, 0.25f));
-    const auto sink = checked(engine.emplace_node<PacketSink>(spec));
-    checked(engine.connect(OPORT(source, 0), IPORT(sink, 0)));
-    checked(engine.commit());
-    auto *out = checked(engine.node<PacketSink>(sink));
+    const auto source = engine.emplace_node<Tone>(spec.sample_rate, 2, 997, 0.25f);
+    const auto sink = engine.emplace_node<PacketSink>(spec);
+    engine.connect(OPORT(source, 0), IPORT(sink, 0));
+    engine.commit();
+    auto *out = engine.node<PacketSink>(sink);
     clock.start();
     for (std::uint64_t tick = 0; tick < 5; ++tick)
     {
@@ -30,19 +30,19 @@ void tone_timeline()
         }
     }
     clock.stop();
-    checked(engine.reset());
+    engine.reset();
     clock.start();
     clock.advance();
     check(out->sample(0) == 0, "Reset restarts the tone at zero phase");
 }
 void tone_validation()
 {
-    expect_exception<std::invalid_argument>([] { Tone invalid(rate, 1, 24000); });
-    expect_exception<std::invalid_argument>([] { Tone invalid(rate, 1, -1); });
-    expect_exception<std::invalid_argument>([] { Tone invalid(rate, 1, 440, std::numeric_limits<float>::infinity()); });
-    expect_exception<std::invalid_argument>([] { Tone invalid(rate, 0); });
+    expect_error(ErrorCode::InvalidArg, [] { Tone invalid(rate, 1, 24000); });
+    expect_error(ErrorCode::InvalidArg, [] { Tone invalid(rate, 1, -1); });
+    expect_error(ErrorCode::InvalidArg, [] { Tone invalid(rate, 1, 440, std::numeric_limits<float>::infinity()); });
+    expect_error(ErrorCode::InvalidArg, [] { Tone invalid(rate, 0); });
     Tone silent(rate, 1, 0, 0);
-    checked(silent.prepare(period));
+    silent.prepare(period);
 }
 } // namespace
 int main(int argc, char **argv)

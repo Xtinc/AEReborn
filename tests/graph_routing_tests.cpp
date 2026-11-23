@@ -11,21 +11,21 @@ void explicit_mix_and_fanout()
 {
     Engine engine(period);
     ClockedGraph clock(engine);
-    const auto a = checked(engine.emplace_node<Tone>(rate, 2, 997, 0.25f));
-    const auto b = checked(engine.emplace_node<Tone>(rate, 2, 431, 0.125f));
-    const auto mix = checked(engine.emplace_node<Mixer>(rate, 2, 2));
+    const auto a = engine.emplace_node<Tone>(rate, 2, 997, 0.25f);
+    const auto b = engine.emplace_node<Tone>(rate, 2, 431, 0.125f);
+    const auto mix = engine.emplace_node<Mixer>(rate, 2, 2);
     const auto matrix =
-        checked(engine.emplace_node<Matrix>(rate, 2, 2, std::initializer_list<float>{0, 1, 1, 0}, 0.5f));
-    const auto first = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 2, SampleFormat::F32P)));
-    const auto second = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 2, SampleFormat::F32P)));
-    checked(engine.connect(OPORT(a, 0), IPORT(mix, 0)));
-    checked(engine.connect(OPORT(b, 0), IPORT(mix, 1)));
-    checked(engine.connect(OPORT(mix, 0), IPORT(matrix, 0)));
-    checked(engine.connect(OPORT(matrix, 0), IPORT(first, 0)));
-    checked(engine.connect(OPORT(matrix, 0), IPORT(second, 0)));
-    checked(engine.commit());
-    auto *one = checked(engine.node<PacketSink>(first));
-    auto *two = checked(engine.node<PacketSink>(second));
+        engine.emplace_node<Matrix>(rate, 2, 2, std::initializer_list<float>{0, 1, 1, 0}, 0.5f);
+    const auto first = engine.emplace_node<PacketSink>(PortSpec(rate, 2, SampleFormat::F32P));
+    const auto second = engine.emplace_node<PacketSink>(PortSpec(rate, 2, SampleFormat::F32P));
+    engine.connect(OPORT(a, 0), IPORT(mix, 0));
+    engine.connect(OPORT(b, 0), IPORT(mix, 1));
+    engine.connect(OPORT(mix, 0), IPORT(matrix, 0));
+    engine.connect(OPORT(matrix, 0), IPORT(first, 0));
+    engine.connect(OPORT(matrix, 0), IPORT(second, 0));
+    engine.commit();
+    auto *one = engine.node<PacketSink>(first);
+    auto *two = engine.node<PacketSink>(second);
     clock.start();
     for (std::size_t tick = 0; tick < 5; ++tick)
     {
@@ -70,21 +70,21 @@ void algorithm_chain()
     Engine engine(period);
     ClockedGraph clock(engine);
     const PortSpec bus(rate, 1, SampleFormat::F32P), pcm(SampleRate::Hz16000, 1, SampleFormat::S16LE);
-    const auto tone = checked(engine.emplace_node<Tone>(rate, 1, 1000, 0.25f));
-    const auto mix = checked(engine.emplace_node<Mixer>(rate, 1, 1));
-    const auto down = checked(engine.emplace_node<Convert>(bus, pcm));
-    const auto algorithm = checked(engine.emplace_node<Algorithm>());
-    const auto up = checked(engine.emplace_node<Convert>(pcm, bus));
-    const auto sink = checked(engine.emplace_node<PacketSink>(bus));
-    expect_error(ErrorCode::FormatMismatch, engine.connect(OPORT(mix, 0), IPORT(algorithm, 0)));
-    checked(engine.connect(OPORT(tone, 0), IPORT(mix, 0)));
-    checked(engine.connect(OPORT(mix, 0), IPORT(down, 0)));
-    checked(engine.connect(OPORT(down, 0), IPORT(algorithm, 0)));
-    checked(engine.connect(OPORT(algorithm, 0), IPORT(up, 0)));
-    checked(engine.connect(OPORT(up, 0), IPORT(sink, 0)));
-    checked(engine.commit());
-    auto *output = checked(engine.node<PacketSink>(sink));
-    auto *algo = checked(engine.node<Algorithm>(algorithm));
+    const auto tone = engine.emplace_node<Tone>(rate, 1, 1000, 0.25f);
+    const auto mix = engine.emplace_node<Mixer>(rate, 1, 1);
+    const auto down = engine.emplace_node<Convert>(bus, pcm);
+    const auto algorithm = engine.emplace_node<Algorithm>();
+    const auto up = engine.emplace_node<Convert>(pcm, bus);
+    const auto sink = engine.emplace_node<PacketSink>(bus);
+    expect_error(ErrorCode::FormatMismatch, [&] { engine.connect(OPORT(mix, 0), IPORT(algorithm, 0)); });
+    engine.connect(OPORT(tone, 0), IPORT(mix, 0));
+    engine.connect(OPORT(mix, 0), IPORT(down, 0));
+    engine.connect(OPORT(down, 0), IPORT(algorithm, 0));
+    engine.connect(OPORT(algorithm, 0), IPORT(up, 0));
+    engine.connect(OPORT(up, 0), IPORT(sink, 0));
+    engine.commit();
+    auto *output = engine.node<PacketSink>(sink);
+    auto *algo = engine.node<Algorithm>(algorithm);
     clock.start();
     for (std::size_t tick = 0; tick < 20; ++tick)
     {
@@ -105,22 +105,22 @@ void silence_and_pruning()
     Engine engine(period);
     ClockedGraph clock(engine);
     const auto source =
-        checked(engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 1.0f; }));
-    const auto sink = checked(engine.emplace_node<PacketSink>(PortSpec(rate, 1, SampleFormat::F32P)));
-    checked(engine.commit());
+        engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 1.0f; });
+    const auto sink = engine.emplace_node<PacketSink>(PortSpec(rate, 1, SampleFormat::F32P));
+    engine.commit();
     clock.start();
     clock.advance();
-    auto *input = checked(engine.node<FloatSource>(source));
-    auto *output = checked(engine.node<PacketSink>(sink));
+    auto *input = engine.node<FloatSource>(source);
+    auto *output = engine.node<PacketSink>(sink);
     check(input->calls == 0 && input->prepares == 0 && output->sample(0) == 0,
           "Orphan sources are pruned and disconnected inputs are silence");
-    const auto conn = checked(engine.connect(OPORT(source, 0), IPORT(sink, 0)));
+    const auto conn = engine.connect(OPORT(source, 0), IPORT(sink, 0));
     clock.commit();
     const auto connected_calls = input->calls;
     clock.advance();
     check(input->calls == connected_calls + 1 && output->sample(0) == 1,
           "Connecting a sink activates its upstream graph");
-    checked(engine.disconnect(conn));
+    engine.disconnect(conn);
     clock.commit();
     const auto calls = input->calls;
     clock.advance();
@@ -134,16 +134,16 @@ void shared_silence()
     const PortSpec wide_planar(SampleRate::Hz44100, 2, SampleFormat::F32P);
     const PortSpec wide_pcm(SampleRate::Hz44100, 3, SampleFormat::S24_3LE);
     const auto source =
-        checked(engine.emplace_node<FloatSource>(wide_planar.sample_rate, 2,
-                                                 [](std::uint64_t, std::size_t ch) { return static_cast<float>(ch + 1); }));
+        engine.emplace_node<FloatSource>(wide_planar.sample_rate, 2,
+                                                 [](std::uint64_t, std::size_t ch) { return static_cast<float>(ch + 1); });
     auto add_sink = [&](PortSpec spec) {
-        return checked(engine.node<PacketSink>(checked(engine.emplace_node<PacketSink>(spec))));
+        return engine.node<PacketSink>(engine.emplace_node<PacketSink>(spec));
     };
     const auto *a = add_sink(planar), *b = add_sink(wide_planar), *c = add_sink(pcm), *d = add_sink(wide_pcm);
-    const auto connected = checked(engine.emplace_node<PacketSink>(wide_planar));
-    const auto *output = checked(engine.node<PacketSink>(connected));
-    checked(engine.connect(OPORT(source, 0), IPORT(connected, 0)));
-    checked(engine.commit());
+    const auto connected = engine.emplace_node<PacketSink>(wide_planar);
+    const auto *output = engine.node<PacketSink>(connected);
+    engine.connect(OPORT(source, 0), IPORT(connected, 0));
+    engine.commit();
     clock.start();
     for (std::uint64_t tick = 0; tick < 2; ++tick)
     {
@@ -173,23 +173,23 @@ void format_validation()
                             PortSpec(rate, 0, SampleFormat::F32P),
                             PortSpec(rate, 1, static_cast<SampleFormat>(99))})
     {
-        expect_exception<std::invalid_argument>([&] { engine.emplace_node<Capture>(spec); });
-        expect_exception<std::invalid_argument>([&] { engine.emplace_node<Playback>(spec); });
-        expect_error(ErrorCode::InvalidArg, engine.emplace_node<PacketSink>(spec));
+        expect_error(ErrorCode::InvalidArg, [&] { engine.emplace_node<Capture>(spec); });
+        expect_error(ErrorCode::InvalidArg, [&] { engine.emplace_node<Playback>(spec); });
+        expect_error(ErrorCode::InvalidArg, [&] { engine.emplace_node<PacketSink>(spec); });
     }
     const auto source =
-        checked(engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 0.0f; }));
+        engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 0.0f; });
     for (const auto spec : {PortSpec(rate, 2, SampleFormat::F32P),
                             PortSpec(SampleRate::Hz16000, 1, SampleFormat::F32P),
                             PortSpec(rate, 1, SampleFormat::F32LE),
                             PortSpec(rate, 1, SampleFormat::S16LE)})
     {
-        const auto sink = checked(engine.emplace_node<PacketSink>(spec));
-        expect_error(ErrorCode::FormatMismatch, engine.connect(OPORT(source, 0), IPORT(sink, 0)));
+        const auto sink = engine.emplace_node<PacketSink>(spec);
+        expect_error(ErrorCode::FormatMismatch, [&] { engine.connect(OPORT(source, 0), IPORT(sink, 0)); });
     }
-    const auto mixer = checked(engine.emplace_node<Mixer>(rate, 1, 1));
-    const auto raw = checked(engine.emplace_node<Capture>(PortSpec(rate, 1, SampleFormat::S16LE)));
-    expect_error(ErrorCode::FormatMismatch, engine.connect(OPORT(raw, 0), IPORT(mixer, 0)));
+    const auto mixer = engine.emplace_node<Mixer>(rate, 1, 1);
+    const auto raw = engine.emplace_node<Capture>(PortSpec(rate, 1, SampleFormat::S16LE));
+    expect_error(ErrorCode::FormatMismatch, [&] { engine.connect(OPORT(raw, 0), IPORT(mixer, 0)); });
 }
 void channel_split_same_tick()
 {
@@ -203,26 +203,26 @@ void channel_split_same_tick()
         right[ch * 8 + ch + 4] = 1;
     }
     const auto source =
-        checked(engine.emplace_node<FloatSource>(split_rate, 8, [](std::uint64_t frame, std::size_t ch)
-                                                 { return frame % 7 ? 0.0f : static_cast<float>(ch + 1); }));
-    const auto other = checked(engine.emplace_node<FloatSource>(split_rate, 4, [](std::uint64_t, std::size_t ch)
-                                                                { return static_cast<float>(ch + 1) * 0.125f; }));
-    const auto a = checked(engine.emplace_node<Matrix>(split_rate, 8, 4, View<const float>{left.data(), left.size()}));
+        engine.emplace_node<FloatSource>(split_rate, 8, [](std::uint64_t frame, std::size_t ch)
+                                                 { return frame % 7 ? 0.0f : static_cast<float>(ch + 1); });
+    const auto other = engine.emplace_node<FloatSource>(split_rate, 4, [](std::uint64_t, std::size_t ch)
+                                                                { return static_cast<float>(ch + 1) * 0.125f; });
+    const auto a = engine.emplace_node<Matrix>(split_rate, 8, 4, View<const float>{left.data(), left.size()});
     const auto b =
-        checked(engine.emplace_node<Matrix>(split_rate, 8, 4, View<const float>{right.data(), right.size()}));
-    const auto mix = checked(engine.emplace_node<Mixer>(split_rate, 4, 2));
-    const auto first = checked(engine.emplace_node<PacketSink>(PortSpec(split_rate, 4, SampleFormat::F32P)));
-    const auto second = checked(engine.emplace_node<PacketSink>(PortSpec(split_rate, 4, SampleFormat::F32P)));
-    checked(engine.connect(OPORT(source, 0), IPORT(a, 0)));
-    checked(engine.connect(OPORT(source, 0), IPORT(b, 0)));
-    checked(engine.connect(OPORT(a, 0), IPORT(first, 0)));
-    checked(engine.connect(OPORT(b, 0), IPORT(mix, 0)));
-    checked(engine.connect(OPORT(other, 0), IPORT(mix, 1)));
-    checked(engine.connect(OPORT(mix, 0), IPORT(second, 0)));
-    checked(engine.commit());
-    const auto *input = checked(engine.node<FloatSource>(source));
-    const auto *out_a = checked(engine.node<PacketSink>(first));
-    const auto *out_b = checked(engine.node<PacketSink>(second));
+        engine.emplace_node<Matrix>(split_rate, 8, 4, View<const float>{right.data(), right.size()});
+    const auto mix = engine.emplace_node<Mixer>(split_rate, 4, 2);
+    const auto first = engine.emplace_node<PacketSink>(PortSpec(split_rate, 4, SampleFormat::F32P));
+    const auto second = engine.emplace_node<PacketSink>(PortSpec(split_rate, 4, SampleFormat::F32P));
+    engine.connect(OPORT(source, 0), IPORT(a, 0));
+    engine.connect(OPORT(source, 0), IPORT(b, 0));
+    engine.connect(OPORT(a, 0), IPORT(first, 0));
+    engine.connect(OPORT(b, 0), IPORT(mix, 0));
+    engine.connect(OPORT(other, 0), IPORT(mix, 1));
+    engine.connect(OPORT(mix, 0), IPORT(second, 0));
+    engine.commit();
+    const auto *input = engine.node<FloatSource>(source);
+    const auto *out_a = engine.node<PacketSink>(first);
+    const auto *out_b = engine.node<PacketSink>(second);
     std::size_t start = 0;
     clock.start();
     for (std::size_t tick = 0; tick < 8; ++tick)

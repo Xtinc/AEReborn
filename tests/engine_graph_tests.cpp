@@ -23,16 +23,17 @@ static_assert(!std::is_convertible<IBBlock, OBBlock>::value, "An input cannot be
 static_assert(!std::is_constructible<PortSpec, SampleRate, std::size_t>::value,
               "Specifying a port requires a sample format");
 constexpr RetCode busy(ErrorCode::Busy);
+static_assert(busy.code() == ErrorCode::Busy, "The stored error code is accessible");
 static_assert(busy == RetCode(ErrorCode::Busy) && busy != RetCode{}, "Return codes compare by error code");
 static_assert(busy == ErrorCode::Busy && ErrorCode::Busy == busy, "Equality accepts an error code on either side");
 static_assert(busy != ErrorCode::Ok && ErrorCode::Ok != busy, "Inequality accepts an error code on either side");
-static_assert(std::is_same<decltype(std::declval<Result<NodeId> &>().value()), NodeId &>::value,
+static_assert(std::is_same<decltype(std::declval<Result<std::size_t> &>().value()), std::size_t &>::value,
               "A mutable result exposes its value by reference");
 
 void frame_ring()
 {
     FrameRing ring;
-    checked(ring.prepare(2, 5));
+    ring.prepare(2, 5);
     std::array<float, 16> samples{}, played{};
     const OFBlock input(samples.data(), 2, 8, 8), output(played.data(), 2, 8, 8);
     for (std::size_t ch = 0; ch < 2; ++ch)
@@ -45,7 +46,7 @@ void frame_ring()
         check(ring.write(input.subblock(1, 4)) == 4 && ring.write(input.subblock(5, 2)) == 1,
               "Ring stores complete frames up to capacity");
         check(ring.write(input) == 0 && ring.available() == 5, "A full ring keeps its old samples");
-        expect_error(ErrorCode::TooLarge, ring.prepare(2, std::numeric_limits<std::size_t>::max()));
+        expect_error(ErrorCode::TooLarge, [&] { ring.prepare(2, std::numeric_limits<std::size_t>::max()); });
         played.fill(-1.0f);
         check(ring.read(output.subblock(2, 6)) == 5 && ring.read(output) == 0,
               "Reading drains only available frames after a rejected prepare");
@@ -65,7 +66,7 @@ void frame_ring()
 void audio_block_layout()
 {
     Buffer buffer;
-    checked(buffer.resize(2, 8));
+    buffer.resize(2, 8);
     auto full = buffer.block(8);
     std::fill_n(full.channel(0), 8, 1.0f);
     std::fill_n(full.channel(1), 8, 2.0f);
@@ -79,9 +80,9 @@ void audio_block_layout()
                   "Planar stride and processing span are independent");
         }
     }
-    expect_error(ErrorCode::InvalidArg, buffer.resize(0, 8));
-    expect_error(ErrorCode::InvalidArg, buffer.resize(1, 0));
-    expect_error(ErrorCode::TooLarge, buffer.resize(std::numeric_limits<std::size_t>::max(), 8));
+    expect_error(ErrorCode::InvalidArg, [&] { buffer.resize(0, 8); });
+    expect_error(ErrorCode::InvalidArg, [&] { buffer.resize(1, 0); });
+    expect_error(ErrorCode::TooLarge, [&] { buffer.resize(std::numeric_limits<std::size_t>::max(), 8); });
     const auto retained = buffer.block(8);
     check(retained.channel(1) - retained.channel(0) == 8 && retained.channel(1)[7] == 2,
           "Rejected resize preserves storage and layout");
@@ -93,14 +94,7 @@ void audio_block_layout()
 void engine_timing_validation()
 {
     for (const auto period : {static_cast<BlockPeriod>(0), static_cast<BlockPeriod>(15)})
-    {
-        Engine engine(period);
-        const auto sink = checked(engine.emplace_node<VirtualNode<1, 0>>());
-        const auto *node = checked(engine.node<VirtualNode<1, 0>>(sink));
-        expect_error(ErrorCode::InvalidArg, engine.commit());
-        check(node->prepares == 0, "The engine rejects an invalid period before preparing nodes");
-        expect_error(ErrorCode::NotPrepared, engine.start());
-    }
+        expect_error(ErrorCode::InvalidArg, [&] { Engine engine(period); });
     const struct
     {
         BlockPeriod period;
@@ -115,7 +109,7 @@ void engine_timing_validation()
     for (const auto &test : cases)
     {
         Engine engine(test.period);
-        checked(engine.commit());
+        engine.commit();
         check(engine.block_period() == test.period, "The engine exposes its configured block period");
         check(fractional.max_frames(test.period) == test.short_frames + 1,
               "Capacity covers the longer fractional block");
@@ -140,93 +134,93 @@ void connection_validation()
 {
     Engine engine(render_period);
     ClockedGraph clock(engine);
-    expect_error(ErrorCode::InvalidArg, engine.add_node(nullptr));
-    expect_error(ErrorCode::InvalidArg, engine.emplace_node<VirtualNode<0, 1>>(0));
-    const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>());
-    const auto sink = checked(engine.emplace_node<VirtualNode<1, 0>>());
-    const auto stereo = checked(engine.emplace_node<VirtualNode<1, 0>>(2));
-    const auto connection = checked(engine.connect(OPORT(source, 0), IPORT(sink, 0)));
-    expect_error(ErrorCode::DuplicateConn, engine.connect(OPORT(source, 0), IPORT(sink, 0)));
-    const auto second = checked(engine.emplace_node<VirtualNode<0, 1>>());
-    expect_error(ErrorCode::InputConnected, engine.connect(OPORT(second, 0), IPORT(sink, 0)));
-    expect_error(ErrorCode::InvalidPort, engine.connect(OPORT(sink, 0), IPORT(source, 0)));
-    expect_error(ErrorCode::InvalidPort, engine.connect(OPORT(source, 1), IPORT(sink, 0)));
-    expect_error(ErrorCode::InvalidPort, engine.connect(OPORT(source, 0), IPORT(sink, 1)));
-    expect_error(ErrorCode::FormatMismatch, engine.connect(OPORT(source, 0), IPORT(stereo, 0)));
-    expect_error(ErrorCode::InvalidType, engine.node<VirtualNode<>>(source));
+    expect_error(ErrorCode::InvalidArg, [&] { engine.add_node(nullptr); });
+    expect_error(ErrorCode::InvalidArg, [&] { engine.emplace_node<VirtualNode<0, 1>>(0); });
+    const auto source = engine.emplace_node<VirtualNode<0, 1>>();
+    const auto sink = engine.emplace_node<VirtualNode<1, 0>>();
+    const auto stereo = engine.emplace_node<VirtualNode<1, 0>>(2);
+    const auto connection = engine.connect(OPORT(source, 0), IPORT(sink, 0));
+    expect_error(ErrorCode::DuplicateConn, [&] { engine.connect(OPORT(source, 0), IPORT(sink, 0)); });
+    const auto second = engine.emplace_node<VirtualNode<0, 1>>();
+    expect_error(ErrorCode::InputBusy, [&] { engine.connect(OPORT(second, 0), IPORT(sink, 0)); });
+    expect_error(ErrorCode::InvalidPort, [&] { engine.connect(OPORT(sink, 0), IPORT(source, 0)); });
+    expect_error(ErrorCode::InvalidPort, [&] { engine.connect(OPORT(source, 1), IPORT(sink, 0)); });
+    expect_error(ErrorCode::InvalidPort, [&] { engine.connect(OPORT(source, 0), IPORT(sink, 1)); });
+    expect_error(ErrorCode::FormatMismatch, [&] { engine.connect(OPORT(source, 0), IPORT(stereo, 0)); });
+    expect_error(ErrorCode::InvalidType, [&] { engine.node<VirtualNode<>>(source); });
     Engine other(render_period);
-    const auto foreign = checked(other.emplace_node<VirtualNode<>>());
-    expect_error(ErrorCode::UnknownNode, engine.connect(OPORT(foreign, 0), IPORT(sink, 0)));
-    expect_error(ErrorCode::UnknownNode, engine.connect(OPORT(source, 0), IPORT(foreign, 0)));
-    checked(engine.commit());
+    const auto foreign = other.emplace_node<VirtualNode<>>();
+    expect_error(ErrorCode::UnknownNode, [&] { engine.connect(OPORT(foreign, 0), IPORT(sink, 0)); });
+    expect_error(ErrorCode::UnknownNode, [&] { engine.connect(OPORT(source, 0), IPORT(foreign, 0)); });
+    engine.commit();
     clock.start();
     clock.advance(); // Rejected graph edits must not invalidate the prepared graph.
-    checked(engine.remove_node(source));
-    expect_error(ErrorCode::UnknownNode, engine.node(source));
-    expect_error(ErrorCode::UnknownConn, engine.disconnect(connection));
-    expect_error(ErrorCode::UnknownNode, engine.remove_node(source));
+    engine.remove_node(source);
+    expect_error(ErrorCode::UnknownNode, [&] { engine.node(source); });
+    expect_error(ErrorCode::UnknownConn, [&] { engine.disconnect(connection); });
+    expect_error(ErrorCode::UnknownNode, [&] { engine.remove_node(source); });
 }
 
 void feedback_rejection()
 {
     Engine engine(render_period);
     ClockedGraph clock(engine);
-    const auto a = checked(engine.emplace_node<VirtualNode<2, 2>>());
-    const auto b = checked(engine.emplace_node<VirtualNode<>>());
-    const auto c = checked(engine.emplace_node<VirtualNode<>>());
-    const auto sink = checked(engine.emplace_node<VirtualNode<1, 0>>());
-    checked(engine.connect(OPORT(a, 0), IPORT(b, 0)));
-    checked(engine.connect(OPORT(b, 0), IPORT(c, 0)));
-    checked(engine.connect(OPORT(c, 0), IPORT(sink, 0)));
-    checked(engine.commit());
-    expect_error(ErrorCode::Cycle, engine.connect(OPORT(c, 0), IPORT(a, 1)));
-    expect_error(ErrorCode::Cycle, engine.connect(OPORT(a, 1), IPORT(a, 1)));
-    checked(engine.set_paused(b, true));
-    expect_error(ErrorCode::Cycle, engine.connect(OPORT(c, 0), IPORT(a, 1)));
-    checked(engine.set_paused(b, false));
+    const auto a = engine.emplace_node<VirtualNode<2, 2>>();
+    const auto b = engine.emplace_node<VirtualNode<>>();
+    const auto c = engine.emplace_node<VirtualNode<>>();
+    const auto sink = engine.emplace_node<VirtualNode<1, 0>>();
+    engine.connect(OPORT(a, 0), IPORT(b, 0));
+    engine.connect(OPORT(b, 0), IPORT(c, 0));
+    engine.connect(OPORT(c, 0), IPORT(sink, 0));
+    engine.commit();
+    expect_error(ErrorCode::Cycle, [&] { engine.connect(OPORT(c, 0), IPORT(a, 1)); });
+    expect_error(ErrorCode::Cycle, [&] { engine.connect(OPORT(a, 1), IPORT(a, 1)); });
+    engine.set_paused(b, true);
+    expect_error(ErrorCode::Cycle, [&] { engine.connect(OPORT(c, 0), IPORT(a, 1)); });
+    engine.set_paused(b, false);
     clock.start();
     clock.advance();
-    check(checked(engine.node<VirtualNode<2, 2>>(a))->calls == 1,
+    check(engine.node<VirtualNode<2, 2>>(a)->calls == 1,
           "Rejected feedback leaves the valid graph executable");
-    const auto x = checked(engine.emplace_node<VirtualNode<>>());
-    const auto y = checked(engine.emplace_node<VirtualNode<>>());
-    checked(engine.connect(OPORT(x, 0), IPORT(y, 0)));
-    expect_error(ErrorCode::Cycle, engine.connect(OPORT(y, 0), IPORT(x, 0)));
+    const auto x = engine.emplace_node<VirtualNode<>>();
+    const auto y = engine.emplace_node<VirtualNode<>>();
+    engine.connect(OPORT(x, 0), IPORT(y, 0));
+    expect_error(ErrorCode::Cycle, [&] { engine.connect(OPORT(y, 0), IPORT(x, 0)); });
 }
 
 void commit_retry()
 {
     Engine engine(render_period);
     ClockedGraph clock(engine);
-    expect_error(ErrorCode::NotPrepared, engine.start());
-    checked(engine.commit());
+    expect_error(ErrorCode::NotReady, [&] { engine.start(); });
+    engine.commit();
     clock.start();
     clock.advance();
     check(engine.tick_position() == 1, "A prepared graph advances one period");
-    const auto processor = checked(engine.emplace_node<VirtualNode<>>());
-    const auto sink = checked(engine.emplace_node<VirtualNode<1, 0>>());
-    checked(engine.connect(OPORT(processor, 0), IPORT(sink, 0)));
-    auto *node = checked(engine.node<VirtualNode<>>(processor));
+    const auto processor = engine.emplace_node<VirtualNode<>>();
+    const auto sink = engine.emplace_node<VirtualNode<1, 0>>();
+    engine.connect(OPORT(processor, 0), IPORT(sink, 0));
+    auto *node = engine.node<VirtualNode<>>(processor);
     node->preparation = ErrorCode::InvalidArg;
-    expect_error(ErrorCode::InvalidArg, engine.commit());
+    expect_error(ErrorCode::InvalidArg, [&] { engine.commit(); });
     clock.advance();
     check(engine.tick_position() == 2 && node->calls == 0, "Preparation failure leaves the old plan running");
     node->preparation = {};
     clock.commit();
-    checked(engine.commit()); // A clean draft succeeds while the clock is parked.
+    engine.commit(); // A clean draft succeeds while the clock is parked.
     const auto calls_after_commit = node->calls;
     clock.advance();
     check(node->prepares == 2 && node->calls == calls_after_commit + 1, "Preparation is retryable and then idempotent");
-    const auto huge = checked(engine.emplace_node<VirtualNode<1, 0>>(std::numeric_limits<std::size_t>::max()));
-    expect_error(ErrorCode::TooLarge, engine.commit());
+    const auto huge = engine.emplace_node<VirtualNode<1, 0>>(std::numeric_limits<std::size_t>::max());
+    expect_error(ErrorCode::TooLarge, [&] { engine.commit(); });
     clock.advance();
-    checked(engine.remove_node(huge));
+    engine.remove_node(huge);
     clock.commit();
     const auto previous_calls = node->calls;
     clock.advance();
     check(node->prepares == 2 && node->calls == previous_calls + 1, "Capacity failure preserves previously prepared DSP state");
     clock.stop();
-    checked(engine.reset());
+    engine.reset();
     check(engine.tick_position() == 0 && node->resets == 1, "Reset reaches nodes and restarts the graph clock");
 }
 
@@ -234,12 +228,12 @@ void buffer_pool_capacity()
 {
     Engine engine(render_period);
     const auto channels = std::vector<float>{}.max_size() / (2 * render_frames) + 1;
-    const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>(channels));
-    const auto sink = checked(engine.emplace_node<VirtualNode<2, 0>>(channels));
-    checked(engine.connect(OPORT(source, 0), IPORT(sink, 0)));
-    expect_error(ErrorCode::TooLarge, engine.commit());
-    checked(engine.remove_node(sink));
-    checked(engine.commit());
+    const auto source = engine.emplace_node<VirtualNode<0, 1>>(channels);
+    const auto sink = engine.emplace_node<VirtualNode<2, 0>>(channels);
+    engine.connect(OPORT(source, 0), IPORT(sink, 0));
+    expect_error(ErrorCode::TooLarge, [&] { engine.commit(); });
+    engine.remove_node(sink);
+    engine.commit();
 }
 
 class ThrowingNode : public VirtualNode<>
@@ -252,13 +246,13 @@ class ThrowingNode : public VirtualNode<>
             std::rethrow_exception(construction_error);
         }
     }
-    RetCode prepare(BlockPeriod spec) override
+    void prepare(BlockPeriod spec) override
     {
         if (fail_preparation)
         {
             throw std::runtime_error("test preparation");
         }
-        return VirtualNode<>::prepare(spec);
+        VirtualNode<>::prepare(spec);
     }
 
     bool fail_preparation = true;
@@ -268,7 +262,7 @@ void node_exception_propagation()
 {
     Engine engine(render_period);
     ClockedGraph clock(engine);
-    checked(engine.commit());
+    engine.commit();
     expect_exception<std::bad_alloc>([&]
                                      { engine.emplace_node<ThrowingNode>(std::make_exception_ptr(std::bad_alloc())); });
     expect_exception<std::length_error>(
@@ -278,20 +272,20 @@ void node_exception_propagation()
     clock.start();
     clock.advance();
 
-    const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>());
-    const auto processor = checked(engine.emplace_node<ThrowingNode>());
-    const auto sink = checked(engine.emplace_node<VirtualNode<1, 0>>());
-    checked(engine.connect(OPORT(source, 0), IPORT(processor, 0)));
-    checked(engine.connect(OPORT(processor, 0), IPORT(sink, 0)));
+    const auto source = engine.emplace_node<VirtualNode<0, 1>>();
+    const auto processor = engine.emplace_node<ThrowingNode>();
+    const auto sink = engine.emplace_node<VirtualNode<1, 0>>();
+    engine.connect(OPORT(source, 0), IPORT(processor, 0));
+    engine.connect(OPORT(processor, 0), IPORT(sink, 0));
     expect_exception<std::runtime_error>([&] { engine.commit(); });
     clock.advance();
     check(engine.tick_position() == 2, "The previous plan runs after a preparation exception");
-    auto *node = checked(engine.node<ThrowingNode>(processor));
+    auto *node = engine.node<ThrowingNode>(processor);
     node->fail_preparation = false;
     clock.commit();
     const auto previous_calls = node->calls;
     clock.advance();
-    check(checked(engine.node<VirtualNode<0, 1>>(source))->prepares == 1 && node->calls == previous_calls + 1,
+    check(engine.node<VirtualNode<0, 1>>(source)->prepares == 1 && node->calls == previous_calls + 1,
           "Retry after an exception preserves prepared dependencies");
 }
 
@@ -299,28 +293,28 @@ void node_replacement()
 {
     Engine engine(render_period);
     ClockedGraph clock(engine);
-    const auto source = checked(engine.emplace_node<VirtualNode<0, 1>>());
-    const auto sink = checked(engine.emplace_node<VirtualNode<1, 0>>());
-    checked(engine.connect(OPORT(source, 0), IPORT(sink, 0)));
-    checked(engine.commit());
+    const auto source = engine.emplace_node<VirtualNode<0, 1>>();
+    const auto sink = engine.emplace_node<VirtualNode<1, 0>>();
+    engine.connect(OPORT(source, 0), IPORT(sink, 0));
+    engine.commit();
     clock.start();
     clock.advance();
-    auto *original = checked(engine.node<VirtualNode<0, 1>>(source));
+    auto *original = engine.node<VirtualNode<0, 1>>(source);
 
-    expect_error(ErrorCode::InvalidArg, engine.replace_node(source, nullptr));
-    expect_error(ErrorCode::UnknownNode, engine.replace_node({}, std::make_unique<VirtualNode<0, 1>>()));
-    expect_error(ErrorCode::FormatMismatch, engine.replace_node(source, std::make_unique<VirtualNode<0, 1>>(0)));
-    expect_error(ErrorCode::FormatMismatch, engine.replace_node(source, std::make_unique<VirtualNode<0, 1>>(2)));
-    expect_error(ErrorCode::FormatMismatch, engine.replace_node(source, std::make_unique<VirtualNode<1, 1>>()));
-    expect_error(ErrorCode::FormatMismatch, engine.replace_node(source, std::make_unique<VirtualNode<0, 2>>()));
+    expect_error(ErrorCode::InvalidArg, [&] { engine.replace_node(source, nullptr); });
+    expect_error(ErrorCode::UnknownNode, [&] { engine.replace_node({}, std::make_unique<VirtualNode<0, 1>>()); });
+    expect_error(ErrorCode::FormatMismatch, [&] { engine.replace_node(source, std::make_unique<VirtualNode<0, 1>>(0)); });
+    expect_error(ErrorCode::FormatMismatch, [&] { engine.replace_node(source, std::make_unique<VirtualNode<0, 1>>(2)); });
+    expect_error(ErrorCode::FormatMismatch, [&] { engine.replace_node(source, std::make_unique<VirtualNode<1, 1>>()); });
+    expect_error(ErrorCode::FormatMismatch, [&] { engine.replace_node(source, std::make_unique<VirtualNode<0, 2>>()); });
     clock.advance();
-    check(checked(engine.node(source)) == original && original->calls == 2,
+    check(engine.node(source) == original && original->calls == 2,
           "Rejected replacements preserve the running node and its connections");
 
-    checked(engine.replace_node(source, std::make_unique<VirtualNode<0, 1>>()));
-    auto *replacement = checked(engine.node<VirtualNode<0, 1>>(source));
+    engine.replace_node(source, std::make_unique<VirtualNode<0, 1>>());
+    auto *replacement = engine.node<VirtualNode<0, 1>>(source);
     clock.commit();
-    auto *old_sink = checked(engine.node<VirtualNode<1, 0>>(sink));
+    auto *old_sink = engine.node<VirtualNode<1, 0>>(sink);
     const auto preceding_calls = old_sink->calls;
     const auto preceding_replacement_calls = replacement->calls;
     clock.advance();
@@ -328,9 +322,9 @@ void node_replacement()
               old_sink->calls == preceding_calls + 1,
           "A compatible replacement takes over existing connections at the next block boundary");
 
-    checked(engine.replace_node(sink, std::make_unique<VirtualNode<1, 0>>()));
+    engine.replace_node(sink, std::make_unique<VirtualNode<1, 0>>());
     clock.commit();
-    const auto *new_sink = checked(engine.node<VirtualNode<1, 0>>(sink));
+    const auto *new_sink = engine.node<VirtualNode<1, 0>>(sink);
     const auto new_sink_calls = new_sink->calls;
     const auto replacement_calls = replacement->calls;
     clock.advance();
@@ -338,36 +332,36 @@ void node_replacement()
           "Replacing an input node keeps it connected to its upstream source");
 
     clock.stop();
-    old_sink = checked(engine.node<VirtualNode<1, 0>>(sink));
-    checked(engine.replace_node(source, std::make_unique<VirtualNode<0, 1>>()));
-    auto *draft = checked(engine.node<VirtualNode<0, 1>>(source));
-    const auto orphan = checked(engine.emplace_node<VirtualNode<0, 1>>());
-    checked(engine.remove_node(sink));
-    checked(engine.reset());
+    old_sink = engine.node<VirtualNode<1, 0>>(sink);
+    engine.replace_node(source, std::make_unique<VirtualNode<0, 1>>());
+    auto *draft = engine.node<VirtualNode<0, 1>>(source);
+    const auto orphan = engine.emplace_node<VirtualNode<0, 1>>();
+    engine.remove_node(sink);
+    engine.reset();
     check(replacement->resets == 1 && old_sink->resets == 1 && draft->resets == 1 &&
-              checked(engine.node<VirtualNode<0, 1>>(orphan))->resets == 1,
+              engine.node<VirtualNode<0, 1>>(orphan)->resets == 1,
           "Reset reaches retained and draft node instances exactly once, including removed sinks and orphan sources");
 }
 
 void handle_uniqueness()
 {
     Engine engine(render_period);
-    const auto a = checked(engine.emplace_node<VirtualNode<>>());
-    const auto b = checked(engine.emplace_node<VirtualNode<>>());
-    const auto connection = checked(engine.connect(OPORT(a, 0), IPORT(b, 0)));
+    const auto a = engine.emplace_node<VirtualNode<>>();
+    const auto b = engine.emplace_node<VirtualNode<>>();
+    const auto connection = engine.connect(OPORT(a, 0), IPORT(b, 0));
 
     Engine other(BlockPeriod::Ms10);
-    const auto x = checked(other.emplace_node<VirtualNode<>>());
-    const auto y = checked(other.emplace_node<VirtualNode<>>());
-    const auto other_connection = checked(other.connect(OPORT(x, 0), IPORT(y, 0)));
+    const auto x = other.emplace_node<VirtualNode<>>();
+    const auto y = other.emplace_node<VirtualNode<>>();
+    const auto other_connection = other.connect(OPORT(x, 0), IPORT(y, 0));
     std::array<std::uint64_t, 6> ids{{a.value, b.value, connection.value, x.value, y.value, other_connection.value}};
     std::sort(ids.begin(), ids.end());
     check(ids.front() != 0 && std::adjacent_find(ids.begin(), ids.end()) == ids.end(),
           "Node and connection IDs are nonzero and unique across engines");
 
-    checked(engine.remove_node(a));
-    const auto replacement = checked(engine.emplace_node<VirtualNode<>>());
-    const auto replacement_connection = checked(engine.connect(OPORT(replacement, 0), IPORT(b, 0)));
+    engine.remove_node(a);
+    const auto replacement = engine.emplace_node<VirtualNode<>>();
+    const auto replacement_connection = engine.connect(OPORT(replacement, 0), IPORT(b, 0));
     check(replacement != a && replacement_connection != connection, "Removed identifiers are not reused");
 }
 

@@ -11,16 +11,6 @@
 namespace
 {
 using namespace aereborn;
-void checked(RetCode code)
-{
-    if (!code)
-        throw std::runtime_error(code.message());
-}
-template <class T> T checked(Result<T> result)
-{
-    checked(result.ret_code());
-    return std::move(result).value();
-}
 class Meter final : public NodeT<1, 0>
 {
   public:
@@ -47,16 +37,16 @@ int main()
     {
         std::atomic<float> level{0};
         Engine engine(BlockPeriod::Ms05);
-        const auto tone = checked(engine.emplace_node<Tone>(SampleRate::Hz48000, 1));
-        const auto mix = checked(engine.emplace_node<Mixer>(SampleRate::Hz48000, 1, 1));
-        const auto matrix = checked(engine.emplace_node<Matrix>(SampleRate::Hz48000, 1));
-        const auto sink = checked(engine.emplace_node<Meter>(level));
-        checked(engine.connect(OPORT(tone, 0), IPORT(mix, 0)));
-        checked(engine.connect(OPORT(mix, 0), IPORT(matrix, 0)));
-        checked(engine.connect(OPORT(matrix, 0), IPORT(sink, 0)));
-        auto *gain = checked(engine.node<Matrix>(matrix));
-        checked(engine.commit());
-        checked(engine.start());
+        const auto tone = engine.emplace_node<Tone>(SampleRate::Hz48000, 1);
+        const auto mix = engine.emplace_node<Mixer>(SampleRate::Hz48000, 1, 1);
+        const auto matrix = engine.emplace_node<Matrix>(SampleRate::Hz48000, 1);
+        const auto sink = engine.emplace_node<Meter>(level);
+        engine.connect(OPORT(tone, 0), IPORT(mix, 0));
+        engine.connect(OPORT(mix, 0), IPORT(matrix, 0));
+        engine.connect(OPORT(matrix, 0), IPORT(sink, 0));
+        auto *gain = engine.node<Matrix>(matrix);
+        engine.commit();
+        engine.start();
         const auto wait = [&]
         {
             const auto target = engine.tick_position() + 4;
@@ -70,9 +60,9 @@ int main()
             std::cout << "tick=" << engine.tick_position() << " peak=" << level.load() << '\n';
         };
         wait();
-        checked(gain->set_gain(0.5f));
+        gain->set_gain(0.5f);
         wait();
-        checked(engine.stop());
+        engine.stop();
     }
     catch (const std::exception &error)
     {

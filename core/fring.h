@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
-#include <limits>
 
 namespace aereborn
 {
@@ -15,17 +14,13 @@ namespace aereborn
 class FrameRing
 {
   public:
-    RetCode prepare(std::size_t channels, std::size_t capacity)
+    /// @brief Allocate storage and clear the queue on success.
+    void prepare(std::size_t channels, std::size_t capacity)
     {
-        if (capacity > std::numeric_limits<std::size_t>::max() / 4)
-            return ErrorCode::TooLarge;
-        const auto code = storage_.resize(channels, capacity);
-        if (code)
-        {
-            capacity_ = capacity;
-            clear();
-        }
-        return code;
+        // Buffer's float storage limit also bounds the cursor arithmetic below.
+        storage_.resize(channels, capacity);
+        capacity_ = capacity;
+        clear();
     }
 
     void clear() noexcept
@@ -45,6 +40,7 @@ class FrameRing
     /// @pre The ring is prepared and the input matches its layout.
     std::size_t write(IFBlock input) noexcept
     {
+        assert(capacity_ && input.valid() && input.channels() == storage_.block(0).channels());
         const auto write = write_.load(std::memory_order_relaxed);
         const auto frames = std::min(input.frames(), capacity_ - queued(write, read_.load(std::memory_order_acquire)));
         if (frames)
@@ -58,6 +54,7 @@ class FrameRing
     /// @pre The ring is prepared and the output matches its layout.
     std::size_t read(OFBlock output) noexcept
     {
+        assert(capacity_ && output.valid() && output.channels() == storage_.block(0).channels());
         const auto read = read_.load(std::memory_order_relaxed);
         const auto frames = std::min(output.frames(), queued(write_.load(std::memory_order_acquire), read));
         if (frames)

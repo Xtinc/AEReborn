@@ -177,9 +177,9 @@ class Buffer
     /// @brief Set the workspace dimensions and zero its samples.
     /// @param channels Number of channels.
     /// @param capacity_frames Frame capacity per channel.
-    /// @return Success, InvalidArg for a zero dimension, or TooLarge if the storage limit is exceeded.
+    /// @throws Error InvalidArg for a zero dimension, or TooLarge if storage would exceed its limit.
     /// @note Allocate in prepare(). Allocation failure propagates as an exception.
-    RetCode resize(std::size_t channels, std::size_t capacity_frames);
+    void resize(std::size_t channels, std::size_t capacity_frames);
 
     /// @brief Borrow a writable block using the workspace capacity as the channel stride.
     /// @param frames Number of frames in the processing span.
