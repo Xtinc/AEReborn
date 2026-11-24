@@ -193,7 +193,7 @@ Tone / BUS（48k F32P）
 
 链接 `aereborn::diag` 并包含 `diag/inspect.h`，即可在串行控制侧调用 `dump_text()` 或 `dump_dot()`。两者都支持返回字符串或写入输出流。传入需要一起检查的后端，报告会按端点关联生效节点，并列出未进入生效 Plan 的后端。队列水位为近似值，`underrun` 和 `overflow` 分别累计图侧采集缺帧和播放丢帧。`late` 是时钟跳过的周期数，`tick_us` 是最近一拍含时钟收尾的估计耗时。
 
-用 `dot -Tsvg graph.dot -o graph.svg` 渲染信号流图。●、◐、○ 分别表示在线、预填充和离线，条形刻度和帧数一起表示近似队列水位，! 标记异常。图上直接显示设备采样率、声道数、增益和转换规格，悬停可查看完整诊断详情。`io.diagnostic_reports` 检查文本及 DOT 输出，`io.endpoint_diagnostics` 检查端点计数和重启。
+用 `dot -Tsvg graph.dot -o graph.svg` 渲染信号流图。卡片标题显示端点状态和后端错误短码，橙色标记预填充、排空、跳拍或队列缺帧。多端口节点按插槽接线，Mixer 的静音端口置灰，对应入边用灰色虚线标识。卡片和连线直接显示关键规格，SVG 悬停可查看完整诊断详情。`io.diagnostic_reports` 检查文本和 DOT 输出，`io.endpoint_diagnostics` 检查端点计数、重启及短批次排空。
 
 ### 构建与验证
 

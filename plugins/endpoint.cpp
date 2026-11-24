@@ -119,6 +119,7 @@ void Capture::close() noexcept
 {
     close_graph_gate(graph_state_);
     ring_.clear();
+    primed_.store(false, std::memory_order_release);
 }
 
 Playback::Playback(SampleRate rate, std::size_t channels, std::chrono::microseconds io_period)
@@ -163,6 +164,7 @@ void Playback::close() noexcept
 {
     close_graph();
     ring_.clear();
+    primed_.store(false, std::memory_order_release);
 }
 
 std::size_t Playback::read(OFBlock output) noexcept

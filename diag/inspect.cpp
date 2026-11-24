@@ -4,9 +4,11 @@
 #include "plugins/convert.h"
 #include "plugins/matrix.h"
 #include "plugins/mixer.h"
+#include <algorithm>
 #include <iomanip>
 #include <locale>
 #include <map>
+#include <set>
 #include <sstream>
 
 namespace aereborn
@@ -87,27 +89,27 @@ template <class Endpoint> void write_queue(std::ostream &out, const Endpoint &en
     out << '/' << endpoint.capacity();
 }
 
-void write_node_details(std::ostream &out, const Node &node, const char *separator)
+void write_node_details(std::ostream &out, const Node &node)
 {
     if (const auto *capture = dynamic_cast<const Capture *>(&node))
     {
-        out << separator;
+        out << " | ";
         write_queue(out, *capture);
         out << " underrun=" << capture->underrun_frames();
     }
     else if (const auto *playback = dynamic_cast<const Playback *>(&node))
     {
-        out << separator;
+        out << " | ";
         write_queue(out, *playback);
         out << " overflow=" << playback->overflow_frames();
     }
     else if (const auto *matrix = dynamic_cast<const Matrix *>(&node))
     {
-        out << separator << "gain=" << std::fixed << std::setprecision(2) << matrix->gain();
+        out << " | gain=" << std::fixed << std::setprecision(2) << matrix->gain();
     }
     else if (const auto *mixer = dynamic_cast<const Mixer *>(&node))
     {
-        out << separator << "muted=[";
+        out << " | muted=[";
         for (std::size_t i = 0; i < mixer->inputs().size(); ++i)
         {
             if (i)
@@ -182,11 +184,21 @@ void write_engine(std::ostream &out, const Engine &engine)
         << " | tick_us=" << engine.last_tick_us();
 }
 
-constexpr auto online_symbol = u8"\u25CF";
-constexpr auto prefill_symbol = u8"\u25D0";
-constexpr auto offline_symbol = u8"\u25CB";
+struct CardColors
+{
+    const char *fill;
+    const char *border;
+    const char *accent;
+};
 
-void write_dot_label(std::ostream &out, const std::string &text)
+constexpr CardColors endpoint_colors{"#DFF4F0", "#2E8B7D", "#15803D"};
+constexpr CardColors dsp_colors{"#E8EEF7", "#4A6FA5", "#1E4D83"};
+constexpr CardColors backend_colors{"#F1F5F9", "#64748B", "#15803D"};
+constexpr CardColors warning_colors{"#FEF3C7", "#D97706", "#92400E"};
+constexpr CardColors error_colors{"#FEE2E2", "#DC2626", "#991B1B"};
+constexpr CardColors inactive_colors{"#F3F4F6", "#9CA3AF", "#64748B"};
+
+void write_dot_escaped(std::ostream &out, const std::string &text)
 {
     for (const auto ch : text)
     {
@@ -203,66 +215,242 @@ void write_dot_label(std::ostream &out, const std::string &text)
     }
 }
 
+void write_html_escaped(std::ostream &out, const std::string &text)
+{
+    for (const auto ch : text)
+    {
+        switch (ch)
+        {
+        case '&': out << "&amp;"; break;
+        case '<': out << "&lt;"; break;
+        case '>': out << "&gt;"; break;
+        case '"': out << "&quot;"; break;
+        default: out << ch; break;
+        }
+    }
+}
+
+const char *error_code_name(ErrorCode code)
+{
+    switch (code)
+    {
+    case ErrorCode::Ok: return "Ok";
+    case ErrorCode::InvalidArg: return "InvalidArg";
+    case ErrorCode::InvalidPort: return "InvalidPort";
+    case ErrorCode::InvalidType: return "InvalidType";
+    case ErrorCode::TooLarge: return "TooLarge";
+    case ErrorCode::NotReady: return "NotReady";
+    case ErrorCode::Busy: return "Busy";
+    case ErrorCode::UnknownNode: return "UnknownNode";
+    case ErrorCode::UnknownConn: return "UnknownConn";
+    case ErrorCode::DuplicateConn: return "DuplicateConn";
+    case ErrorCode::InputBusy: return "InputBusy";
+    case ErrorCode::Cycle: return "Cycle";
+    case ErrorCode::FormatMismatch: return "FormatMismatch";
+    case ErrorCode::IoFailed: return "IoFailed";
+    case ErrorCode::DeviceLost: return "DeviceLost";
+    case ErrorCode::EndOfStream: return "EndOfStream";
+    case ErrorCode::Cancelled: return "Cancelled";
+    case ErrorCode::Timeout: return "Timeout";
+    }
+    return "Unknown";
+}
+
+void write_short_rate(std::ostream &out, SampleRate rate)
+{
+    const auto hz = static_cast<std::uint32_t>(rate);
+    out << hz / 1000;
+    auto remainder = hz % 1000;
+    if (remainder)
+    {
+        out << '.';
+        for (auto place = 100u; remainder; place /= 10)
+        {
+            out << remainder / place;
+            remainder %= place;
+        }
+    }
+    out << 'k';
+}
+
+void write_short_spec(std::ostream &out, PortSpec spec)
+{
+    write_short_rate(out, spec.sample_rate);
+    out << ' ' << spec.channels << "ch " << format_name(spec.format);
+}
+
+void begin_card(std::ostream &out, const CardColors &colors, const char *title, NodeId id = {}, bool ports = false)
+{
+    // Graphviz draws cell fills as rectangles. Keep the fill on the rounded table.
+    out << " [label=<<TABLE BORDER=\"1\" CELLBORDER=\"0\" CELLSPACING=\"0\" CELLPADDING=\"5\""
+           " STYLE=\"ROUNDED\" BGCOLOR=\"" << colors.fill << "\" COLOR=\"" << colors.border << '"';
+    if (ports)
+        out << " COLUMNS=\"*\"";
+    out << "><TR><TD ALIGN=\"LEFT\"";
+    if (ports)
+        out << " COLSPAN=\"2\"";
+    out << "><FONT POINT-SIZE=\"11\"><B>";
+    write_html_escaped(out, title);
+    out << "</B></FONT>";
+    if (id)
+        out << " <FONT POINT-SIZE=\"9\" COLOR=\"#475569\">#" << id.value << "</FONT>";
+}
+
+void write_badge(std::ostream &out, const char *text, const CardColors &colors)
+{
+    out << " <FONT POINT-SIZE=\"9\" COLOR=\"" << colors.accent << "\"><B>" << text << "</B></FONT>";
+}
+
+void end_card(std::ostream &out, const std::string &details)
+{
+    out << "</TABLE>>, tooltip=\"";
+    write_dot_escaped(out, details);
+    out << "\"];\n";
+}
+
 template <class Endpoint>
-void write_dot_endpoint(std::ostream &out, NodeId id, const Endpoint &endpoint, std::size_t lost)
+void write_dot_endpoint(std::ostream &out, NodeId id, const Endpoint &endpoint, std::size_t lost, const char *loss_name)
 {
     const auto online = endpoint.online();
-    out << "label=\"" << (online ? (endpoint.steady() ? online_symbol : prefill_symbol) : offline_symbol)
-        << ' ' << endpoint.type_name() << "  #" << id.value << "\\n";
+    const auto steady = online && endpoint.steady();
+    const auto &status_color = online ? (steady ? endpoint_colors : warning_colors) : inactive_colors;
+    begin_card(out, lost ? warning_colors : status_color, endpoint.type_name(), id);
+    write_badge(out, steady ? "ONLINE" : (online ? "PREFILL" : "OFFLINE"), status_color);
+    out << "</TD></TR><HR/><TR><TD ALIGN=\"LEFT\">Queue ";
 
     std::size_t frames = 0;
     const auto capacity = endpoint.capacity();
     if (capacity && endpoint.estimate_queued_frames(frames))
     {
-        constexpr auto segments = 5;
-        const auto filled = static_cast<int>(static_cast<double>(frames) * segments / capacity + 0.5);
-        for (int segment = 0; segment < segments; ++segment)
-            out << (segment < filled ? u8"\u25B0" : u8"\u25B1");
-        out << "  " << frames << '/' << capacity;
+        const auto percent = static_cast<unsigned>(static_cast<double>(frames) * 100 / capacity + 0.5);
+        out << frames << '/' << capacity << " (" << percent << "%)";
     }
     else
-        out << u8"\u2014";
+        out << "-/" << capacity;
     if (lost)
-        out << "  ! " << lost;
-    out << "\", fillcolor=" << (lost ? "\"#FFF2DF\"" : "\"#E7F5F2\"")
-        << ", color=" << (lost ? "\"#C88643\"" : "\"#7BAFA8\"");
+        out << "<BR ALIGN=\"LEFT\"/><FONT COLOR=\"" << warning_colors.accent << "\"><B>"
+            << loss_name << ": " << lost << "f</B></FONT>";
+    out << "</TD></TR>";
 }
 
-void write_dot_node(std::ostream &out, NodeId id, const Node &node)
+bool is_multiport_node(const Node &node)
 {
-    out << "  n" << id.value << " [";
-    if (const auto *capture = dynamic_cast<const Capture *>(&node))
-        write_dot_endpoint(out, id, *capture, capture->underrun_frames());
-    else if (const auto *playback = dynamic_cast<const Playback *>(&node))
-        write_dot_endpoint(out, id, *playback, playback->overflow_frames());
+    return node.inputs().size() > 1 || node.outputs().size() > 1;
+}
+
+using MutedInputs = std::set<std::pair<NodeId, std::size_t>>;
+
+void write_port_cell(std::ostream &out, bool input, std::size_t index, std::size_t count, std::size_t rows, bool muted)
+{
+    if (!count)
+    {
+        out << "<TD ROWSPAN=\"" << rows << "\"></TD>";
+        return;
+    }
+
+    out << "<TD ALIGN=\"" << (input ? "LEFT" : "RIGHT") << "\" PORT=\"" << (input ? 'i' : 'o') << index << '"';
+    if (rows > count && index == count - 1)
+        out << " ROWSPAN=\"" << rows - index << '"';
+    out << '>';
+    if (muted)
+        out << "<FONT COLOR=\"" << inactive_colors.accent << "\">in" << index << " [MUTE]</FONT>";
+    else
+        out << (input ? "in" : "out") << index;
+    out << "</TD>";
+}
+
+void write_dot_ports(std::ostream &out, NodeId id, const Node &node, MutedInputs &muted_inputs)
+{
+    const auto inputs = node.inputs().size();
+    const auto outputs = node.outputs().size();
+    const auto rows = std::max(inputs, outputs);
+    const auto *mixer = dynamic_cast<const Mixer *>(&node);
+    for (std::size_t i = 0; i < rows; ++i)
+    {
+        out << "<TR>";
+        if (i < inputs || (i == 0 && !inputs))
+        {
+            const auto muted = mixer && mixer->muted(i);
+            if (muted)
+                muted_inputs.emplace(id, i);
+            write_port_cell(out, true, i, inputs, rows, muted);
+        }
+        if (i < outputs || (i == 0 && !outputs))
+            write_port_cell(out, false, i, outputs, rows, false);
+        out << "</TR>";
+    }
+}
+
+void write_convert(std::ostream &out, PortSpec input, PortSpec output)
+{
+    const auto rate_changed = input.sample_rate != output.sample_rate;
+    const auto format_changed = input.format != output.format;
+    if (!rate_changed && !format_changed)
+    {
+        out << "passthrough";
+        return;
+    }
+
+    const auto write_changed_fields = [&](PortSpec spec) {
+        if (rate_changed)
+            write_short_rate(out, spec.sample_rate);
+        if (rate_changed && format_changed)
+            out << ' ';
+        if (format_changed)
+            out << format_name(spec.format);
+    };
+    write_changed_fields(input);
+    out << " -&gt; ";
+    write_changed_fields(output);
+}
+
+void write_single_port_node(std::ostream &out, const Node &node)
+{
+    const auto inputs = node.inputs();
+    const auto outputs = node.outputs();
+    if (const auto *matrix = dynamic_cast<const Matrix *>(&node))
+    {
+        if (inputs[0].channels != outputs[0].channels)
+            out << inputs[0].channels << "ch -&gt; " << outputs[0].channels << "ch | ";
+        const auto gain = matrix->gain();
+        if (gain == 0.0f)
+            out << "<FONT COLOR=\"" << inactive_colors.accent << "\">Gain 0.00 [MUTE]</FONT>";
+        else
+            out << "Gain " << std::fixed << std::setprecision(2) << gain;
+    }
+    else if (dynamic_cast<const Convert *>(&node))
+        write_convert(out, inputs[0], outputs[0]);
     else
     {
-        out << "label=\"";
-        const auto *mixer = dynamic_cast<const Mixer *>(&node);
-        const auto *matrix = dynamic_cast<const Matrix *>(&node);
-        const auto *convert = dynamic_cast<const Convert *>(&node);
-        if (mixer)
-            out << u8"\u03A3 ";
-        else if (convert)
-            out << u8"\u2194 ";
-        write_dot_label(out, node.type_name());
-        out << "  #" << id.value;
-        if (mixer)
-            out << "\\n" << mixer->inputs().size() << " inputs";
-        else if (matrix)
-            out << u8"\\n\u00D7 " << std::fixed << std::setprecision(2) << matrix->gain() << std::defaultfloat
-                << std::setprecision(6);
-        else if (convert)
+        write_short_spec(out, inputs.empty() ? outputs[0] : inputs[0]);
+        if (!inputs.empty() && !outputs.empty() && inputs[0] != outputs[0])
         {
-            const auto input = convert->inputs()[0];
-            const auto output = convert->outputs()[0];
-            if (input.sample_rate != output.sample_rate)
-                out << "\\n" << static_cast<std::uint32_t>(input.sample_rate) / 1000.0 << u8" \u2192 "
-                    << static_cast<std::uint32_t>(output.sample_rate) / 1000.0 << " kHz";
-            else if (input.format != output.format)
-                out << "\\n" << format_name(input.format) << u8" \u2192 " << format_name(output.format);
+            out << " -&gt; ";
+            write_short_spec(out, outputs[0]);
         }
-        out << '"';
+    }
+}
+
+void write_dot_node(std::ostream &out, NodeId id, const Node &node, MutedInputs &muted_inputs)
+{
+    out << "  n" << id.value;
+    if (const auto *capture = dynamic_cast<const Capture *>(&node))
+        write_dot_endpoint(out, id, *capture, capture->underrun_frames(), "Underrun");
+    else if (const auto *playback = dynamic_cast<const Playback *>(&node))
+        write_dot_endpoint(out, id, *playback, playback->overflow_frames(), "Overflow");
+    else
+    {
+        const auto ports = is_multiport_node(node);
+        begin_card(out, dsp_colors, node.type_name(), id, ports);
+        out << "</TD></TR><HR/>";
+        if (ports)
+            write_dot_ports(out, id, node, muted_inputs);
+        else
+        {
+            out << "<TR><TD ALIGN=\"LEFT\">";
+            write_single_port_node(out, node);
+            out << "</TD></TR>";
+        }
     }
 
     std::ostringstream details;
@@ -270,32 +458,88 @@ void write_dot_node(std::ostream &out, NodeId id, const Node &node)
     details << '[' << id.value << "] " << node.type_name();
     write_ports(details, "in", node.inputs());
     write_ports(details, "out", node.outputs());
-    write_node_details(details, node, " | ");
-    out << ", tooltip=\"";
-    write_dot_label(out, details.str());
-    out << "\"];\n";
+    write_node_details(details, node);
+    end_card(out, details.str());
 }
 
-void write_dot_backend(std::ostream &out, const Backend &backend, bool detached)
+const char *write_dot_backend(std::ostream &out, const Backend &backend, RetCode error, bool detached)
 {
-    const auto error = backend.last_error();
-    out << " [label=\"" << (error ? (backend.running() ? online_symbol : offline_symbol) : "!") << ' ';
-    write_dot_label(out, backend.type_name());
+    const auto *active = dynamic_cast<const ActiveBackend *>(&backend);
+    const auto async = active && active->is_async();
+    const auto fir = backend.uses_resampler();
+    const auto state = active ? active->state() : (backend.running() ? ActiveBackend::State::Running
+                                                                    : ActiveBackend::State::Stopped);
+    const char *status = "STOP";
+    auto colors = &inactive_colors;
+    switch (state)
+    {
+    case ActiveBackend::State::Running:
+        status = "RUN";
+        colors = &backend_colors;
+        break;
+    case ActiveBackend::State::Draining:
+        status = "DRAIN";
+        colors = &warning_colors;
+        break;
+    case ActiveBackend::State::Stopping:
+        status = "STOPPING";
+        colors = &warning_colors;
+        break;
+    case ActiveBackend::State::Stopped:
+        break;
+    }
+    if (!error)
+        colors = &error_colors;
+    begin_card(out, detached && error ? inactive_colors : *colors, backend.type_name());
+    const auto badge = error ? std::string(status) : std::string("ERR: ") + error_code_name(error.code());
+    write_badge(out, badge.c_str(), *colors);
+    out << "</TD></TR><HR/><TR><TD ALIGN=\"LEFT\">";
     const auto device = backend.device_spec();
     if (device.channels)
-        out << "\\n" << static_cast<std::uint32_t>(device.sample_rate) / 1000.0 << " kHz / " << device.channels << " ch";
-    out << "\", fontsize=10, fillcolor=" << (error ? "\"#F7F9FC\"" : "\"#FCEBE8\"");
-    if (!error)
-        out << ", color=\"#C76662\", fontcolor=\"#9F3836\"";
-    if (detached)
-        out << ", style=\"rounded,filled,dashed\"";
+    {
+        write_short_spec(out, device);
+        out << " (max " << backend.device_max_frames() << "f)";
+    }
+    else
+        out << "unbound";
+    out << "<BR ALIGN=\"LEFT\"/>" << (active ? (async ? "async" : "sync") : "passive");
+    if (fir)
+        out << " | FIR";
+    if (async)
+        out << " | drift " << std::fixed << std::setprecision(1) << std::showpos << active->drift_ppm()
+            << std::noshowpos << " ppm";
+    out << "</TD></TR>";
 
     std::ostringstream details;
     details.imbue(std::locale::classic());
     write_backend(details, backend, error);
-    out << ", tooltip=\"";
-    write_dot_label(out, details.str());
-    out << "\"];\n";
+    end_card(out, details.str());
+    return async ? "ASRC" : (fir ? "FIR" : "PCM");
+}
+
+void write_dot_engine(std::ostream &out, const Engine &engine)
+{
+    const auto state = engine.state();
+    const auto running = state == Engine::State::Running;
+    const auto ready = state == Engine::State::Ready;
+    const auto &colors = running ? endpoint_colors : (ready ? dsp_colors : inactive_colors);
+    out << "<TABLE BORDER=\"0\" CELLBORDER=\"0\" CELLSPACING=\"4\" CELLPADDING=\"5\"><TR>"
+           "<TD><FONT POINT-SIZE=\"15\"><B>AEReborn</B></FONT></TD><TD BGCOLOR=\"" << colors.fill << "\">";
+    write_badge(out, running ? "RUNNING" : (ready ? "READY" : "UNPREPARED"), colors);
+    out << "</TD><TD>" << static_cast<std::uint32_t>(engine.block_period()) << " ms | Plan #"
+        << engine.plan_generation() << " | tick " << engine.tick_position() << " | " << engine.last_tick_us()
+        << " us</TD>";
+    if (engine.dirty())
+    {
+        out << "<TD BGCOLOR=\"" << warning_colors.fill << "\">";
+        write_badge(out, "DIRTY", warning_colors);
+        out << "</TD>";
+    }
+    const auto missed = engine.missed_periods();
+    if (missed)
+        out << "<TD BGCOLOR=\"" << warning_colors.fill << "\"><FONT POINT-SIZE=\"9\" COLOR=\""
+            << warning_colors.accent << "\"><B>LATE " << missed << "</B></FONT></TD>";
+    out << "</TR></TABLE>";
 }
 
 PortSpec connection_spec(const Engine &engine, const Connection &connection)
@@ -322,7 +566,7 @@ std::string dump_text(const Engine &engine, View<const Backend *const> backends)
         out << "  [" << id.value << "] " << std::left << std::setw(9) << node.type_name() << std::right;
         write_ports(out, "in", node.inputs());
         write_ports(out, "out", node.outputs());
-        write_node_details(out, node, " | ");
+        write_node_details(out, node);
         out << '\n';
         if (const auto *backend = links.take(node))
         {
@@ -370,45 +614,68 @@ std::string dump_dot(const Engine &engine, View<const Backend *const> backends)
     details.imbue(std::locale::classic());
     write_engine(details, engine);
     out << "digraph AEReborn {\n"
-           "  graph [rankdir=LR, bgcolor=white, pad=0.28, nodesep=0.34, ranksep=0.48, labelloc=t, "
-           "fontname=Arial, fontsize=17, fontcolor=\"#172D48\", label=<<B>AEReborn</B><BR/>"
-           "<FONT FACE=\"Arial\" POINT-SIZE=\"11\" COLOR=\"#52677A\">"
-        << state_name(engine.state()) << "  /  " << static_cast<std::uint32_t>(engine.block_period())
-        << " ms  /  Plan " << engine.plan_generation()
-        << "</FONT><BR/><FONT FACE=\"Arial\" POINT-SIZE=\"10\" COLOR=\"#52677A\">"
-        << online_symbol << " online   " << prefill_symbol << " prefill   " << offline_symbol
-        << " offline   ! alert</FONT>>, tooltip=\"";
-    write_dot_label(out, details.str());
+           "  graph [rankdir=LR, bgcolor=white, pad=0.32, nodesep=0.42, ranksep=0.64, labelloc=t, "
+           "fontname=Arial, fontsize=11, fontcolor=\"#0F172A\", label=<";
+    write_dot_engine(out, engine);
+    out << ">, tooltip=\"";
+    write_dot_escaped(out, details.str());
     out << "\"];\n"
-           "  node [shape=box, style=\"rounded,filled\", fontname=Arial, fontsize=12, "
-           "fontcolor=\"#172D48\", fillcolor=\"#EEF3FA\", color=\"#ADC0D7\", margin=\"0.13,0.08\"];\n"
-           "  edge [color=\"#607C9A\", arrowsize=0.65, penwidth=1.4];\n";
+           "  node [shape=plain, fontname=Arial, fontsize=10, fontcolor=\"#0F172A\"];\n"
+           "  edge [fontname=Arial, fontsize=9, fontcolor=\"#64748B\", color=\"#475569\", arrowsize=0.7, penwidth=1.4];\n";
 
     BackendLinks links(backends);
+    MutedInputs muted_inputs;
+    std::map<NodeId, const Node *> nodes;
     for (const auto id : engine.plan_nodes())
     {
         const auto &node = *engine.plan_node(id);
-        write_dot_node(out, id, node);
+        nodes.emplace(id, &node);
+        write_dot_node(out, id, node, muted_inputs);
 
         if (const auto *backend = links.take(node))
         {
+            const auto error = backend->last_error();
             out << "  b" << id.value;
-            write_dot_backend(out, *backend, false);
+            const auto *mode = write_dot_backend(out, *backend, error, false);
             // A backend binds to a Capture source or a Playback sink.
             if (node.inputs().empty())
-                out << "  b" << id.value << " -> n" << id.value;
+                out << "  b" << id.value << ":e -> n" << id.value << ":w";
             else
-                out << "  n" << id.value << " -> b" << id.value;
-            out << " [style=dashed, color=\"#8297AD\"];\n";
+                out << "  n" << id.value << ":e -> b" << id.value << ":w";
+            out << " [style=dashed, color=\"" << (error ? backend_colors.border : error_colors.border)
+                << "\", label=\"" << mode << "\", tooltip=\"";
+            write_dot_escaped(out, backend->type_name());
+            out << " | graph ";
+            write_spec(out, backend->logical_spec());
+            out << " | device ";
+            write_spec(out, backend->device_spec());
+            out << "\"];\n";
         }
     }
 
     for (const auto &connection : engine.plan_connections())
     {
-        out << "  n" << connection.from.node.value << " -> n" << connection.to.node.value << " [tooltip=\"#"
-            << connection.id.value << ": [" << connection.from.node.value << "]:" << connection.from.index
+        const auto &from = *nodes.find(connection.from.node)->second;
+        const auto &to = *nodes.find(connection.to.node)->second;
+        const auto spec = from.outputs()[connection.from.index];
+        const auto muted = muted_inputs.count({connection.to.node, connection.to.index});
+        out << "  n" << connection.from.node.value;
+        if (is_multiport_node(from))
+            out << ":o" << connection.from.index;
+        out << ":e -> n" << connection.to.node.value;
+        if (is_multiport_node(to))
+            out << ":i" << connection.to.index;
+        out << ":w [label=\"";
+        write_short_spec(out, spec);
+        out << (muted ? " (muted)\"" : "\"");
+        if (muted)
+            out << ", style=dashed, color=\"" << inactive_colors.border
+                << "\", fontcolor=\"" << inactive_colors.accent << '"';
+        out << ", tooltip=\"#" << connection.id.value << ": [" << connection.from.node.value << "]:" << connection.from.index
             << " -> [" << connection.to.node.value << "]:" << connection.to.index << " (";
-        write_spec(out, connection_spec(engine, connection));
+        write_spec(out, spec);
+        if (muted)
+            out << ", muted";
         out << ")\"];\n";
     }
 
@@ -420,13 +687,13 @@ std::string dump_dot(const Engine &engine, View<const Backend *const> backends)
         {
             if (!cluster_open)
             {
-                out << "  subgraph cluster_detached {\n    label=\"Detached\";\n    style=\"rounded,dashed\";\n"
-                       "    fontname=Arial;\n    fontsize=10;\n    fontcolor=\"#52677A\";\n"
-                       "    color=\"#ADC0D7\";\n    margin=12;\n";
+                out << "  subgraph cluster_detached {\n    label=\"Detached Backends\";\n    style=\"rounded,dashed\";\n"
+                       "    fontname=Arial;\n    fontsize=10;\n    fontcolor=\"#64748B\";\n"
+                       "    color=\"#9CA3AF\";\n    margin=12;\n";
                 cluster_open = true;
             }
             out << "    detached" << i;
-            write_dot_backend(out, *backend, true);
+            write_dot_backend(out, *backend, backend->last_error(), true);
         }
     }
     if (cluster_open)
