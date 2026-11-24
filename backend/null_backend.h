@@ -7,7 +7,7 @@ namespace aereborn
 {
 
 /// @brief Graph-clocked source of silence or sink that discards PCM frames.
-class NullBackend final : public Backend
+class NullBackend final : public ActiveBackend
 {
   public:
     /// @brief Construct a null backend whose direction is selected at bind time.

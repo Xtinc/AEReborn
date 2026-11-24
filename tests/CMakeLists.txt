@@ -40,12 +40,21 @@ aereborn_test_group(endpoint endpoint_tests.cpp aereborn::backend
     empty_capture_timeout startup_empty_capture_timeout sync_playback_drain sync_capture_eos null_backends
     wav_round_trip wav_reader wav_file_write wav_segments
     ${platform_endpoint_tests})
+aereborn_test_group(push_source test_push_source.cpp aereborn::backend
+    lifecycle endpoint_ownership same_rate_stream resampled_stream mix_and_isolation)
+aereborn_test_group(pull_sink test_pull_sink.cpp aereborn::backend
+    lifecycle fixed_pcm resampled_stream clocked_round_trip)
+aereborn_test_group(usr_playback test_usr_playback.cpp aereborn::backend
+    lifecycle fixed_batches fir_drain graph_silence fanout_and_mix)
 aereborn_test_group(drift drift_tests.cpp aereborn::backend small_packet_jitter large_packet_jitter endpoint_integration)
 aereborn_test_group(tone tone_tests.cpp aereborn_test_plugins tone_timeline tone_validation)
 aereborn_test_group(allocation allocation_failure_tests.cpp aereborn::backend
     buffer_resize_rollback conversion_rollback direct_conversion_needs_no_workspace
-    plan_allocation_rollback render_uses_prepared_buffers backend_binding_rollback endpoint_uses_prepared_buffers)
+    plan_allocation_rollback render_uses_prepared_buffers backend_binding_rollback endpoint_uses_prepared_buffers
+    push_uses_prepared_buffers push_binding_rollback pull_binding_rollback output_uses_prepared_buffers)
 set_tests_properties(allocation.buffer_resize_rollback allocation.conversion_rollback
     allocation.direct_conversion_needs_no_workspace allocation.plan_allocation_rollback
     allocation.render_uses_prepared_buffers allocation.backend_binding_rollback
-    allocation.endpoint_uses_prepared_buffers PROPERTIES SKIP_RETURN_CODE 77)
+    allocation.endpoint_uses_prepared_buffers allocation.push_uses_prepared_buffers allocation.push_binding_rollback
+    allocation.pull_binding_rollback allocation.output_uses_prepared_buffers
+    PROPERTIES SKIP_RETURN_CODE 77)

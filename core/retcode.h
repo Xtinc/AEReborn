@@ -184,6 +184,30 @@ template <class T> class Result
     T value_{};
 };
 
+/// @brief Run a non-throwing cleanup when leaving scope unless dismissed.
+template <class Cleanup> class ScopeExit
+{
+  public:
+    explicit ScopeExit(Cleanup cleanup) noexcept(std::is_nothrow_move_constructible<Cleanup>::value)
+        : cleanup_(std::move(cleanup))
+    {
+    }
+    ScopeExit(const ScopeExit &) = delete;
+    ScopeExit &operator=(const ScopeExit &) = delete;
+
+    ~ScopeExit()
+    {
+        if (active_)
+            cleanup_();
+    }
+
+    void dismiss() noexcept { active_ = false; }
+
+  private:
+    Cleanup cleanup_;
+    bool active_ = true;
+};
+
 } // namespace aereborn
 
 #endif // AEREBORN_CORE_RETCODE_H

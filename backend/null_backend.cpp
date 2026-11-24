@@ -5,7 +5,7 @@
 namespace aereborn
 {
 
-NullBackend::NullBackend(SampleFormat format) : Backend(false), format_(format)
+NullBackend::NullBackend(SampleFormat format) : ActiveBackend(false), format_(format)
 {
     if (!is_interleaved_pcm(format_))
         throw Error(ErrorCode::InvalidArg);

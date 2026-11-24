@@ -124,8 +124,9 @@ Engine 停止会等待图处理退出。后端停止时唤醒阻塞的异步 I/O
 
 - NetworkSource：会话识别、乱序整理、按播放期限解码/FEC/PLC，再交付音频。NetworkSink：排队、编码、发送。先 PCM，后 Opus；协议独立版本化。
 - WavCapture 在后端线程读文件，可循环播放。WavPlayback 接收同步播放队列，解绑时回填 RIFF/WAVE 文件长度。
-- PushSource：应用显式推入带格式、帧时间和连续性信息的音频，接口报告接收数量或队列满。
-- 回调输出：普通 Sink 接收图内 float，或由 Convert 转换为所需 PCM。后端通过有界队列异步调用用户函数，负责数据所有权、缺口报告和停止屏障。
+- `PushSource`：应用推入固定规格的交错 PCM，接口返回已接收的输入帧数。帧时间和连续性信息由上层流处理。
+- `PullSink`：应用从 `Playback` 拉取固定规格的交错 PCM，返回实际输出帧数。
+- `UsrPlayback`：同步播放后端在工作线程按固定批次回调交错 PCM，停止时排空队列和 FIR 尾部。回调中的块只在当次调用内有效。
 
 ## 6. 混音策略归属
 
@@ -179,7 +180,9 @@ Tone / BUS（48k F32P）
 - `replace_node()` 要求输入、输出的数量及完整规格相同，布局不同时抛出 `Error(FormatMismatch)`。设备格式变化时重新准备设备侧转换。新包长超出原周期预算时，用同端口规格的新节点替换并提交，保留 NodeId 和图连接。逻辑端口规格变化时修改相应连线。
 - `set_paused()` 通过计划移除或恢复节点及相关连接，未改动实例保留状态。暂停导致某个输入失去来源时，该输入得到静音。需要平滑暂停时，先将 Matrix 增益淡出至零，再提交暂停。
 - `Matrix::set_gain()` 和 `Mixer::set_muted()` 使用原子变量，可与 `process()` 并发调用。处理块读取当前设置。控制侧从 `Engine::node()` 借用草稿节点指针，须在节点被移除或替换前结束使用，最长有效期到 Engine 析构。
-- 图提交并准备端点后，用后端的 `bind(endpoint)` 协商 PCM 规格和单包预算 `io_period()`，然后调用 `start()` 等待工作线程完成设备初始化。端点已经被占用时抛出 `Error(Busy)`。绑定失败释放设备资源和占用。启动失败时先回收工作线程，再向控制调用方抛出设备错误。
+- 图提交并准备端点后，`ActiveBackend::bind(endpoint)` 协商 PCM 规格和单包预算 `io_period()`，`start()` 在工作线程上初始化。`ActiveBackend` 和 `PassiveBackend` 共用 `Backend` 的端点占用与 PCM 转换，并可通过 `Backend&` 统一启停与查询。端点已经被占用时抛出 `Error(Busy)`。绑定失败释放资源和占用。设备启动失败时先回收工作线程，再向控制调用方抛出设备错误。
+- `PushSource` 绑定 `Capture`，由应用串行执行 `push(IBBlock)`、控制接口、状态查询和析构。可用单消费者指令队列执行这些操作。PCM 缓冲至少保留到 `push()` 返回。同一流的分片按顺序投递，停止接收旧流数据后再执行停机或重启。`push()` 返回本次接收的输入帧数，后续从该偏移续推。队列空位不足时可能返回零，图侧缺帧时补静音。`stop()` 丢弃未消费的帧并复位重采样器。
+- `PullSink` 同样由应用串行调用，`pull(OBBlock)` 读取 `Playback` 中当前可用的 PCM。`UsrPlayback` 由同步播放工作线程消费 `Playback` 队列。分数秒预算在构造 `Playback` 时一次向上取整为微秒，回调使用固定帧数，交付由数据就绪驱动。
 - `stop()` 下线并复位 DSP 和漂移，保留绑定和已分配工作区。同步播放先关闭图侧写入，写完已排队帧及 FIR 尾部。同步 I/O 钩子须自行完成操作。切换设备时依次调用旧后端的 `unbind()` 和新后端的 `bind(endpoint)`、`start()`。
 - 异步播放补齐设备批次的静音，后端通过 `last_error()` 返回 I/O 终止原因。异步等待和数据交接共用以最后一次 I/O 进展为起点的截止时间。主动停止可唤醒设备等待。测试通过真实的 I/O 工作线程验证设备交接。
 - `Engine::stop()` 唤醒时钟并等待在途图处理退出。先停止绑定的后端，再调用 `Engine::reset()`。在移除、替换端点或销毁 Engine 前解绑其后端。派生驱动析构时先调用 `unbind()`。
@@ -188,7 +191,7 @@ Tone / BUS（48k F32P）
 
 ### 构建与验证
 
-项目使用 C++14。`aereborn::core` 和 `aereborn::backend` 链接 `Threads::Threads`。`aereborn::backend` 是静态库，包含 Null 和 RIFF/WAVE 后端。Linux 在查找到 ALSA 开发库时编译 ALSA 后端并定义 `AEREBORN_HAS_ALSA`，Windows 编译 WASAPI 后端。只构建库可设置 `-DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF`。
+项目使用 C++14。`aereborn::core` 和 `aereborn::backend` 链接 `Threads::Threads`。静态库 `aereborn::backend` 包含 `PushSource`、`PullSink`、`UsrPlayback`、Null 和 RIFF/WAVE 后端。Linux 在查找到 ALSA 开发库时编译 ALSA 后端并定义 `AEREBORN_HAS_ALSA`，Windows 编译 WASAPI 后端。只构建库可设置 `-DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF`。
 
 ~~~powershell
 cmake -S . -B build -DBUILD_TESTING=ON
@@ -198,7 +201,7 @@ cmake --build build --config Release --parallel 4
 ctest --test-dir build -C Release --output-on-failure
 ~~~
 
-测试按 core、runtime、routing、convert、resampling、mix、device、endpoint、drift、tone、allocation、example 分组。引擎测试使用内置时钟，通过测试节点在块边界与测试控制侧同步。混音、格式转换和重采样使用独立字节或数值参照。端点测试覆盖分数帧、队列换包、阻塞停机、错误下线、批次帧数越界、格式重开和模拟漂移。图处理和设备线程的运行期数据通路验证零堆操作，停止后重新启动会重新创建系统线程。
+测试按 core、runtime、routing、convert、resampling、mix、device、endpoint、push_source、pull_sink、usr_playback、drift、tone、allocation、example 分组。引擎测试使用内置时钟，通过测试节点在块边界与测试控制侧同步。混音、格式转换和重采样使用独立字节或数值参照。端点测试覆盖分数帧、队列换包、阻塞停机、错误下线、批次帧数越界、格式重开和模拟漂移。图处理、设备 I/O、推拉和回调交付的运行期数据通路验证零堆操作。带线程的后端在重新启动时创建新的工作线程。
 
 MSVC Debug 的迭代器代理会在 noexcept 构造中分配内存，allocation 用例按项目规则跳过，在 Release 完整执行。示例由默认开启的 BUILD_EXAMPLES 控制。
 

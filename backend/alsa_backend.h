@@ -17,7 +17,7 @@ namespace aereborn
 /// @note An empty card name or "default" selects the ALSA default PCM. PCM names such as hw: or plug:
 ///       are passed through. A bare card name is expanded to hw:CARD=<card>,DEV=<device>.
 /// @note Prefers MMAP_INTERLEAVED when use_mmap is true and falls back to RW_INTERLEAVED.
-class AlsaBackend final : public Backend
+class AlsaBackend final : public ActiveBackend
 {
   public:
     /// @brief Create an ALSA backend whose direction is selected when it binds.

@@ -11,7 +11,7 @@ namespace aereborn
 /// @brief Graph-clocked RIFF/WAVE source. Reports EndOfStream when all passes have been read.
 /// @note Unsigned 8-bit PCM and 64-bit float files are exposed as F32LE.
 /// @note Restart resumes at the next file frame to read. Rebinding opens the file from the beginning.
-class WavCapture final : public Backend
+class WavCapture final : public ActiveBackend
 {
   public:
     /// @brief Number of additional passes after the first one.
@@ -25,7 +25,7 @@ class WavCapture final : public Backend
     /// @brief Play once and then repeat the requested number of times.
     explicit WavCapture(std::string path, Repeat repeats);
     ~WavCapture() override { unbind(); }
-    using Backend::bind;
+    using ActiveBackend::bind;
     void bind(Playback &) = delete;
 
   private:
@@ -42,7 +42,7 @@ class WavCapture final : public Backend
 
 /// @brief Graph-clocked RIFF/WAVE sink supporting S16LE, S24_3LE, S32LE and F32LE.
 /// @note Stop drains and flushes the audio. Unbind and rotation finalize the RIFF and data lengths.
-class WavPlayback final : public Backend
+class WavPlayback final : public ActiveBackend
 {
   public:
     /// @brief Record to one file, truncating its existing contents at bind time.
@@ -53,7 +53,7 @@ class WavPlayback final : public Backend
     /// @throws Error If the format is unsupported for WAV output or the duration is negative.
     WavPlayback(std::string path, SampleFormat format, std::chrono::seconds segment_duration);
     ~WavPlayback() override { unbind(); }
-    using Backend::bind;
+    using ActiveBackend::bind;
     void bind(Capture &) = delete;
 
   private:

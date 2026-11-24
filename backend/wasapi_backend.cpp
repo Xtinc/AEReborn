@@ -174,7 +174,7 @@ Result<PortSpec> WasapiBackend::on_open(bool capture, PortSpec logical, std::chr
         return record_failure(failure_, "IAudioClient::GetMixFormat", rc);
     const std::unique_ptr<WAVEFORMATEX, FreeComBuffer> format(format_ptr);
     const PortSpec spec{static_cast<SampleRate>(format->nSamplesPerSec), format->nChannels, sample_format(*format)};
-    if (!spec.valid() || !is_interleaved_pcm(spec.format) || logical.channels != spec.channels ||
+    if (!valid_pcm_spec(spec) || logical.channels != spec.channels ||
         format->nBlockAlign != spec.channels * sample_bytes(spec.format) ||
         sizeof(*format) + format->cbSize > format_.size())
         return ErrorCode::FormatMismatch;
@@ -404,7 +404,7 @@ RetCode WasapiBackend::write(IAudioRenderClient &render, std::uint32_t frames, V
     return FAILED(rc) ? record_failure(failure_, "IAudioRenderClient::ReleaseBuffer", rc) : RetCode{};
 }
 
-WasapiBackend::WasapiBackend(std::wstring device) : Backend(true), device_(std::move(device))
+WasapiBackend::WasapiBackend(std::wstring device) : ActiveBackend(true), device_(std::move(device))
 {
 }
 

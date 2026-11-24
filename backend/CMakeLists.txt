@@ -1,4 +1,5 @@
-add_library(aereborn_backend STATIC backend.cpp null_backend.cpp wav_backend.cpp wav_file.cpp)
+add_library(aereborn_backend STATIC
+    backend.cpp null_backend.cpp pull_sink.cpp push_source.cpp usr_playback.cpp wav_backend.cpp wav_file.cpp)
 add_library(aereborn::backend ALIAS aereborn_backend)
 target_link_libraries(aereborn_backend PUBLIC aereborn::plugins PRIVATE Threads::Threads)
 

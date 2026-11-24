@@ -17,7 +17,7 @@ namespace aereborn
 {
 
 /// @brief Event-driven WASAPI backend for a Windows Vista or later SDK target.
-class WasapiBackend final : public Backend
+class WasapiBackend final : public ActiveBackend
 {
   public:
     /// @brief Native failure details. operation is null when no native failure was recorded.

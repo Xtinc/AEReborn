@@ -1,13 +1,12 @@
 #include "backend.h"
 
 #include "core/os.h"
+#include "core/retcode.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <type_traits>
-#include <utility>
 
 namespace aereborn
 {
@@ -20,35 +19,186 @@ using Microseconds = std::chrono::microseconds;
 
 constexpr double max_asrc_correction = max_clock_drift_ppm / 1000000.0;
 
-template <class Cleanup> class ScopeExit
-{
-  public:
-    explicit ScopeExit(Cleanup cleanup) noexcept : cleanup_(std::move(cleanup))
-    {
-    }
-    ~ScopeExit()
-    {
-        if (active_)
-            cleanup_();
-    }
-    void dismiss() noexcept
-    {
-        active_ = false;
-    }
-
-  private:
-    Cleanup cleanup_;
-    bool active_ = true;
-};
-
 } // namespace
 
 Backend::~Backend()
 {
-    assert(!bound() && "Derived backend must unbind before destruction");
+    assert(!capture_ && !playback_ && "Backend must release its endpoint before destruction");
 }
 
-Result<std::size_t> Backend::frames_in_period(SampleRate rate, Microseconds period) noexcept
+void Backend::claim(Capture &endpoint)
+{
+    claim_endpoint(endpoint, capture_);
+}
+
+void Backend::claim(Playback &endpoint)
+{
+    claim_endpoint(endpoint, playback_);
+}
+
+template <class Endpoint> void Backend::claim_endpoint(Endpoint &endpoint, Endpoint *&slot)
+{
+    if (capture_ || playback_)
+        throw Error(ErrorCode::Busy);
+    if (!endpoint.capacity())
+        throw Error(ErrorCode::NotReady);
+    if (endpoint.backend_bound_.exchange(true, std::memory_order_acq_rel))
+        throw Error(ErrorCode::Busy);
+    slot = &endpoint;
+}
+
+void Backend::validate_channels(std::size_t logical_channels, std::size_t device_channels)
+{
+    if (device_channels != logical_channels)
+        throw Error(ErrorCode::FormatMismatch);
+}
+
+void Backend::prepare(PortSpec logical, SampleRate device_rate, double max_rate_offset)
+{
+    const auto frames = device_max_frames_;
+    const auto capture = is_capture();
+    const auto src_fs = capture ? device_rate : logical.sample_rate;
+    const auto dst_fs = capture ? logical.sample_rate : device_rate;
+    const auto logical_frames = capture ? SincResampler::max_output_frames(src_fs, dst_fs, frames, max_rate_offset)
+                                        : SincResampler::max_input_frames(src_fs, dst_fs, frames, max_rate_offset);
+    if (logical_frames > target_frames())
+        throw Error(ErrorCode::TooLarge);
+
+    resampler_.prepare(logical.channels, src_fs, dst_fs, max_rate_offset);
+    if (resampler_.needs_fir())
+        device_planar_.resize(logical.channels, frames);
+    logical_planar_.resize(logical.channels, logical_frames);
+    logical_frames_ = logical_frames;
+}
+
+void Backend::reset_workspace() noexcept
+{
+    device_spec_ = {};
+    device_max_frames_ = 0;
+    logical_frames_ = 0;
+    resampler_ = {};
+    device_planar_ = {};
+    logical_planar_ = {};
+}
+
+void Backend::release_endpoint() noexcept
+{
+    assert(!bound() && (capture_ || playback_));
+    auto &occupied = capture_ ? capture_->backend_bound_ : playback_->backend_bound_;
+    occupied.store(false, std::memory_order_release);
+    capture_ = nullptr;
+    playback_ = nullptr;
+}
+
+void Backend::release() noexcept
+{
+    reset_workspace();
+    release_endpoint();
+}
+
+void Backend::open_queue(bool prefill) noexcept
+{
+    if (capture_)
+        capture_->open(prefill);
+    else
+        playback_->open(prefill);
+}
+
+void Backend::close_queue() noexcept
+{
+    if (capture_)
+        capture_->close();
+    else
+        playback_->close();
+    resampler_.reset();
+}
+
+void Backend::close_playback_graph() noexcept
+{
+    playback_->close_graph();
+}
+
+PortSpec Backend::logical_spec() const noexcept
+{
+    return capture_ ? capture_->spec() : playback_->spec();
+}
+
+std::chrono::microseconds Backend::endpoint_period() const noexcept
+{
+    return capture_ ? capture_->io_period() : playback_->io_period();
+}
+
+bool Backend::steady() const noexcept
+{
+    return capture_ ? capture_->steady() : playback_->steady();
+}
+
+std::size_t Backend::available() const noexcept
+{
+    return capture_ ? capture_->available() : playback_->available();
+}
+
+std::size_t Backend::target_frames() const noexcept
+{
+    return capture_ ? capture_->target_frames() : playback_->target_frames();
+}
+
+std::size_t Backend::capture_free_frames() const noexcept
+{
+    return capture_->capacity() - capture_->available();
+}
+
+void Backend::decode_to_capture(IBBlock input, double scale) noexcept
+{
+    const auto fir = resampler_.needs_fir();
+    const auto planar = (fir ? device_planar_ : logical_planar_).block(input.frames());
+    decode_pcm(input, planar);
+    if (fir)
+        emit_capture(planar, scale);
+    else
+        capture_->write(planar);
+}
+
+void Backend::flush_capture_tail(std::size_t frames) noexcept
+{
+    const auto input = device_planar_.block(frames);
+    input.clear();
+    emit_capture(input, 1.0);
+}
+
+void Backend::emit_capture(IFBlock input, double scale) noexcept
+{
+    const auto output = logical_block(logical_frames_);
+    const auto result = resampler_.process(input, output, scale);
+    assert(result.consumed == input.frames());
+    capture_->write(output.subblock(0, result.produced));
+}
+
+std::size_t Backend::read_playback(OFBlock output) noexcept
+{
+    // A zero-frame batch must leave the playback prefill gate untouched.
+    return output.frames() ? playback_->read(output) : 0;
+}
+
+OBBlock Backend::encode_from_playback(IFBlock input, OBBlock output, double scale) noexcept
+{
+    auto source = input;
+    if (resampler_.needs_fir())
+    {
+        const auto device = device_planar_.block(output.frames());
+        const auto result = resampler_.process(input, device, scale);
+        assert(result.consumed == input.frames());
+        source = device.subblock(0, result.produced);
+    }
+
+    assert(source.frames() <= output.frames());
+    const OBBlock encoded(output.byte_view().data(), output.spec(), source.frames());
+    if (encoded.frames())
+        encode_pcm(source, encoded);
+    return encoded;
+}
+
+Result<std::size_t> Backend::frames_in_period(SampleRate rate, std::chrono::microseconds period) noexcept
 {
     constexpr std::uint64_t micros_per_second = 1000000;
     const auto hz = static_cast<std::uint32_t>(rate);
@@ -61,80 +211,80 @@ Result<std::size_t> Backend::frames_in_period(SampleRate rate, Microseconds peri
     return static_cast<std::size_t>(frames);
 }
 
-void Backend::bind(Capture &endpoint)
+void PassiveBackend::start()
 {
-    bind_endpoint(endpoint, capture_);
-}
-
-void Backend::bind(Playback &endpoint)
-{
-    bind_endpoint(endpoint, playback_);
-}
-
-template <class Endpoint> void Backend::bind_endpoint(Endpoint &endpoint, Endpoint *&slot)
-{
-    if (bound())
-        throw Error(ErrorCode::Busy);
-    if (!endpoint.capacity())
+    if (!bound())
         throw Error(ErrorCode::NotReady);
-    if (endpoint.backend_bound_.exchange(true, std::memory_order_acq_rel))
+    if (running_)
         throw Error(ErrorCode::Busy);
+    open_queue(false);
+    running_ = true;
+}
 
-    const auto cleanup = [&]() noexcept {
-        workspace_ = {};
+void PassiveBackend::stop() noexcept
+{
+    if (!running_)
+        return;
+    close_queue();
+    running_ = false;
+}
+
+void PassiveBackend::unbind() noexcept
+{
+    if (!bound())
+        return;
+    stop();
+    release();
+}
+
+void ActiveBackend::bind(Capture &endpoint)
+{
+    bind_endpoint(endpoint);
+}
+
+void ActiveBackend::bind(Playback &endpoint)
+{
+    bind_endpoint(endpoint);
+}
+
+template <class Endpoint> void ActiveBackend::bind_endpoint(Endpoint &endpoint)
+{
+    claim(endpoint);
+    const auto cleanup = [this]() noexcept {
+        reset_workspace();
         on_close();
-        endpoint.backend_bound_.store(false, std::memory_order_release);
+        release_endpoint();
     };
     ScopeExit<decltype(cleanup)> rollback(cleanup);
 
-    constexpr bool capture = std::is_same<Endpoint, Capture>::value;
     const auto logical = endpoint.spec();
-    const auto period = endpoint.io_period();
-    workspace_.device_spec = on_open(capture, logical, period).value_or_throw();
-
-    const auto &device = workspace_.device_spec;
+    const auto period = endpoint_period();
+    const auto device = on_open(is_capture(), logical, period).value_or_throw();
     const auto frames = device_max_frames();
-    if (!is_sample_rate(device.sample_rate) || !device.channels || !is_interleaved_pcm(device.format) || !frames)
+    if (!valid_pcm_spec(device) || !frames)
         throw Error(ErrorCode::InvalidArg);
-    if (device.channels != logical.channels)
-        throw Error(ErrorCode::FormatMismatch);
+    validate_channels(logical.channels, device.channels);
     if (frames > frames_in_period(device.sample_rate, period).value_or_throw())
         throw Error(ErrorCode::TooLarge);
 
-    const auto src_fs = capture ? device.sample_rate : logical.sample_rate;
-    const auto dst_fs = capture ? logical.sample_rate : device.sample_rate;
-    const auto max_rate_offset = async_ ? max_asrc_correction : 0.0;
-    const auto logical_frames = capture ? SincResampler::max_output_frames(src_fs, dst_fs, frames, max_rate_offset)
-                                        : SincResampler::max_input_frames(src_fs, dst_fs, frames, max_rate_offset);
-    if (logical_frames > endpoint.target_frames())
-        throw Error(ErrorCode::TooLarge);
-
+    prepare(logical, device.sample_rate, async_ ? max_asrc_correction : 0.0);
     const auto width = sample_bytes(device.format);
-    if (frames > workspace_.device_bytes.max_size() / logical.channels / width)
+    if (frames > device_bytes_.max_size() / device.channels / width)
         throw Error(ErrorCode::TooLarge);
-    workspace_.resampler.prepare(logical.channels, src_fs, dst_fs, max_rate_offset);
-    if (workspace_.resampler.needs_fir())
-        workspace_.device_planar.resize(logical.channels, frames);
-    workspace_.logical_planar.resize(logical.channels, logical_frames);
-    workspace_.device_bytes.resize(frames * logical.channels * width);
-    workspace_.logical_frames = logical_frames;
+    // Allocate the byte buffer last. A failed resize leaves it empty.
+    device_bytes_.resize(frames * device.channels * width);
 
-    slot = &endpoint;
+    complete_binding(device);
     last_error_.store({}, std::memory_order_release);
     rollback.dismiss();
 }
 
-bool Backend::running() const noexcept
+bool ActiveBackend::running() const noexcept
 {
     return worker_state_.load(std::memory_order_acquire) != State::Stopped;
 }
 
-Microseconds Backend::endpoint_period() const noexcept
-{
-    return capture_ ? capture_->io_period() : playback_->io_period();
-}
-
-Milliseconds Backend::io_timeout() const noexcept
+Milliseconds ActiveBackend::io_timeout() const noexcept
 {
     // Ten periods, rounded up to the wait API's millisecond resolution.
     const auto us = endpoint_period().count();
@@ -142,7 +292,7 @@ Milliseconds Backend::io_timeout() const noexcept
     return Milliseconds(std::max<std::int64_t>(500, std::min<std::int64_t>(ms, std::numeric_limits<int>::max())));
 }
 
-int Backend::remaining_io_ms() const noexcept
+int ActiveBackend::remaining_io_ms() const noexcept
 {
     const auto remaining = io_deadline_ - Clock::now();
     if (remaining <= Clock::duration::zero())
@@ -151,7 +301,7 @@ int Backend::remaining_io_ms() const noexcept
     return static_cast<int>(ms.count() + (ms < remaining));
 }
 
-void Backend::start()
+void ActiveBackend::start()
 {
     if (!bound())
         throw Error(ErrorCode::NotReady);
@@ -165,15 +315,12 @@ void Backend::start()
     bool start_done = false;
     worker_ = std::thread([this, &start_result, &start_done]() noexcept {
         if (async_)
-            configure_audio_thread(capture_ ? "ae-capture" : "ae-playback");
+            configure_audio_thread(is_capture() ? "ae-capture" : "ae-playback");
 
         const auto code = on_start();
         if (code)
         {
-            if (capture_)
-                capture_->open(async_);
-            else
-                playback_->open(async_);
+            open_queue(async_);
             worker_state_.store(State::Running, std::memory_order_release);
         }
         {
@@ -194,15 +341,15 @@ void Backend::start()
     start_result.or_throw();
 }
 
-void Backend::stop() noexcept
+void ActiveBackend::stop() noexcept
 {
     if (!worker_.joinable())
         return;
     if (running())
     {
-        const auto drain = !async_ && playback_;
+        const auto drain = !async_ && !is_capture();
         if (drain)
-            playback_->close_graph();
+            close_playback_graph();
 
         bool stopping;
         {
@@ -221,62 +368,55 @@ void Backend::stop() noexcept
     worker_.join();
 }
 
-void Backend::unbind() noexcept
+void ActiveBackend::unbind() noexcept
 {
     if (!bound())
         return;
     stop();
     on_close();
-    auto &bound = capture_ ? capture_->backend_bound_ : playback_->backend_bound_;
-    bound.store(false, std::memory_order_release);
-    capture_ = nullptr;
-    playback_ = nullptr;
-    workspace_ = {};
+    std::vector<std::uint8_t>().swap(device_bytes_);
+    release();
 }
 
-void Backend::go_offline(RetCode error) noexcept
+void ActiveBackend::go_offline(RetCode error) noexcept
 {
-    if (capture_)
-        capture_->close();
-    else
-        playback_->close();
-    workspace_.resampler.reset();
+    close_queue();
     asrc_.reset();
     has_input_ = false;
     record_io_error(error);
 }
 
-void Backend::record_io_error(RetCode error) noexcept
+void ActiveBackend::record_io_error(RetCode error) noexcept
 {
     if (!error && error != ErrorCode::Cancelled)
         last_error_.store(error, std::memory_order_release);
 }
 
-Result<std::size_t> Backend::on_read(OBBlock) noexcept
+Result<std::size_t> ActiveBackend::on_read(OBBlock) noexcept
 {
     return ErrorCode::InvalidArg;
 }
 
-RetCode Backend::on_write(IBBlock) noexcept
+RetCode ActiveBackend::on_write(IBBlock) noexcept
 {
     return ErrorCode::InvalidArg;
 }
 
-RetCode Backend::on_write_silence(OBBlock scratch) noexcept
+RetCode ActiveBackend::on_write_silence(OBBlock scratch) noexcept
 {
     const auto bytes = scratch.byte_view();
     std::memset(bytes.data(), 0, bytes.size());
     return on_write(scratch);
 }
 
-void Backend::wait_backpressure() noexcept
+void ActiveBackend::wait_backpressure() noexcept
 {
     const auto wait = std::max(Microseconds(200), std::min(Microseconds(2000), endpoint_period() / 2));
     std::unique_lock<std::mutex> lock(wait_mutex_);
     wait_cv_.wait_for(lock, wait, [this] { return worker_state_.load(std::memory_order_acquire) != State::Running; });
 }
 
-void Backend::ASRC::update(std::size_t queued_before, std::size_t queued_after, std::size_t target_frames,
+void ActiveBackend::ASRC::update(std::size_t queued_before, std::size_t queued_after, std::size_t target_frames,
                            SampleRate logical_rate, std::size_t device_frames, SampleRate device_rate) noexcept
 {
     constexpr double filter_seconds = 0.25;
@@ -296,20 +436,12 @@ void Backend::ASRC::update(std::size_t queued_before, std::size_t queued_after, 
     correction = std::max(-max_asrc_correction, std::min(max_asrc_correction, proportional + integral));
 }
 
-OBBlock Backend::device_block(std::size_t frames) noexcept
+OBBlock ActiveBackend::device_block(std::size_t frames) noexcept
 {
-    return {workspace_.device_bytes.data(), workspace_.device_spec, frames};
+    return {device_bytes_.data(), device_spec(), frames};
 }
 
-void Backend::emit_capture(IFBlock input, double scale) noexcept
-{
-    const auto output = workspace_.logical_planar.block(workspace_.logical_frames);
-    const auto result = workspace_.resampler.process(input, output, scale);
-    assert(result.consumed == input.frames());
-    capture_->write(output.subblock(0, result.produced));
-}
-
-RetCode Backend::transfer_capture(std::size_t &device_frames) noexcept
+RetCode ActiveBackend::transfer_capture(std::size_t &device_frames) noexcept
 {
     const auto batch = device_block(device_max_frames());
     const auto read = on_read(batch);
@@ -322,22 +454,16 @@ RetCode Backend::transfer_capture(std::size_t &device_frames) noexcept
         return {};
 
     has_input_ = true;
-    const auto steady = async_ && capture_->steady();
-    const auto queued_before = steady ? capture_->available() : 0;
-    const auto fir = workspace_.resampler.needs_fir();
-    const auto planar = (fir ? workspace_.device_planar : workspace_.logical_planar).block(device_frames);
-    decode_pcm(device_block(device_frames), planar);
-    if (fir)
-        emit_capture(planar, asrc_.scale());
-    else
-        capture_->write(planar);
-    if (steady)
-        asrc_.update(queued_before, capture_->available(), capture_->target_frames(), capture_->spec().sample_rate,
+    const auto primed = async_ && steady();
+    const auto queued_before = primed ? available() : 0;
+    decode_to_capture(device_block(device_frames), asrc_.scale());
+    if (primed)
+        asrc_.update(queued_before, available(), target_frames(), logical_spec().sample_rate,
                      device_frames, batch.spec().sample_rate);
     return {};
 }
 
-Result<std::size_t> Backend::next_playback_batch() noexcept
+Result<std::size_t> ActiveBackend::next_playback_batch() noexcept
 {
     const auto batch = on_wait_writable();
     if (!batch)
@@ -348,26 +474,15 @@ Result<std::size_t> Backend::next_playback_batch() noexcept
     return batch;
 }
 
-RetCode Backend::emit_playback(IFBlock input, std::size_t device_frames, double scale) noexcept
+RetCode ActiveBackend::emit_playback(IFBlock input, std::size_t device_frames, double scale) noexcept
 {
-    IFBlock output = input;
-    if (workspace_.resampler.needs_fir())
-    {
-        const auto device = workspace_.device_planar.block(device_frames);
-        const auto conversion = workspace_.resampler.process(input, device, scale);
-        assert(conversion.consumed == input.frames());
-        output = device.subblock(0, conversion.produced);
-    }
+    const auto batch = device_block(device_frames);
+    const auto samples = encode_from_playback(input, batch, scale);
+    if (!samples.frames())
+        return async_ ? on_write_silence(batch) : RetCode{};
 
-    const auto produced = output.frames();
-    if (!produced)
-        return async_ ? on_write_silence(device_block(device_frames)) : RetCode{};
-
-    const auto samples = device_block(produced);
-    encode_pcm(output, samples);
-    if (async_ && produced < device_frames)
+    if (async_ && samples.frames() < device_frames)
     {
-        const auto batch = device_block(device_frames);
         const auto bytes = batch.byte_view();
         const auto encoded = samples.byte_view().size();
         std::memset(bytes.data() + encoded, 0, bytes.size() - encoded);
@@ -376,32 +491,32 @@ RetCode Backend::emit_playback(IFBlock input, std::size_t device_frames, double 
     return on_write(samples);
 }
 
-RetCode Backend::transfer_playback_async(std::size_t &device_frames) noexcept
+RetCode ActiveBackend::transfer_playback_async(std::size_t &device_frames) noexcept
 {
     const auto batch = next_playback_batch();
     if (!batch)
         return batch.ret_code();
     device_frames = batch.value();
     const auto scale = asrc_.scale();
-    const auto requested = workspace_.resampler.required_input(device_frames, scale);
-    const auto steady = playback_->steady();
-    const auto queued_before = steady ? playback_->available() : 0;
-    const auto logical = workspace_.logical_planar.block(requested);
-    const auto received = requested ? playback_->read(logical) : 0;
-    const auto result = received || (!requested && steady)
+    const auto requested = required_input(device_frames, scale);
+    const auto primed = steady();
+    const auto queued_before = primed ? available() : 0;
+    const auto logical = logical_block(requested);
+    const auto received = read_playback(logical);
+    const auto result = received || (!requested && primed)
                             ? emit_playback(logical.subblock(0, received), device_frames, scale)
                             : on_write_silence(device_block(device_frames));
-    if (result && steady)
-        asrc_.update(queued_before, playback_->available(), playback_->target_frames(), playback_->spec().sample_rate,
-                     device_frames, workspace_.device_spec.sample_rate);
+    if (result && primed)
+        asrc_.update(queued_before, available(), target_frames(), logical_spec().sample_rate,
+                     device_frames, device_spec().sample_rate);
     return result;
 }
 
-RetCode Backend::run_sync_capture() noexcept
+RetCode ActiveBackend::run_sync_capture() noexcept
 {
     while (worker_state_.load(std::memory_order_acquire) == State::Running)
     {
-        if (capture_->capacity() - capture_->available() < workspace_.logical_frames)
+        if (capture_free_frames() < logical_frames())
         {
             wait_backpressure();
             continue;
@@ -416,20 +531,17 @@ RetCode Backend::run_sync_capture() noexcept
     return {};
 }
 
-RetCode Backend::drain_capture() noexcept
+RetCode ActiveBackend::drain_capture() noexcept
 {
-    auto tail = has_input_ ? workspace_.resampler.tail_frames() : 0;
+    auto tail = has_input_ ? tail_frames() : 0;
     while (worker_state_.load(std::memory_order_acquire) == State::Running)
     {
-        const auto queued = capture_->available();
-        if (!tail && !queued)
+        if (!tail && !available())
             return ErrorCode::EndOfStream;
-        if (tail && capture_->capacity() - queued >= workspace_.logical_frames)
+        if (tail && capture_free_frames() >= logical_frames())
         {
             const auto frames = std::min(tail, device_max_frames());
-            const auto input = workspace_.device_planar.block(frames);
-            input.clear();
-            emit_capture(input, 1);
+            flush_capture_tail(frames);
             tail -= frames;
         }
         else
@@ -438,22 +550,22 @@ RetCode Backend::drain_capture() noexcept
     return {};
 }
 
-RetCode Backend::run_sync_playback() noexcept
+RetCode ActiveBackend::run_sync_playback() noexcept
 {
     while (worker_state_.load(std::memory_order_acquire) == State::Running)
     {
         const auto batch = next_playback_batch();
         if (!batch)
             return batch.ret_code();
-        const auto requested = workspace_.resampler.required_input(batch.value());
+        const auto requested = required_input(batch.value());
 
-        while (playback_->available() < requested && worker_state_.load(std::memory_order_acquire) == State::Running)
+        while (available() < requested && worker_state_.load(std::memory_order_acquire) == State::Running)
             wait_backpressure();
         if (worker_state_.load(std::memory_order_acquire) != State::Running)
             break;
 
-        const auto logical = workspace_.logical_planar.block(requested);
-        const auto received = requested ? playback_->read(logical) : 0;
+        const auto logical = logical_block(requested);
+        const auto received = read_playback(logical);
         assert(received == requested);
         has_input_ |= received != 0;
         const auto result = emit_playback(logical, batch.value(), 1.0);
@@ -463,23 +575,23 @@ RetCode Backend::run_sync_playback() noexcept
     return worker_state_.load(std::memory_order_acquire) == State::Draining ? drain_playback() : RetCode{};
 }
 
-RetCode Backend::drain_playback() noexcept
+RetCode ActiveBackend::drain_playback() noexcept
 {
-    auto tail = has_input_ || playback_->available() ? workspace_.resampler.tail_frames() : 0;
+    auto tail = has_input_ || available() ? tail_frames() : 0;
     for (;;)
     {
-        if (!tail && !playback_->available())
+        if (!tail && !available())
         {
             // Upsampling can still have output at the current phase after consuming the last input frame.
-            if (workspace_.resampler.required_input(1))
+            if (required_input(1))
                 return {};
         }
         const auto batch = next_playback_batch();
         if (!batch)
             return batch.ret_code();
-        const auto requested = workspace_.resampler.required_input(batch.value());
-        const auto logical = workspace_.logical_planar.block(requested);
-        const auto received = requested ? playback_->read(logical) : 0;
+        const auto requested = required_input(batch.value());
+        const auto logical = logical_block(requested);
+        const auto received = read_playback(logical);
         const auto padding = std::min(tail, requested - received);
         if (padding)
         {
@@ -492,14 +604,14 @@ RetCode Backend::drain_playback() noexcept
     }
 }
 
-RetCode Backend::run_async() noexcept
+RetCode ActiveBackend::run_async() noexcept
 {
     const auto timeout = io_timeout();
     io_deadline_ = Clock::now() + timeout;
     while (worker_state_.load(std::memory_order_acquire) == State::Running)
     {
         std::size_t frames = 0;
-        const auto result = capture_ ? transfer_capture(frames) : transfer_playback_async(frames);
+        const auto result = is_capture() ? transfer_capture(frames) : transfer_playback_async(frames);
         if (!result)
             return result;
 
@@ -512,9 +624,9 @@ RetCode Backend::run_async() noexcept
     return {};
 }
 
-void Backend::run() noexcept
+void ActiveBackend::run() noexcept
 {
-    auto error = async_ ? run_async() : (capture_ ? run_sync_capture() : run_sync_playback());
+    auto error = async_ ? run_async() : (is_capture() ? run_sync_capture() : run_sync_playback());
     on_stop();
     if (worker_state_.load(std::memory_order_acquire) == State::Stopping)
         error = {};

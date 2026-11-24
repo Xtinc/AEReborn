@@ -29,11 +29,11 @@ struct BackendCalls
 };
 
 /// @brief Scriptable device fixture. Configure its behavior while stopped.
-class TestBackend final : public Backend
+class TestBackend final : public ActiveBackend
 {
   public:
     TestBackend(PortSpec spec, std::size_t frames, BackendCalls *calls = nullptr, bool async = true)
-        : Backend(async), spec_(spec), frames_(frames), calls_(calls)
+        : ActiveBackend(async), spec_(spec), frames_(frames), calls_(calls)
     {
     }
 

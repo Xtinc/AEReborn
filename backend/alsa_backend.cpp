@@ -31,7 +31,7 @@ std::string normalize_device_name(std::string card, unsigned int device)
 } // namespace
 
 AlsaBackend::AlsaBackend(std::string card, unsigned int device, bool use_mmap)
-    : Backend(true), device_(normalize_device_name(std::move(card), device)), use_mmap_(use_mmap)
+    : ActiveBackend(true), device_(normalize_device_name(std::move(card), device)), use_mmap_(use_mmap)
 {
 }
 

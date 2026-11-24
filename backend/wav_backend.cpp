@@ -14,12 +14,12 @@ constexpr auto segment_number_width = std::numeric_limits<std::uint32_t>::digits
 } // namespace
 
 WavCapture::WavCapture(std::string path, bool loop)
-    : Backend(false), path_(std::move(path)), loop_(loop)
+    : ActiveBackend(false), path_(std::move(path)), loop_(loop)
 {
 }
 
 WavCapture::WavCapture(std::string path, Repeat repeats)
-    : Backend(false), path_(std::move(path)), repeats_(repeats.count)
+    : ActiveBackend(false), path_(std::move(path)), repeats_(repeats.count)
 {
 }
 
@@ -79,7 +79,7 @@ WavPlayback::WavPlayback(std::string path, SampleFormat format)
 }
 
 WavPlayback::WavPlayback(std::string path, SampleFormat format, std::chrono::seconds segment_duration)
-    : Backend(false), path_(std::move(path)), format_(format), segment_duration_(segment_duration)
+    : ActiveBackend(false), path_(std::move(path)), format_(format), segment_duration_(segment_duration)
 {
     if (segment_duration_.count() < 0)
         throw Error(ErrorCode::InvalidArg);

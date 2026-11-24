@@ -1,307 +1,48 @@
 
-===== aereborn.md =====
-# AEReborn 错误处理统一与错误码精简改造计划
-
-本计划旨在消除当前代码库中“异常与错误码在同一条控制链上混用、热路径多处冗余错误传递、内部反复 `try/catch` 转错误码”的复杂度，将全库收敛为**两条极简边界、全库零 `try/catch` 胶水、单一异常类型 `aereborn::Error`** 的清晰模型。
-
----
-
-## 1. 核心取舍：两条边界替代混合双轨
-
-综合评估控制面复杂度与 C++14 语言约束（无 `[[nodiscard]]`），最简单的方案是**将 `Backend::bind()` 与 `Backend::start()` 也纳入统一异常控制面**，使全库只剩两条清晰规则：
-
-| 执行边界 | 覆盖范围 | 错误表达方式 | 为什么最简单 |
-| :--- | :--- | :--- | :--- |
-| **控制线程公开接口** | `Engine` 全部控制接口、`Node::prepare`、插件构造与参数接口、`Buffer::resize`、`FrameRing::prepare`、`SincResampler::prepare` / `max_*_frames`、`Backend::bind` / `start` | **统一抛 `aereborn::Error`**（继承 `std::runtime_error`，携带 `ErrorCode`） | 1. 建图、提交、绑定、启动全流程直线书写，彻底消灭 `checked(...)` 与 `Result<T>` 拆包。<br>2. 避免 C++14 忘记检查 `bind()` / `start()` 返回值导致静默吞错。<br>3. `Backend::bind()` 内部与 `SincResampler` / `Buffer` 零阻抗失配，单靠 `ScopeExit` 自动回滚，零 `try/catch`。 |
-| **驱动钩子与异步工作线程** | `Backend` 派生钩子（`on_open`、`on_start`、`on_read`、`on_wait_writable`、`on_write`）、`Backend::frames_in_period`、`Backend::last_error()` | **保留 `RetCode` / `Result<std::size_t>`**（I/O 钩子全部标 `noexcept`） | 1. 驱动直接映射 ALSA `-errno` / WASAPI `HRESULT` / 文件 EOF，无需在驱动层写 `throw`。<br>2. 异常永不跨线程传播；`Backend::bind()` 与 `Backend::start()` 在基类边界通过 `.or_throw()` 一行完成桥接。<br>3. `on_read` / `on_wait_writable` / `on_write` 标记 `noexcept` 后，彻底删除 `backend.cpp` 内全部 `try/catch (...)`。 |
-| **实时渲染、热路径 DSP 与停机清理** | `Node::process` / `reset`、`FrameRing::read` / `write`、`decode_pcm` / `encode_pcm`、`SincResampler::process_tick` / `required_input` / `process`、`Backend::stop` / `unbind` | **`noexcept` 返回裸值或 `void`**（前置条件由 `assert` 守卫） | 零展开开销，删光 `Backend` 热路径中全部不可能触发的重采样错误判断分支。 |
-
----
-
-## 2. `ErrorCode` 命名整理与对称规范
-
-遵循 `CODING_GUIDELINES.md` 的命名约定（最短清晰写法、成对词缀对齐、避免词根重复），删除全库未引用的 `BufferFull`，将错误码精简为 **18 个、5 组**，并修正 3 处不对称或别扭的命名：
-
-| 分组 | 原名称 | 新名称 | 调整说明与语义 |
-| :--- | :--- | :--- | :--- |
-| **成功** | `Ok` | `Ok` | 操作成功 |
-| **参数与边界** | `InvalidArg` | `InvalidArg` | 非法参数（空指针、无效采样率/格式/周期、NaN/Inf、维度不匹配） |
-| | `InvalidPort` | `InvalidPort` | 端口索引越界（与 `InvalidArg` / `InvalidType` 保持 `Invalid*` 前缀对齐） |
-| | `InvalidType` | `InvalidType` | 节点动态类型转换失败 |
-| | `TooLarge` | `TooLarge` | 缓冲容量、帧数、文件长度或矩阵尺寸超出上限 |
-| **状态与并发** | `NotPrepared` | `NotReady` | **改名**：统一覆盖未 `prepare`、未 `commit`、未 `bind` 三种未就绪态，与 `Busy` 形成简洁对偶 |
-| | `Busy` | `Busy` | 状态冲突（运行中禁止修改、时钟线程重入、端点或后端已被占用） |
-| | `BufferFull` | *(删除)* | 全库无任何引用，直接清除 |
-| **图与连接** | `UnknownNode` | `UnknownNode` | 节点不存在或已移除（与 `UnknownConn` 等长对称） |
-| | `UnknownConn` | `UnknownConn` | 连接不存在 |
-| | `DuplicateConn` | `DuplicateConn` | 相同 `(from, to)` 已连接（与 `UnknownConn` 共享 `*Conn` 后缀） |
-| | `InputConnected` | `InputBusy` | **改名**：输入端口已被其他来源占用，消除原名“Connected”偏正向的歧义，并与 `Busy` 风格对齐 |
-| | `Cycle` | `Cycle` | 连接会引入反馈环 |
-| | `FormatMismatch` | `FormatMismatch` | 端口规格、节点替换布局或设备格式/声道不匹配 |
-| **I/O 与设备** | `IoError` | `IoFailed` | **改名**：消除 `ErrorCode::IoError` 中 `Error` 词根重复，与 `DeviceLost` 分词形态一致 |
-| | `DeviceLost` | `DeviceLost` | 音频设备拔出、失联或不存在 |
-| | `EndOfStream` | `EndOfStream` | 有限流正常读至末尾（如非循环 WAV 文件） |
-| | `Cancelled` | `Cancelled` | 阻塞 I/O 被主动 `stop()` 唤醒取消 |
-| | `Timeout` | `Timeout` | 异步设备超出无进展截止时间 |
-
----
-
-## 3. 核心错误原语设计（`core/retcode.h`）
-
-保留 `core/retcode.h` 文件路径以减少头文件变更面，新增 `aereborn::Error` 异常类及 `RetCode::or_throw()` / `Result<T>::value_or_throw()` 桥接方法：
-
-```cpp
-#ifndef AEREBORN_CORE_RETCODE_H
-#define AEREBORN_CORE_RETCODE_H
-
-#include <cassert>
-#include <stdexcept>
-#include <string>
-#include <type_traits>
-#include <utility>
-
-namespace aereborn
-{
-
-enum class ErrorCode
-{
-    Ok = 0,
-
-    // Validation & capacity
-    InvalidArg,
-    InvalidPort,
-    InvalidType,
-    TooLarge,
-
-    // Lifecycle & concurrency
-    NotReady,
-    Busy,
-
-    // Graph topology & format
-    UnknownNode,
-    UnknownConn,
-    DuplicateConn,
-    InputBusy,
-    Cycle,
-    FormatMismatch,
-
-    // External I/O & device status
-    IoFailed,
-    DeviceLost,
-    EndOfStream,
-    Cancelled,
-    Timeout
-};
-
-class Error;
-
-class RetCode
-{
-  public:
-    constexpr RetCode(ErrorCode code = ErrorCode::Ok) noexcept : code_(code) {}
-    constexpr explicit operator bool() const noexcept { return code_ == ErrorCode::Ok; }
-    constexpr ErrorCode code() const noexcept { return code_; }
-
-    friend constexpr bool operator==(RetCode lhs, RetCode rhs) noexcept { return lhs.code_ == rhs.code_; }
-    friend constexpr bool operator!=(RetCode lhs, RetCode rhs) noexcept { return lhs.code_ != rhs.code_; }
-
-    const char *message() const noexcept
-    {
-        switch (code_)
-        {
-        case ErrorCode::Ok:             return "Success";
-        case ErrorCode::InvalidArg:     return "Invalid argument";
-        case ErrorCode::InvalidPort:    return "Port index is out of range";
-        case ErrorCode::InvalidType:    return "Node has a different type";
-        case ErrorCode::TooLarge:       return "Requested capacity exceeds the supported size";
-        case ErrorCode::NotReady:       return "Object is not prepared, committed, or bound";
-        case ErrorCode::Busy:           return "Current execution context or state prevents this operation";
-        case ErrorCode::UnknownNode:    return "Node does not belong to this engine or was removed";
-        case ErrorCode::UnknownConn:    return "Connection does not exist";
-        case ErrorCode::DuplicateConn:  return "These ports are already connected";
-        case ErrorCode::InputBusy:      return "Input already has a source; use a mixer for multiple sources";
-        case ErrorCode::Cycle:          return "Connection would create a feedback cycle";
-        case ErrorCode::FormatMismatch: return "Formats or port layouts do not match";
-        case ErrorCode::IoFailed:       return "I/O operation failed";
-        case ErrorCode::DeviceLost:     return "Audio device is no longer available";
-        case ErrorCode::EndOfStream:    return "End of stream";
-        case ErrorCode::Cancelled:      return "I/O operation was cancelled";
-        case ErrorCode::Timeout:        return "I/O operation timed out";
-        }
-        return "Unknown error code";
-    }
-
-    /// @brief Throw aereborn::Error if this code represents a failure.
-    void or_throw() const;
-
-  private:
-    ErrorCode code_;
-};
-
-/// @brief Unified exception thrown by all control-plane AEReborn APIs.
-class Error : public std::runtime_error
-{
-  public:
-    explicit Error(ErrorCode code) : std::runtime_error(RetCode(code).message()), code_(code) {}
-    Error(ErrorCode code, const char *detail) : std::runtime_error(detail), code_(code) {}
-    Error(ErrorCode code, const std::string &detail) : std::runtime_error(detail), code_(code) {}
-
-    ErrorCode code() const noexcept { return code_; }
-
-  private:
-    ErrorCode code_;
-};
-
-inline void RetCode::or_throw() const
-{
-    if (!*this)
-        throw Error(code_);
-}
-
-/// @brief Status-or-value return type used by non-throwing backend I/O hooks.
-template <class T> class Result
-{
-  public:
-    Result(T value) noexcept(std::is_nothrow_move_constructible<T>::value) : value_(std::move(value)) {}
-    Result(RetCode code) noexcept(std::is_nothrow_default_constructible<T>::value) : ret_code_(code) { assert(!code); }
-    Result(ErrorCode code) noexcept(std::is_nothrow_default_constructible<T>::value) : Result(RetCode(code)) {}
-
-    RetCode ret_code() const noexcept { return ret_code_; }
-    explicit operator bool() const noexcept { return static_cast<bool>(ret_code_); }
-    T &value() & noexcept { assert(ret_code_); return value_; }
-    const T &value() const & noexcept { assert(ret_code_); return value_; }
-    T value() && noexcept(std::is_nothrow_move_constructible<T>::value) { assert(ret_code_); return std::move(value_); }
-
-    T value_or_throw() &&
-    {
-        ret_code_.or_throw();
-        return std::move(value_);
-    }
-
-  private:
-    RetCode ret_code_;
-    T value_{};
-};
-
-} // namespace aereborn
-
-#endif // AEREBORN_CORE_RETCODE_H
-```
-
----
-
-## 4. 逐模块改造清单
-
-### 4.1 `core/`：控制路径全面去 `RetCode` / `Result<T>`
-
-| 文件 | 改造前 | 改造后 | 关键细节 |
-| :--- | :--- | :--- | :--- |
-| **`core/block.h` & `core/types.cpp`** | `RetCode Buffer::resize(...)` | `void Buffer::resize(...)` | 零维度抛 `Error(InvalidArg)`，尺寸溢出抛 `Error(TooLarge)`，与 `std::bad_alloc` 同走异常路径。 |
-| **`core/fring.h`** | `RetCode FrameRing::prepare(...)` | `void FrameRing::prepare(...)` | 容量超限抛 `Error(TooLarge)`，`storage_.resize()` 成功后才更新 `capacity_` 并 `clear()`，保持强异常安全。 |
-| **`core/graph.h`** | `virtual RetCode prepare(BlockPeriod)` | `virtual void prepare(BlockPeriod)` | 自定义节点在 `prepare()` 中原本即可抛异常，统一后消除双轨检查。 |
-| **`core/resampler.h` & `.cpp`** | `prepare` 返 `RetCode`；`max_*_frames`、`required_input`、`process` 返 `Result<...>` | 控制侧：`void prepare(...)`、`std::size_t max_output_frames(...)`、`std::size_t max_input_frames(...)` 抛 `Error`；<br>热路径：`std::size_t required_input(...) const noexcept`、`Transfer process(...) noexcept` 返回裸值 | `prepare` 内部局部构建 `history`/`kernel` 完成后再 `std::move`，失败保留旧状态；热路径 `required_input` / `process` 改用 `assert` 守卫前置条件，与 `decode_pcm` / `encode_pcm` / `process_tick` 保持一致。 |
-| **`core/engine.h` & `.cpp`** | 全部控制接口返回 `RetCode` / `Result<T>`；`period_` 延迟到 `commit()` 校验 | `Engine(BlockPeriod)` 构造即校验 `is_block_period` 并抛 `Error(InvalidArg)`；<br>控制接口直接返回裸值：`NodeId add_node(...)`、`NodeId emplace_node<T>(...)`、`void remove_node(...)`、`void replace_node(...)`、`void set_paused(...)`、`Node *node(...)`、`T *node<T>(...)`、`ConnId connect(...)`、`void disconnect(...)`、`void commit()`、`void start()`、`void stop()`、`void reset()` | 1. `Engine::Graph` 与 `Engine::Runner` 内部同步移除所有 `RetCode`/`Result<T>` 包装。<br>2. `commit()` 先在局部 `Plan` 准备并测算，异常时原 `current_` 计划毫发无损。<br>3. `stop()` 仅在时钟线程重入时抛 `Error(Busy)`，控制线程永不抛；`~Engine()` 由 `Clock` 析构直接 `clock_->stop()` 保持 `noexcept`。 |
-
-### 4.2 `plugins/`：统一抛 `aereborn::Error`，彻底零 `RetCode` / `Result<T>`
-
-| 文件 | 改造内容 |
-| :--- | :--- |
-| **`plugins/convert.h` & `.cpp`** | 构造非法规格改抛 `Error(ErrorCode::InvalidArg, ...)`（替换 `std::invalid_argument`）；`void prepare(BlockPeriod)` 校验失败抛 `Error(InvalidArg)`，局部缓冲准备完毕后再 `std::move` 保持强异常安全。 |
-| **`plugins/endpoint.h` & `.cpp`** | `Capture` / `Playback` 构造非法规格或非正 `io_period` 改抛 `Error(ErrorCode::InvalidArg, ...)`；`void prepare(BlockPeriod)` 按场景抛 `Error(InvalidArg)` / `Error(Busy)` / `Error(TooLarge)`；`process()` 保持 `noexcept`。 |
-| **`plugins/matrix.h` & `.cpp`** | 构造非法参数/非有限系数改抛 `Error(ErrorCode::InvalidArg, ...)`，尺寸超限改抛 `Error(ErrorCode::TooLarge, ...)`（替换 `std::length_error`）；`void set_gain(float)` 在 `!std::isfinite(gain)` 时抛 `Error(InvalidArg)`；`void prepare(BlockPeriod)`；`process()` / `reset()` 保持 `noexcept`。 |
-| **`plugins/mixer.h` & `.cpp`** | 构造改抛 `Error(ErrorCode::InvalidArg, ...)`；`void set_muted(std::size_t, bool)` 与 `bool muted(std::size_t) const` 在索引越界时抛 `Error(ErrorCode::InvalidPort)`（消灭 `Result<bool>`）。 |
-
-### 4.3 `backend/`：统一控制面异常 + `noexcept` I/O 钩子 + 全库零 `try/catch`
-
-| 文件 | 改造内容 |
-| :--- | :--- |
-| **`backend/backend.h` & `.cpp`** | 1. **控制接口统一抛异常**：`void bind(Capture&)`、`void bind(Playback&)`、`void start()` 全部返回 `void`，失败抛 `aereborn::Error`（未就绪抛 `NotReady`，已绑定/被占用/运行中抛 `Busy`，驱动 `on_open()` / `on_start()` 错误经 `.or_throw()` 透传）。<br>2. **`bind_endpoint()` 零 `try/catch`**：调用 `on_open(...).or_throw()`、`frames_in_period(...).value_or_throw()`、`SincResampler::max_*_frames(...)`、`resampler.prepare(...)`、`Buffer::resize(...)`，任何异常由局部 `ScopeExit` 自动执行 `on_close()` 与释放 `backend_bound_`。<br>3. **`start()` 零 `try/catch`**：去掉 `catch (const std::system_error &)`，与 `Engine::start()` 统一；工作线程 `on_start()` 失败时先 `worker_.join()` 再调 `start_result.or_throw()`。<br>4. **I/O 钩子全部 `noexcept`**：将 `on_read(OBBlock) noexcept`、`on_wait_writable() noexcept`、`on_write(IBBlock) noexcept` 标为 `noexcept`，删除 `transfer_capture`、`next_playback_batch`、`transfer_playback` 中全部 **3 处** `try/catch (...)`。<br>5. **热路径去冗余判断**：因 `SincResampler::required_input` 与 `process` 返回裸值，`emit_capture` 简化为 `void noexcept`，`playback_input_frames` 简化为 `std::size_t noexcept`，删去 `transfer_playback`、`transfer`、`run_sync_playback`、`drain_playback` 中全部 **5 处** 冗余错误检查分支。<br>6. 同步替换重命名后的错误码：`NotPrepared -> NotReady`、`IoError -> IoFailed`。 |
-| **`backend/alsa_backend.h` & `.cpp`** | `on_read` / `on_wait_writable` / `on_write` 补齐 `noexcept`；`IoError` 全局替换为 `IoFailed`。 |
-| **`backend/wasapi_backend.h` & `.cpp`** | `on_read` / `on_wait_writable` / `on_write` 补齐 `noexcept`；`IoError` 替换为 `IoFailed`；**顺手修复上轮核对发现的两处细节**：`on_open()` 拷贝前执行 `format_.fill(0)` 防止复绑残留旧字节；`on_read()` 在 `GetBuffer` 返回 `frames == 0` 时直接 `ReleaseBuffer(0)` 返回 `0`，避免 `memcpy` 空指针未定义行为。 |
-| **`backend/wav_backend.h` & `.cpp`** | `on_read` / `on_write` 补齐 `noexcept`（标准库默认 `exceptions()` 掩码为 `goodbit`，不抛异常）；`IoError` 替换为 `IoFailed`。 |
-| **`backend/null_backend.h` & `.cpp`** | `on_read` / `on_write` 补齐 `noexcept`。 |
-
-### 4.4 `examples/clocked_graph.cpp` 简化效果
-
-删除文件顶部的两个 `checked(...)` 包装模板，主流程直接直线书写：
-
-```cpp
-int main()
-{
-    try
-    {
-        std::atomic<float> level{0};
-        Engine engine(BlockPeriod::Ms05);
-        const auto tone   = engine.emplace_node<Tone>(SampleRate::Hz48000, 1);
-        const auto mix    = engine.emplace_node<Mixer>(SampleRate::Hz48000, 1, 1);
-        const auto matrix = engine.emplace_node<Matrix>(SampleRate::Hz48000, 1);
-        const auto sink   = engine.emplace_node<Meter>(level);
-        engine.connect(OPORT(tone, 0), IPORT(mix, 0));
-        engine.connect(OPORT(mix, 0), IPORT(matrix, 0));
-        engine.connect(OPORT(matrix, 0), IPORT(sink, 0));
-        auto *gain = engine.node<Matrix>(matrix);
-        engine.commit();
-        engine.start();
-        // ...
-        gain->set_gain(0.5f);
-        // ...
-        engine.stop();
-    }
-    catch (const std::exception &error)
-    {
-        std::cerr << error.what() << '\n';
-        return 1;
-    }
-}
-```
-
----
-
-## 5. 分阶段实施顺序与验收清单
-
-### 实施步骤
-
-1. **阶段 1：核心原语与内核/插件迁移**
-   * 更新 `core/retcode.h`（整理 18 个 `ErrorCode`、新增 `aereborn::Error`、`RetCode::code()` / `or_throw()`、`Result<T>::value_or_throw()`）。
-   * 改造 `core/block.h`、`core/types.cpp`、`core/fring.h`、`core/graph.h`、`core/resampler.h/.cpp`、`core/engine.h/.cpp`。
-   * 改造 `plugins/convert.*`、`plugins/endpoint.*`、`plugins/matrix.*`、`plugins/mixer.*`（构造统一改抛 `aereborn::Error`）。
-   * 清理 `examples/clocked_graph.cpp`。
-2. **阶段 2：后端控制面统一与 I/O 热路径去 `try/catch`**
-   * 改造 `backend/backend.h/.cpp`（`bind`/`start` 改抛 `Error`，`on_read`/`on_wait_writable`/`on_write` 标 `noexcept`，删除全部 `try/catch` 与 5 处重采样错误检查）。
-   * 同步更新 `alsa_backend.*`、`wasapi_backend.*`（含两处边界修复）、`wav_backend.*`、`null_backend.*`。
-3. **阶段 3：测试迁移与文档收口**
-   * 在测试支撑头中新增极简断言工具 `expect_error(ErrorCode expected, Fn &&fn)`，统一替代原有错误码失败分支检查；正常路径直接去掉所有 `Result` 拆包样板。
-   * 更新 `tests/support/test_backend.h`（I/O 钩子标 `noexcept`，错误码名同步为 `NotReady` / `InputBusy` / `IoFailed`）。
-   * 同步更新 `CODING_GUIDELINES.md` 第 3 节（错误处理准则）、`AudioEngine_Outline.md` 第 7 节（修正异常描述并清理重复跳转句与旧词“周期偏离”）及 `AudioEngine_Backend_Plan.md`。
-
-### 验收清单
-
-| 验收维度 | 验收标准 |
-| :--- | :--- |
-| **错误原语洁净度** | `ErrorCode` 共 18 项，无未使用的 `BufferFull`，完成 `NotReady` / `InputBusy` / `IoFailed` 命名对称化；全库零 `std::invalid_argument` / `std::length_error` 抛出点，控制面全部统一为 `aereborn::Error`。 |
-| **零胶水转换** | `core/`、`plugins/`、`backend/` 源码中 **0 处 `try/catch`**（仅示例 `examples/` 与测试 `tests/` 捕获校验异常）；`Backend` 全部 I/O 钩子均带 `noexcept`。 |
-| **强异常安全与回滚** | `Engine::commit()` 失败保留旧渲染计划；`Convert::prepare()` / `SincResampler::prepare()` 失败保留旧缓冲；`Backend::bind()` 任一步抛异常（含 `on_open` 报错或 `std::bad_alloc`）均自动执行 `on_close()` 并释放端点占用；`Backend::start()` 在 `on_start()` 失败时安全 `join()` 线程并抛出对应 `ErrorCode`。 |
-| **全量回归与实时性** | Debug 与 Release 下全量 CTest 通过；Release `allocation` 用例继续验证图渲染、设备热路径与重启工作区复用的零堆分配。 |
 ===== AudioEngine_Backend_Plan.md =====
 # 设备后端实施说明
 
 ## 层次与设备类型
 
-`core/` 提供块视图、PCM 编解码、重采样器和 SPSC 帧环。`plugins/` 的 Capture 与 Playback 只负责图侧 F32P 队列。`backend/` 的单一 `Backend` 管理设备、I/O 线程、PCM 工作区和漂移控制。`aereborn::backend` 依赖 `aereborn::plugins` 和 `aereborn::core`。
+`core/` 提供块视图、PCM 编解码、重采样器和 SPSC 帧环。`plugins/` 的 Capture 与 Playback 负责图侧 F32P 队列。`Backend` 统一管理端点占用、PCM 转换和平面工作区，并提供多态启停与状态查询。`PassiveBackend` 由调用方驱动，`ActiveBackend` 管理工作线程、设备字节缓冲和异步漂移控制。`aereborn::backend` 依赖 `aereborn::plugins` 和 `aereborn::core`。
 
 `AlsaBackend`、`WasapiBackend` 和 `NullBackend` 根据 `bind(Capture&)` 或 `bind(Playback&)` 选择运行方向。`WavCapture` 和 `WavPlayback` 只接受各自方向。Null 与 WAV 跟随引擎时钟，ALSA 与 WASAPI 服务有独立时钟的设备。测试后端通过真实的绑定和启停流程运行，在测试桩内控制设备批次的就绪时机。
 
+`PushSource` 和 `PullSink` 继承 `PassiveBackend`，分别绑定 `Capture` 和 `Playback`。`UsrPlayback` 继承 `ActiveBackend`，在工作线程交付图侧输出。设备的绑定入口位于 `ActiveBackend`，调用方可用 `Backend&` 统一启停和查询状态。
+
 ## 绑定和启停
 
-- 先准备图端点，再在控制侧调用 `bind()`。同一端点只接受一个后端。绑定时协商 PCM 和帧数并准备工作区。`bind()` 通过 `aereborn::Error` 报告预期失败。打开或准备失败时，作用域清理会调用 `on_close()` 并释放端点占用。`on_close()` 必须能清理部分初始化的资源。标准库分配异常直接传播。
-- `start()` 先回收已自行退出的工作线程，再启动新线程并等待 `on_start()` 的结果。初始化成功后上线端点。初始化失败时回收线程，再将设备错误以 `Error` 抛给调用方。线程创建异常直接传播，绑定可用于重试。
-- `on_open()` 在控制线程接收逻辑端口的 `PortSpec` 和 I/O 周期，通过 `Result<DeviceFormat>` 返回协商后的 PCM 规格和批次上限或设备错误。资源准备异常可以传播。工作线程的启动、读取、等待可写和写入钩子使用 `noexcept`，通过 `RetCode` 或 `Result<std::size_t>` 报告故障。应用通过 `last_error()` 读取运行期终止原因。
-- `stop()` 取消 I/O 或排空同步播放队列，再等待线程退出。`on_cancel()` 由控制侧触发，`on_start()` 和 `on_stop()` 在 I/O 线程上成对执行。正常退出、设备故障和主动取消共用线程收尾流程。
+- 先准备图端点，再在控制侧调用 `bind()`。同一端点只接受一个外部驱动。`Backend` 预占端点，准备完毕后才发布绑定。`bind()` 通过 `aereborn::Error` 报告预期失败。工作线程驱动打开或准备失败时先清空已协商状态，再由 `on_close()` 清理设备资源，最后释放端点占用。标准库分配异常直接传播。
+- `ActiveBackend::start()` 先回收已退出的工作线程，再启动新线程并等待 `on_start()` 的结果。初始化成功后上线端点。初始化失败时回收线程，再以 `Error` 报告设备错误。线程创建异常直接传播，绑定可用于重试。
+- `on_open()` 在控制线程接收逻辑端口的 `PortSpec` 和 I/O 周期，通过 `Result<PortSpec>` 返回协商后的 PCM 规格或设备错误。驱动通过 `set_device_max_frames()` 将批次上限写入工作区，应用可用 `device_max_frames()` 查询。资源准备异常可以传播。工作线程的启动、读取、等待可写和写入钩子使用 `noexcept`，通过 `RetCode` 或 `Result<std::size_t>` 报告故障。应用通过 `last_error()` 读取运行期终止原因。
+- `ActiveBackend::stop()` 取消 I/O 或排空同步播放队列，再等待线程退出。`on_cancel()` 由控制侧触发。`on_start()` 成功后，`on_stop()` 在同一 I/O 线程执行。正常退出、设备故障和主动取消共用线程收尾流程。
 - `stop()` 保留绑定和工作区以便重启。`unbind()` 停机后关闭资源并释放端点。后端必须在端点销毁前解绑，具体驱动的析构函数先调用 `unbind()`。
 
 异步播放、同步播放和同步排空分别控制读取时机，共用重采样、PCM 编码和写入逻辑。异步播放不足一个设备批次时补静音，升采样有时可仅凭 FIR 历史输出。ASRC 根据队列水位调整采样速率，在后端离线时复位。
 
 同步播放停止时关闭图侧写入，写完队列和 FIR 尾部。同步采集遇到 EOF 后冲刷 FIR，让图消费剩余帧，主动停止可取消排空。
+
+## PushSource
+
+构造时指定固定的交错 PCM `PortSpec`，声道数须与 `Capture` 一致。绑定失败时释放端点占用及准备中的工作区。内部切片时长取端点 I/O 周期与 10 ms 的较小值。推入的数据直接解码为 F32P，采样率不同时经过固定比率的 FIR 重采样，再写入图侧队列。推流路径使用绑定时准备的缓冲，输入 PCM 直接从调用方缓冲读取。
+
+`start()` 在调用线程开放图侧读取，无需启动预填充。`stop()` 等待在途队列读取结束，丢弃未消费的帧并复位重采样器。FIR 尾音随复位丢弃。绑定和工作区保留到 `unbind()`，可以直接重启。
+
+`push(IBBlock)` 返回实际接收的输入帧数，短写后从该帧偏移继续推送。有效输入在后端未运行或帧数为零时返回 `0`。启用 FIR 时，每个切片按输出帧数上界预留空间，因此队列尚有空位时也可能返回 `0`。图侧缺帧时补静音，输入间隔不触发 I/O 超时。
+
+同一实例的操作、状态查询和析构由调用方串行执行，例如使用单消费者指令队列。调用方按顺序投递同一流的分片，切换流时先停止接收旧流数据。`IBBlock` 借用的 PCM 缓冲至少保留到对应的 `push()` 返回。
+
+多路输入各自绑定独立 `Capture`，然后连接到 `Mixer` 的不同输入。单声道 `Capture` 接入立体声混音时，可用 `engine.emplace_node<Matrix>(rate, 1, 2, std::initializer_list<float>{1.0f, 1.0f})` 将同一声道送到左右两侧。
+
+## PullSink
+
+`PullSink` 绑定 `Playback`。调用方提供固定规格的交错 PCM 可写缓冲，`pull(OBBlock)` 返回实际写入的输出帧数，未写入的区间保留原样。拉取立即返回可用帧，无需等待图补数据或由后端填静音。跨采样率时按当前 FIR 相位从队列取数据，后续拉取接着上次相位处理。调用方串行执行拉取、查询和生命周期操作。停机时丢弃未拉取的帧并复位重采样器，绑定保留到 `unbind()`。
+
+## UsrPlayback
+
+`UsrPlayback` 绑定 `Playback`，在独立工作线程按固定批次交付交错 PCM。正常批次向下取整为 `采样率 × io_period` 的整帧数。若应用用分数秒配置周期，在创建 `Playback` 时一次性向上取整为微秒，例如 `1/30 s` 转为 `33334 µs`，对应 44.1 kHz 每批 1470 帧、48 kHz 每批 1600 帧。回调由队列就绪驱动，与图 tick 独立。44.1 kHz 下图每 5 ms 交替写入 221、220 帧；端点周期为 5 ms 时回调每批取 220 帧，其余帧留在队列。
+
+回调借用的 `IBBlock` 只在当次调用内有效。回调需返回且不得抛异常，启停和解绑由控制侧串行执行。`stop()` 关闭图侧写入，排空已入队的音频和 FIR 尾部后回收工作线程，排空期间可能交付短包。慢回调可能填满自己的队列并丢弃无法入队的新帧，也会延长停机。其他分支各自消费独立队列。
 
 ## Null 和 WAV
 
@@ -458,8 +199,9 @@ Engine 停止会等待图处理退出。后端停止时唤醒阻塞的异步 I/O
 
 - NetworkSource：会话识别、乱序整理、按播放期限解码/FEC/PLC，再交付音频。NetworkSink：排队、编码、发送。先 PCM，后 Opus；协议独立版本化。
 - WavCapture 在后端线程读文件，可循环播放。WavPlayback 接收同步播放队列，解绑时回填 RIFF/WAVE 文件长度。
-- PushSource：应用显式推入带格式、帧时间和连续性信息的音频，接口报告接收数量或队列满。
-- 回调输出：普通 Sink 接收图内 float，或由 Convert 转换为所需 PCM。后端通过有界队列异步调用用户函数，负责数据所有权、缺口报告和停止屏障。
+- `PushSource`：应用推入固定规格的交错 PCM，接口返回已接收的输入帧数。帧时间和连续性信息由上层流处理。
+- `PullSink`：应用从 `Playback` 拉取固定规格的交错 PCM，返回实际输出帧数。
+- `UsrPlayback`：同步播放后端在工作线程按固定批次回调交错 PCM，停止时排空队列和 FIR 尾部。回调中的块只在当次调用内有效。
 
 ## 6. 混音策略归属
 
@@ -513,7 +255,9 @@ Tone / BUS（48k F32P）
 - `replace_node()` 要求输入、输出的数量及完整规格相同，布局不同时抛出 `Error(FormatMismatch)`。设备格式变化时重新准备设备侧转换。新包长超出原周期预算时，用同端口规格的新节点替换并提交，保留 NodeId 和图连接。逻辑端口规格变化时修改相应连线。
 - `set_paused()` 通过计划移除或恢复节点及相关连接，未改动实例保留状态。暂停导致某个输入失去来源时，该输入得到静音。需要平滑暂停时，先将 Matrix 增益淡出至零，再提交暂停。
 - `Matrix::set_gain()` 和 `Mixer::set_muted()` 使用原子变量，可与 `process()` 并发调用。处理块读取当前设置。控制侧从 `Engine::node()` 借用草稿节点指针，须在节点被移除或替换前结束使用，最长有效期到 Engine 析构。
-- 图提交并准备端点后，用后端的 `bind(endpoint)` 协商 PCM 规格和单包预算 `io_period()`，然后调用 `start()` 等待工作线程完成设备初始化。端点已经被占用时抛出 `Error(Busy)`。绑定失败释放设备资源和占用。启动失败时先回收工作线程，再向控制调用方抛出设备错误。
+- 图提交并准备端点后，`ActiveBackend::bind(endpoint)` 协商 PCM 规格和单包预算 `io_period()`，`start()` 在工作线程上初始化。`ActiveBackend` 和 `PassiveBackend` 共用 `Backend` 的端点占用与 PCM 转换，并可通过 `Backend&` 统一启停与查询。端点已经被占用时抛出 `Error(Busy)`。绑定失败释放资源和占用。设备启动失败时先回收工作线程，再向控制调用方抛出设备错误。
+- `PushSource` 绑定 `Capture`，由应用串行执行 `push(IBBlock)`、控制接口、状态查询和析构。可用单消费者指令队列执行这些操作。PCM 缓冲至少保留到 `push()` 返回。同一流的分片按顺序投递，停止接收旧流数据后再执行停机或重启。`push()` 返回本次接收的输入帧数，后续从该偏移续推。队列空位不足时可能返回零，图侧缺帧时补静音。`stop()` 丢弃未消费的帧并复位重采样器。
+- `PullSink` 同样由应用串行调用，`pull(OBBlock)` 读取 `Playback` 中当前可用的 PCM。`UsrPlayback` 由同步播放工作线程消费 `Playback` 队列。分数秒预算在构造 `Playback` 时一次向上取整为微秒，回调使用固定帧数，交付由数据就绪驱动。
 - `stop()` 下线并复位 DSP 和漂移，保留绑定和已分配工作区。同步播放先关闭图侧写入，写完已排队帧及 FIR 尾部。同步 I/O 钩子须自行完成操作。切换设备时依次调用旧后端的 `unbind()` 和新后端的 `bind(endpoint)`、`start()`。
 - 异步播放补齐设备批次的静音，后端通过 `last_error()` 返回 I/O 终止原因。异步等待和数据交接共用以最后一次 I/O 进展为起点的截止时间。主动停止可唤醒设备等待。测试通过真实的 I/O 工作线程验证设备交接。
 - `Engine::stop()` 唤醒时钟并等待在途图处理退出。先停止绑定的后端，再调用 `Engine::reset()`。在移除、替换端点或销毁 Engine 前解绑其后端。派生驱动析构时先调用 `unbind()`。
@@ -522,7 +266,7 @@ Tone / BUS（48k F32P）
 
 ### 构建与验证
 
-项目使用 C++14。`aereborn::core` 和 `aereborn::backend` 链接 `Threads::Threads`。`aereborn::backend` 是静态库，包含 Null 和 RIFF/WAVE 后端。Linux 在查找到 ALSA 开发库时编译 ALSA 后端并定义 `AEREBORN_HAS_ALSA`，Windows 编译 WASAPI 后端。只构建库可设置 `-DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF`。
+项目使用 C++14。`aereborn::core` 和 `aereborn::backend` 链接 `Threads::Threads`。静态库 `aereborn::backend` 包含 `PushSource`、`PullSink`、`UsrPlayback`、Null 和 RIFF/WAVE 后端。Linux 在查找到 ALSA 开发库时编译 ALSA 后端并定义 `AEREBORN_HAS_ALSA`，Windows 编译 WASAPI 后端。只构建库可设置 `-DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF`。
 
 ~~~powershell
 cmake -S . -B build -DBUILD_TESTING=ON
@@ -532,7 +276,7 @@ cmake --build build --config Release --parallel 4
 ctest --test-dir build -C Release --output-on-failure
 ~~~
 
-测试按 core、runtime、routing、convert、resampling、mix、device、endpoint、drift、tone、allocation、example 分组。引擎测试使用内置时钟，通过测试节点在块边界与测试控制侧同步。混音、格式转换和重采样使用独立字节或数值参照。端点测试覆盖分数帧、队列换包、阻塞停机、错误下线、批次帧数越界、格式重开和模拟漂移。图处理和设备线程的运行期数据通路验证零堆操作，停止后重新启动会重新创建系统线程。
+测试按 core、runtime、routing、convert、resampling、mix、device、endpoint、push_source、pull_sink、usr_playback、drift、tone、allocation、example 分组。引擎测试使用内置时钟，通过测试节点在块边界与测试控制侧同步。混音、格式转换和重采样使用独立字节或数值参照。端点测试覆盖分数帧、队列换包、阻塞停机、错误下线、批次帧数越界、格式重开和模拟漂移。图处理、设备 I/O、推拉和回调交付的运行期数据通路验证零堆操作。带线程的后端在重新启动时创建新的工作线程。
 
 MSVC Debug 的迭代器代理会在 noexcept 构造中分配内存，allocation 用例按项目规则跳过，在 Release 完整执行。示例由默认开启的 BUILD_EXAMPLES 控制。
 
@@ -2788,6 +2532,30 @@ template <class T> class Result
     T value_{};
 };
 
+/// @brief Run a non-throwing cleanup when leaving scope unless dismissed.
+template <class Cleanup> class ScopeExit
+{
+  public:
+    explicit ScopeExit(Cleanup cleanup) noexcept(std::is_nothrow_move_constructible<Cleanup>::value)
+        : cleanup_(std::move(cleanup))
+    {
+    }
+    ScopeExit(const ScopeExit &) = delete;
+    ScopeExit &operator=(const ScopeExit &) = delete;
+
+    ~ScopeExit()
+    {
+        if (active_)
+            cleanup_();
+    }
+
+    void dismiss() noexcept { active_ = false; }
+
+  private:
+    Cleanup cleanup_;
+    bool active_ = true;
+};
+
 } // namespace aereborn
 
 #endif // AEREBORN_CORE_RETCODE_H
@@ -4042,12 +3810,12 @@ std::string normalize_device_name(std::string card, unsigned int device)
 } // namespace
 
 AlsaBackend::AlsaBackend(std::string card, unsigned int device, bool use_mmap)
-    : Backend(true), device_(normalize_device_name(std::move(card), device)), use_mmap_(use_mmap)
+    : ActiveBackend(true), device_(normalize_device_name(std::move(card), device)), use_mmap_(use_mmap)
 {
 }
 
-Result<Backend::DeviceFormat> AlsaBackend::configure_pcm(snd_pcm_t *handle, bool mmap, PortSpec logical,
-                                                         std::chrono::microseconds duration) noexcept
+Result<PortSpec> AlsaBackend::configure_pcm(snd_pcm_t *handle, bool mmap, PortSpec logical,
+                                            std::chrono::microseconds duration) noexcept
 {
     const auto access = mmap ? SND_PCM_ACCESS_MMAP_INTERLEAVED : SND_PCM_ACCESS_RW_INTERLEAVED;
     snd_pcm_hw_params_t *hw;
@@ -4102,11 +3870,11 @@ Result<Backend::DeviceFormat> AlsaBackend::configure_pcm(snd_pcm_t *handle, bool
         return ErrorCode::FormatMismatch;
     if (rc < 0)
         return alsa_error(rc);
-    return DeviceFormat{{rate, logical.channels, format}, std::min<std::size_t>(period, budget.value())};
+    set_device_max_frames(std::min<std::size_t>(period, budget.value()));
+    return PortSpec{rate, logical.channels, format};
 }
 
-Result<Backend::DeviceFormat> AlsaBackend::on_open(bool capture, PortSpec logical,
-                                                   std::chrono::microseconds duration)
+Result<PortSpec> AlsaBackend::on_open(bool capture, PortSpec logical, std::chrono::microseconds duration)
 {
     if (logical.channels > std::numeric_limits<unsigned>::max())
         return ErrorCode::TooLarge;
@@ -4118,16 +3886,16 @@ Result<Backend::DeviceFormat> AlsaBackend::on_open(bool capture, PortSpec logica
     std::unique_ptr<snd_pcm_t, decltype(&snd_pcm_close)> pcm(handle, snd_pcm_close);
 
     auto mmap = use_mmap_;
-    auto device = configure_pcm(handle, mmap, logical, duration);
-    if (mmap && device.ret_code() == ErrorCode::FormatMismatch)
+    auto spec = configure_pcm(handle, mmap, logical, duration);
+    if (mmap && spec.ret_code() == ErrorCode::FormatMismatch)
     {
         mmap = false;
-        device = configure_pcm(handle, mmap, logical, duration);
+        spec = configure_pcm(handle, mmap, logical, duration);
     }
-    if (!device)
-        return device;
+    if (!spec)
+        return spec;
 
-    const auto frames = device.value().max_frames;
+    const auto frames = device_max_frames();
     snd_pcm_sw_params_t *sw;
     snd_pcm_sw_params_alloca(&sw);
     if (snd_pcm_sw_params_current(handle, sw) < 0 || snd_pcm_sw_params_set_avail_min(handle, sw, frames) < 0)
@@ -4158,7 +3926,7 @@ Result<Backend::DeviceFormat> AlsaBackend::on_open(bool capture, PortSpec logica
     poll_ = std::move(descriptors);
     mmap_ = mmap;
     pcm_ = pcm.release();
-    return device;
+    return spec;
 }
 
 RetCode AlsaBackend::on_start() noexcept
@@ -4363,7 +4131,7 @@ namespace aereborn
 /// @note An empty card name or "default" selects the ALSA default PCM. PCM names such as hw: or plug:
 ///       are passed through. A bare card name is expanded to hw:CARD=<card>,DEV=<device>.
 /// @note Prefers MMAP_INTERLEAVED when use_mmap is true and falls back to RW_INTERLEAVED.
-class AlsaBackend final : public Backend
+class AlsaBackend final : public ActiveBackend
 {
   public:
     /// @brief Create an ALSA backend whose direction is selected when it binds.
@@ -4377,7 +4145,7 @@ class AlsaBackend final : public Backend
     }
 
   private:
-    Result<DeviceFormat> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
+    Result<PortSpec> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
     RetCode on_start() noexcept override;
     void on_stop() noexcept override;
     void on_cancel() noexcept override;
@@ -4387,8 +4155,8 @@ class AlsaBackend final : public Backend
     Result<std::size_t> on_wait_writable() noexcept override;
     RetCode on_write(IBBlock input) noexcept override;
 
-    static Result<DeviceFormat> configure_pcm(_snd_pcm *pcm, bool mmap, PortSpec logical,
-                                               std::chrono::microseconds duration) noexcept;
+    Result<PortSpec> configure_pcm(_snd_pcm *pcm, bool mmap, PortSpec logical,
+                                   std::chrono::microseconds duration) noexcept;
     RetCode prepare_stream() noexcept;
     RetCode wait_ready() noexcept;
     RetCode recover(int error) noexcept;
@@ -4409,13 +4177,12 @@ class AlsaBackend final : public Backend
 #include "backend.h"
 
 #include "core/os.h"
+#include "core/retcode.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <type_traits>
-#include <utility>
 
 namespace aereborn
 {
@@ -4428,35 +4195,186 @@ using Microseconds = std::chrono::microseconds;
 
 constexpr double max_asrc_correction = max_clock_drift_ppm / 1000000.0;
 
-template <class Cleanup> class ScopeExit
-{
-  public:
-    explicit ScopeExit(Cleanup cleanup) noexcept : cleanup_(std::move(cleanup))
-    {
-    }
-    ~ScopeExit()
-    {
-        if (active_)
-            cleanup_();
-    }
-    void dismiss() noexcept
-    {
-        active_ = false;
-    }
-
-  private:
-    Cleanup cleanup_;
-    bool active_ = true;
-};
-
 } // namespace
 
 Backend::~Backend()
 {
-    assert(!bound() && "Derived backend must unbind before destruction");
+    assert(!capture_ && !playback_ && "Backend must release its endpoint before destruction");
 }
 
-Result<std::size_t> Backend::frames_in_period(SampleRate rate, Microseconds period) noexcept
+void Backend::claim(Capture &endpoint)
+{
+    claim_endpoint(endpoint, capture_);
+}
+
+void Backend::claim(Playback &endpoint)
+{
+    claim_endpoint(endpoint, playback_);
+}
+
+template <class Endpoint> void Backend::claim_endpoint(Endpoint &endpoint, Endpoint *&slot)
+{
+    if (capture_ || playback_)
+        throw Error(ErrorCode::Busy);
+    if (!endpoint.capacity())
+        throw Error(ErrorCode::NotReady);
+    if (endpoint.backend_bound_.exchange(true, std::memory_order_acq_rel))
+        throw Error(ErrorCode::Busy);
+    slot = &endpoint;
+}
+
+void Backend::validate_channels(std::size_t logical_channels, std::size_t device_channels)
+{
+    if (device_channels != logical_channels)
+        throw Error(ErrorCode::FormatMismatch);
+}
+
+void Backend::prepare(PortSpec logical, SampleRate device_rate, double max_rate_offset)
+{
+    const auto frames = device_max_frames_;
+    const auto capture = is_capture();
+    const auto src_fs = capture ? device_rate : logical.sample_rate;
+    const auto dst_fs = capture ? logical.sample_rate : device_rate;
+    const auto logical_frames = capture ? SincResampler::max_output_frames(src_fs, dst_fs, frames, max_rate_offset)
+                                        : SincResampler::max_input_frames(src_fs, dst_fs, frames, max_rate_offset);
+    if (logical_frames > target_frames())
+        throw Error(ErrorCode::TooLarge);
+
+    resampler_.prepare(logical.channels, src_fs, dst_fs, max_rate_offset);
+    if (resampler_.needs_fir())
+        device_planar_.resize(logical.channels, frames);
+    logical_planar_.resize(logical.channels, logical_frames);
+    logical_frames_ = logical_frames;
+}
+
+void Backend::reset_workspace() noexcept
+{
+    device_spec_ = {};
+    device_max_frames_ = 0;
+    logical_frames_ = 0;
+    resampler_ = {};
+    device_planar_ = {};
+    logical_planar_ = {};
+}
+
+void Backend::release_endpoint() noexcept
+{
+    assert(!bound() && (capture_ || playback_));
+    auto &occupied = capture_ ? capture_->backend_bound_ : playback_->backend_bound_;
+    occupied.store(false, std::memory_order_release);
+    capture_ = nullptr;
+    playback_ = nullptr;
+}
+
+void Backend::release() noexcept
+{
+    reset_workspace();
+    release_endpoint();
+}
+
+void Backend::open_queue(bool prefill) noexcept
+{
+    if (capture_)
+        capture_->open(prefill);
+    else
+        playback_->open(prefill);
+}
+
+void Backend::close_queue() noexcept
+{
+    if (capture_)
+        capture_->close();
+    else
+        playback_->close();
+    resampler_.reset();
+}
+
+void Backend::close_playback_graph() noexcept
+{
+    playback_->close_graph();
+}
+
+PortSpec Backend::logical_spec() const noexcept
+{
+    return capture_ ? capture_->spec() : playback_->spec();
+}
+
+std::chrono::microseconds Backend::endpoint_period() const noexcept
+{
+    return capture_ ? capture_->io_period() : playback_->io_period();
+}
+
+bool Backend::steady() const noexcept
+{
+    return capture_ ? capture_->steady() : playback_->steady();
+}
+
+std::size_t Backend::available() const noexcept
+{
+    return capture_ ? capture_->available() : playback_->available();
+}
+
+std::size_t Backend::target_frames() const noexcept
+{
+    return capture_ ? capture_->target_frames() : playback_->target_frames();
+}
+
+std::size_t Backend::capture_free_frames() const noexcept
+{
+    return capture_->capacity() - capture_->available();
+}
+
+void Backend::decode_to_capture(IBBlock input, double scale) noexcept
+{
+    const auto fir = resampler_.needs_fir();
+    const auto planar = (fir ? device_planar_ : logical_planar_).block(input.frames());
+    decode_pcm(input, planar);
+    if (fir)
+        emit_capture(planar, scale);
+    else
+        capture_->write(planar);
+}
+
+void Backend::flush_capture_tail(std::size_t frames) noexcept
+{
+    const auto input = device_planar_.block(frames);
+    input.clear();
+    emit_capture(input, 1.0);
+}
+
+void Backend::emit_capture(IFBlock input, double scale) noexcept
+{
+    const auto output = logical_block(logical_frames_);
+    const auto result = resampler_.process(input, output, scale);
+    assert(result.consumed == input.frames());
+    capture_->write(output.subblock(0, result.produced));
+}
+
+std::size_t Backend::read_playback(OFBlock output) noexcept
+{
+    // A zero-frame batch must leave the playback prefill gate untouched.
+    return output.frames() ? playback_->read(output) : 0;
+}
+
+OBBlock Backend::encode_from_playback(IFBlock input, OBBlock output, double scale) noexcept
+{
+    auto source = input;
+    if (resampler_.needs_fir())
+    {
+        const auto device = device_planar_.block(output.frames());
+        const auto result = resampler_.process(input, device, scale);
+        assert(result.consumed == input.frames());
+        source = device.subblock(0, result.produced);
+    }
+
+    assert(source.frames() <= output.frames());
+    const OBBlock encoded(output.byte_view().data(), output.spec(), source.frames());
+    if (encoded.frames())
+        encode_pcm(source, encoded);
+    return encoded;
+}
+
+Result<std::size_t> Backend::frames_in_period(SampleRate rate, std::chrono::microseconds period) noexcept
 {
     constexpr std::uint64_t micros_per_second = 1000000;
     const auto hz = static_cast<std::uint32_t>(rate);
@@ -4469,80 +4387,80 @@ Result<std::size_t> Backend::frames_in_period(SampleRate rate, Microseconds peri
     return static_cast<std::size_t>(frames);
 }
 
-void Backend::bind(Capture &endpoint)
+void PassiveBackend::start()
 {
-    bind_endpoint(endpoint, capture_);
-}
-
-void Backend::bind(Playback &endpoint)
-{
-    bind_endpoint(endpoint, playback_);
-}
-
-template <class Endpoint> void Backend::bind_endpoint(Endpoint &endpoint, Endpoint *&slot)
-{
-    if (bound())
-        throw Error(ErrorCode::Busy);
-    if (!endpoint.capacity())
+    if (!bound())
         throw Error(ErrorCode::NotReady);
-    if (endpoint.backend_bound_.exchange(true, std::memory_order_acq_rel))
+    if (running_)
         throw Error(ErrorCode::Busy);
+    open_queue(false);
+    running_ = true;
+}
 
-    const auto cleanup = [&]() noexcept {
+void PassiveBackend::stop() noexcept
+{
+    if (!running_)
+        return;
+    close_queue();
+    running_ = false;
+}
+
+void PassiveBackend::unbind() noexcept
+{
+    if (!bound())
+        return;
+    stop();
+    release();
+}
+
+void ActiveBackend::bind(Capture &endpoint)
+{
+    bind_endpoint(endpoint);
+}
+
+void ActiveBackend::bind(Playback &endpoint)
+{
+    bind_endpoint(endpoint);
+}
+
+template <class Endpoint> void ActiveBackend::bind_endpoint(Endpoint &endpoint)
+{
+    claim(endpoint);
+    const auto cleanup = [this]() noexcept {
+        reset_workspace();
         on_close();
-        endpoint.backend_bound_.store(false, std::memory_order_release);
+        release_endpoint();
     };
     ScopeExit<decltype(cleanup)> rollback(cleanup);
 
-    constexpr bool capture = std::is_same<Endpoint, Capture>::value;
-    Workspace next;
     const auto logical = endpoint.spec();
-    const auto period = endpoint.io_period();
-    next.device = on_open(capture, logical, period).value_or_throw();
-
-    const auto &device = next.device.spec;
-    const auto frames = next.device.max_frames;
-    if (!device.valid() || !is_interleaved_pcm(device.format) || !frames)
+    const auto period = endpoint_period();
+    const auto device = on_open(is_capture(), logical, period).value_or_throw();
+    const auto frames = device_max_frames();
+    if (!valid_pcm_spec(device) || !frames)
         throw Error(ErrorCode::InvalidArg);
-    if (device.channels != logical.channels)
-        throw Error(ErrorCode::FormatMismatch);
+    validate_channels(logical.channels, device.channels);
     if (frames > frames_in_period(device.sample_rate, period).value_or_throw())
         throw Error(ErrorCode::TooLarge);
 
-    const auto src_fs = capture ? device.sample_rate : logical.sample_rate;
-    const auto dst_fs = capture ? logical.sample_rate : device.sample_rate;
-    const auto max_rate_offset = async_ ? max_asrc_correction : 0.0;
-    next.logical_frames = capture ? SincResampler::max_output_frames(src_fs, dst_fs, frames, max_rate_offset)
-                                  : SincResampler::max_input_frames(src_fs, dst_fs, frames, max_rate_offset);
-    if (next.logical_frames > endpoint.target_frames())
-        throw Error(ErrorCode::TooLarge);
-
+    prepare(logical, device.sample_rate, async_ ? max_asrc_correction : 0.0);
     const auto width = sample_bytes(device.format);
-    if (frames > next.device_bytes.max_size() / logical.channels / width)
+    if (frames > device_bytes_.max_size() / device.channels / width)
         throw Error(ErrorCode::TooLarge);
-    next.resampler.prepare(logical.channels, src_fs, dst_fs, max_rate_offset);
-    if (next.resampler.needs_fir())
-        next.device_planar.resize(logical.channels, frames);
-    next.logical_planar.resize(logical.channels, next.logical_frames);
-    next.device_bytes.resize(frames * logical.channels * width);
+    // Allocate the byte buffer last. A failed resize leaves it empty.
+    device_bytes_.resize(frames * device.channels * width);
 
-    workspace_ = std::move(next);
-    slot = &endpoint;
+    complete_binding(device);
     last_error_.store({}, std::memory_order_release);
     rollback.dismiss();
 }
 
-bool Backend::running() const noexcept
+bool ActiveBackend::running() const noexcept
 {
     return worker_state_.load(std::memory_order_acquire) != State::Stopped;
 }
 
-Microseconds Backend::endpoint_period() const noexcept
-{
-    return capture_ ? capture_->io_period() : playback_->io_period();
-}
-
-Milliseconds Backend::io_timeout() const noexcept
+Milliseconds ActiveBackend::io_timeout() const noexcept
 {
     // Ten periods, rounded up to the wait API's millisecond resolution.
     const auto us = endpoint_period().count();
@@ -4550,7 +4468,7 @@ Milliseconds Backend::io_timeout() const noexcept
     return Milliseconds(std::max<std::int64_t>(500, std::min<std::int64_t>(ms, std::numeric_limits<int>::max())));
 }
 
-int Backend::remaining_io_ms() const noexcept
+int ActiveBackend::remaining_io_ms() const noexcept
 {
     const auto remaining = io_deadline_ - Clock::now();
     if (remaining <= Clock::duration::zero())
@@ -4559,7 +4477,7 @@ int Backend::remaining_io_ms() const noexcept
     return static_cast<int>(ms.count() + (ms < remaining));
 }
 
-void Backend::start()
+void ActiveBackend::start()
 {
     if (!bound())
         throw Error(ErrorCode::NotReady);
@@ -4573,15 +4491,12 @@ void Backend::start()
     bool start_done = false;
     worker_ = std::thread([this, &start_result, &start_done]() noexcept {
         if (async_)
-            configure_audio_thread(capture_ ? "ae-capture" : "ae-playback");
+            configure_audio_thread(is_capture() ? "ae-capture" : "ae-playback");
 
         const auto code = on_start();
         if (code)
         {
-            if (capture_)
-                capture_->open(async_);
-            else
-                playback_->open(async_);
+            open_queue(async_);
             worker_state_.store(State::Running, std::memory_order_release);
         }
         {
@@ -4602,13 +4517,15 @@ void Backend::start()
     start_result.or_throw();
 }
 
-void Backend::stop() noexcept
+void ActiveBackend::stop() noexcept
 {
-    if (worker_.joinable())
+    if (!worker_.joinable())
+        return;
+    if (running())
     {
-        const auto drain = !async_ && playback_;
+        const auto drain = !async_ && !is_capture();
         if (drain)
-            playback_->close_graph();
+            close_playback_graph();
 
         bool stopping;
         {
@@ -4623,66 +4540,59 @@ void Backend::stop() noexcept
             if (!drain)
                 on_cancel();
         }
-        worker_.join();
     }
+    worker_.join();
 }
 
-void Backend::unbind() noexcept
+void ActiveBackend::unbind() noexcept
 {
     if (!bound())
         return;
     stop();
     on_close();
-    auto &bound = capture_ ? capture_->backend_bound_ : playback_->backend_bound_;
-    bound.store(false, std::memory_order_release);
-    capture_ = nullptr;
-    playback_ = nullptr;
-    workspace_ = {};
+    std::vector<std::uint8_t>().swap(device_bytes_);
+    release();
 }
 
-void Backend::go_offline(RetCode error) noexcept
+void ActiveBackend::go_offline(RetCode error) noexcept
 {
-    if (capture_)
-        capture_->close();
-    else
-        playback_->close();
-    workspace_.resampler.reset();
+    close_queue();
     asrc_.reset();
     has_input_ = false;
     record_io_error(error);
 }
 
-void Backend::record_io_error(RetCode error) noexcept
+void ActiveBackend::record_io_error(RetCode error) noexcept
 {
     if (!error && error != ErrorCode::Cancelled)
         last_error_.store(error, std::memory_order_release);
 }
 
-Result<std::size_t> Backend::on_read(OBBlock) noexcept
+Result<std::size_t> ActiveBackend::on_read(OBBlock) noexcept
 {
     return ErrorCode::InvalidArg;
 }
 
-RetCode Backend::on_write(IBBlock) noexcept
+RetCode ActiveBackend::on_write(IBBlock) noexcept
 {
     return ErrorCode::InvalidArg;
 }
 
-RetCode Backend::on_write_silence(OBBlock scratch) noexcept
+RetCode ActiveBackend::on_write_silence(OBBlock scratch) noexcept
 {
     const auto bytes = scratch.byte_view();
     std::memset(bytes.data(), 0, bytes.size());
     return on_write(scratch);
 }
 
-void Backend::wait_backpressure() noexcept
+void ActiveBackend::wait_backpressure() noexcept
 {
     const auto wait = std::max(Microseconds(200), std::min(Microseconds(2000), endpoint_period() / 2));
     std::unique_lock<std::mutex> lock(wait_mutex_);
     wait_cv_.wait_for(lock, wait, [this] { return worker_state_.load(std::memory_order_acquire) != State::Running; });
 }
 
-void Backend::ASRC::update(std::size_t queued_before, std::size_t queued_after, std::size_t target_frames,
+void ActiveBackend::ASRC::update(std::size_t queued_before, std::size_t queued_after, std::size_t target_frames,
                            SampleRate logical_rate, std::size_t device_frames, SampleRate device_rate) noexcept
 {
     constexpr double filter_seconds = 0.25;
@@ -4702,20 +4612,12 @@ void Backend::ASRC::update(std::size_t queued_before, std::size_t queued_after, 
     correction = std::max(-max_asrc_correction, std::min(max_asrc_correction, proportional + integral));
 }
 
-OBBlock Backend::device_block(std::size_t frames) noexcept
+OBBlock ActiveBackend::device_block(std::size_t frames) noexcept
 {
-    return {workspace_.device_bytes.data(), workspace_.device.spec, frames};
+    return {device_bytes_.data(), device_spec(), frames};
 }
 
-void Backend::emit_capture(IFBlock input, double scale) noexcept
-{
-    const auto output = workspace_.logical_planar.block(workspace_.logical_frames);
-    const auto result = workspace_.resampler.process(input, output, scale);
-    assert(result.consumed == input.frames());
-    capture_->write(output.subblock(0, result.produced));
-}
-
-RetCode Backend::transfer_capture(std::size_t &device_frames) noexcept
+RetCode ActiveBackend::transfer_capture(std::size_t &device_frames) noexcept
 {
     const auto batch = device_block(device_max_frames());
     const auto read = on_read(batch);
@@ -4728,22 +4630,16 @@ RetCode Backend::transfer_capture(std::size_t &device_frames) noexcept
         return {};
 
     has_input_ = true;
-    const auto steady = async_ && capture_->steady();
-    const auto queued_before = steady ? capture_->available() : 0;
-    const auto fir = workspace_.resampler.needs_fir();
-    const auto planar = (fir ? workspace_.device_planar : workspace_.logical_planar).block(device_frames);
-    decode_pcm(device_block(device_frames), planar);
-    if (fir)
-        emit_capture(planar, asrc_.scale());
-    else
-        capture_->write(planar);
-    if (steady)
-        asrc_.update(queued_before, capture_->available(), capture_->target_frames(), capture_->spec().sample_rate,
+    const auto primed = async_ && steady();
+    const auto queued_before = primed ? available() : 0;
+    decode_to_capture(device_block(device_frames), asrc_.scale());
+    if (primed)
+        asrc_.update(queued_before, available(), target_frames(), logical_spec().sample_rate,
                      device_frames, batch.spec().sample_rate);
     return {};
 }
 
-Result<std::size_t> Backend::next_playback_batch() noexcept
+Result<std::size_t> ActiveBackend::next_playback_batch() noexcept
 {
     const auto batch = on_wait_writable();
     if (!batch)
@@ -4754,26 +4650,15 @@ Result<std::size_t> Backend::next_playback_batch() noexcept
     return batch;
 }
 
-RetCode Backend::emit_playback(IFBlock input, std::size_t device_frames, double scale) noexcept
+RetCode ActiveBackend::emit_playback(IFBlock input, std::size_t device_frames, double scale) noexcept
 {
-    IFBlock output = input;
-    if (workspace_.resampler.needs_fir())
-    {
-        const auto device = workspace_.device_planar.block(device_frames);
-        const auto conversion = workspace_.resampler.process(input, device, scale);
-        assert(conversion.consumed == input.frames());
-        output = device.subblock(0, conversion.produced);
-    }
+    const auto batch = device_block(device_frames);
+    const auto samples = encode_from_playback(input, batch, scale);
+    if (!samples.frames())
+        return async_ ? on_write_silence(batch) : RetCode{};
 
-    const auto produced = output.frames();
-    if (!produced)
-        return async_ ? on_write_silence(device_block(device_frames)) : RetCode{};
-
-    const auto samples = device_block(produced);
-    encode_pcm(output, samples);
-    if (async_ && produced < device_frames)
+    if (async_ && samples.frames() < device_frames)
     {
-        const auto batch = device_block(device_frames);
         const auto bytes = batch.byte_view();
         const auto encoded = samples.byte_view().size();
         std::memset(bytes.data() + encoded, 0, bytes.size() - encoded);
@@ -4782,32 +4667,32 @@ RetCode Backend::emit_playback(IFBlock input, std::size_t device_frames, double 
     return on_write(samples);
 }
 
-RetCode Backend::transfer_playback_async(std::size_t &device_frames) noexcept
+RetCode ActiveBackend::transfer_playback_async(std::size_t &device_frames) noexcept
 {
     const auto batch = next_playback_batch();
     if (!batch)
         return batch.ret_code();
     device_frames = batch.value();
     const auto scale = asrc_.scale();
-    const auto requested = workspace_.resampler.required_input(device_frames, scale);
-    const auto steady = playback_->steady();
-    const auto queued_before = steady ? playback_->available() : 0;
-    const auto logical = workspace_.logical_planar.block(requested);
-    const auto received = requested ? playback_->read(logical) : 0;
-    const auto result = received || (!requested && steady)
+    const auto requested = required_input(device_frames, scale);
+    const auto primed = steady();
+    const auto queued_before = primed ? available() : 0;
+    const auto logical = logical_block(requested);
+    const auto received = read_playback(logical);
+    const auto result = received || (!requested && primed)
                             ? emit_playback(logical.subblock(0, received), device_frames, scale)
                             : on_write_silence(device_block(device_frames));
-    if (result && steady)
-        asrc_.update(queued_before, playback_->available(), playback_->target_frames(), playback_->spec().sample_rate,
-                     device_frames, workspace_.device.spec.sample_rate);
+    if (result && primed)
+        asrc_.update(queued_before, available(), target_frames(), logical_spec().sample_rate,
+                     device_frames, device_spec().sample_rate);
     return result;
 }
 
-RetCode Backend::run_sync_capture() noexcept
+RetCode ActiveBackend::run_sync_capture() noexcept
 {
     while (worker_state_.load(std::memory_order_acquire) == State::Running)
     {
-        if (capture_->capacity() - capture_->available() < workspace_.logical_frames)
+        if (capture_free_frames() < logical_frames())
         {
             wait_backpressure();
             continue;
@@ -4822,20 +4707,17 @@ RetCode Backend::run_sync_capture() noexcept
     return {};
 }
 
-RetCode Backend::drain_capture() noexcept
+RetCode ActiveBackend::drain_capture() noexcept
 {
-    auto tail = has_input_ ? workspace_.resampler.tail_frames() : 0;
+    auto tail = has_input_ ? tail_frames() : 0;
     while (worker_state_.load(std::memory_order_acquire) == State::Running)
     {
-        const auto queued = capture_->available();
-        if (!tail && !queued)
+        if (!tail && !available())
             return ErrorCode::EndOfStream;
-        if (tail && capture_->capacity() - queued >= workspace_.logical_frames)
+        if (tail && capture_free_frames() >= logical_frames())
         {
             const auto frames = std::min(tail, device_max_frames());
-            const auto input = workspace_.device_planar.block(frames);
-            input.clear();
-            emit_capture(input, 1);
+            flush_capture_tail(frames);
             tail -= frames;
         }
         else
@@ -4844,22 +4726,22 @@ RetCode Backend::drain_capture() noexcept
     return {};
 }
 
-RetCode Backend::run_sync_playback() noexcept
+RetCode ActiveBackend::run_sync_playback() noexcept
 {
     while (worker_state_.load(std::memory_order_acquire) == State::Running)
     {
         const auto batch = next_playback_batch();
         if (!batch)
             return batch.ret_code();
-        const auto requested = workspace_.resampler.required_input(batch.value());
+        const auto requested = required_input(batch.value());
 
-        while (worker_state_.load(std::memory_order_acquire) == State::Running && playback_->available() < requested)
+        while (available() < requested && worker_state_.load(std::memory_order_acquire) == State::Running)
             wait_backpressure();
         if (worker_state_.load(std::memory_order_acquire) != State::Running)
             break;
 
-        const auto logical = workspace_.logical_planar.block(requested);
-        const auto received = requested ? playback_->read(logical) : 0;
+        const auto logical = logical_block(requested);
+        const auto received = read_playback(logical);
         assert(received == requested);
         has_input_ |= received != 0;
         const auto result = emit_playback(logical, batch.value(), 1.0);
@@ -4869,23 +4751,23 @@ RetCode Backend::run_sync_playback() noexcept
     return worker_state_.load(std::memory_order_acquire) == State::Draining ? drain_playback() : RetCode{};
 }
 
-RetCode Backend::drain_playback() noexcept
+RetCode ActiveBackend::drain_playback() noexcept
 {
-    auto tail = has_input_ || playback_->available() ? workspace_.resampler.tail_frames() : 0;
+    auto tail = has_input_ || available() ? tail_frames() : 0;
     for (;;)
     {
-        if (!tail && !playback_->available())
+        if (!tail && !available())
         {
             // Upsampling can still have output at the current phase after consuming the last input frame.
-            if (workspace_.resampler.required_input(1))
+            if (required_input(1))
                 return {};
         }
         const auto batch = next_playback_batch();
         if (!batch)
             return batch.ret_code();
-        const auto requested = workspace_.resampler.required_input(batch.value());
-        const auto logical = workspace_.logical_planar.block(requested);
-        const auto received = requested ? playback_->read(logical) : 0;
+        const auto requested = required_input(batch.value());
+        const auto logical = logical_block(requested);
+        const auto received = read_playback(logical);
         const auto padding = std::min(tail, requested - received);
         if (padding)
         {
@@ -4898,14 +4780,14 @@ RetCode Backend::drain_playback() noexcept
     }
 }
 
-RetCode Backend::run_async() noexcept
+RetCode ActiveBackend::run_async() noexcept
 {
     const auto timeout = io_timeout();
     io_deadline_ = Clock::now() + timeout;
     while (worker_state_.load(std::memory_order_acquire) == State::Running)
     {
         std::size_t frames = 0;
-        const auto result = capture_ ? transfer_capture(frames) : transfer_playback_async(frames);
+        const auto result = is_capture() ? transfer_capture(frames) : transfer_playback_async(frames);
         if (!result)
             return result;
 
@@ -4918,9 +4800,9 @@ RetCode Backend::run_async() noexcept
     return {};
 }
 
-void Backend::run() noexcept
+void ActiveBackend::run() noexcept
 {
-    auto error = async_ ? run_async() : (capture_ ? run_sync_capture() : run_sync_playback());
+    auto error = async_ ? run_async() : (is_capture() ? run_sync_capture() : run_sync_playback());
     on_stop();
     if (worker_state_.load(std::memory_order_acquire) == State::Stopping)
         error = {};
@@ -4935,7 +4817,9 @@ void Backend::run() noexcept
 #define AEREBORN_BACKEND_BACKEND_H
 
 #include "core/resampler.h"
+#include "core/retcode.h"
 #include "plugins/endpoint.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -4947,19 +4831,133 @@ void Backend::run() noexcept
 namespace aereborn
 {
 
-/// @brief Common base for interleaved PCM backends bound to a Capture or Playback node.
-/// @note Borrows the bound endpoint; unbind or destroy before removing the node or destroying Engine.
-/// @note Serialize bind(), start(), stop(), unbind(), and destruction on the control side.
-///       Query bound() and device specifications on that side.
-/// @note CRITICAL: Concrete derived destructors MUST call unbind() as their first statement.
+/// @brief Owns endpoint occupation and the PCM workspace for external I/O.
+/// @note Unbind or destroy the backend before removing its endpoint or destroying Engine.
 class Backend
 {
   public:
     virtual ~Backend();
-
     Backend(const Backend &) = delete;
     Backend &operator=(const Backend &) = delete;
 
+    virtual void start() = 0;
+    virtual void stop() noexcept = 0;
+    virtual void unbind() noexcept = 0;
+
+    /// @brief Report whether the endpoint and all working buffers are ready.
+    bool bound() const noexcept { return device_spec_.channels != 0; }
+    virtual bool running() const noexcept = 0;
+    /// @brief Return the runtime I/O status. Passive calls report errors directly.
+    virtual RetCode last_error() const noexcept { return {}; }
+    /// @brief Return the negotiated PCM specification, or an empty specification when unbound.
+    PortSpec device_spec() const noexcept { return device_spec_; }
+    /// @brief Return the device batch limit, including the provisional value set by on_open().
+    std::size_t device_max_frames() const noexcept { return device_max_frames_; }
+
+  protected:
+    Backend() = default;
+
+    void claim(Capture &endpoint);
+    void claim(Playback &endpoint);
+    // The adapter has validated the device rate, channels, and batch size.
+    void prepare(PortSpec logical, SampleRate device_rate, double max_rate_offset);
+    // Publish only after the adapter has prepared all of its resources.
+    void complete_binding(PortSpec device) noexcept { device_spec_ = device; }
+
+    // Keep endpoint occupation through driver rollback, even after clearing the workspace.
+    void reset_workspace() noexcept;
+    void release_endpoint() noexcept;
+    void release() noexcept;
+
+    void open_queue(bool prefill) noexcept;
+    void close_queue() noexcept;
+    void close_playback_graph() noexcept;
+
+    bool is_capture() const noexcept { return capture_ != nullptr; }
+    PortSpec logical_spec() const noexcept;
+    std::chrono::microseconds endpoint_period() const noexcept;
+    void set_device_max_frames(std::size_t frames) noexcept { device_max_frames_ = frames; }
+
+    bool steady() const noexcept;
+    std::size_t available() const noexcept;
+    std::size_t target_frames() const noexcept;
+    std::size_t capture_free_frames() const noexcept;
+    std::size_t logical_frames() const noexcept { return logical_frames_; }
+    bool needs_fir() const noexcept { return resampler_.needs_fir(); }
+    std::size_t tail_frames() const noexcept { return resampler_.tail_frames(); }
+
+    void decode_to_capture(IBBlock input, double scale) noexcept;
+    void flush_capture_tail(std::size_t frames) noexcept;
+
+    std::size_t required_input(std::size_t frames, double scale = 1.0) const noexcept
+    {
+        return resampler_.required_input(frames, scale);
+    }
+    OFBlock logical_block(std::size_t frames) noexcept { return logical_planar_.block(frames); }
+    std::size_t read_playback(OFBlock output) noexcept;
+    OBBlock encode_from_playback(IFBlock input, OBBlock output, double scale) noexcept;
+
+    static constexpr bool valid_pcm_spec(PortSpec spec) noexcept
+    {
+        return is_sample_rate(spec.sample_rate) && spec.channels && is_interleaved_pcm(spec.format);
+    }
+    static Result<std::size_t> frames_in_period(SampleRate rate, std::chrono::microseconds period) noexcept;
+    static void validate_channels(std::size_t logical_channels, std::size_t device_channels);
+
+  private:
+    template <class Endpoint> void claim_endpoint(Endpoint &endpoint, Endpoint *&slot);
+    void emit_capture(IFBlock input, double scale) noexcept;
+
+    Capture *capture_ = nullptr;
+    Playback *playback_ = nullptr;
+    PortSpec device_spec_;
+    std::size_t device_max_frames_ = 0;
+    std::size_t logical_frames_ = 0;
+    SincResampler resampler_;
+    Buffer device_planar_;
+    Buffer logical_planar_;
+};
+
+/// @brief Caller-driven I/O without its own worker thread.
+/// @note Serialize all calls, including queries and destruction, on the calling side.
+class PassiveBackend : public Backend
+{
+  public:
+    void start() final;
+    void stop() noexcept final;
+    void unbind() noexcept final;
+    bool running() const noexcept final { return running_; }
+
+  protected:
+    ~PassiveBackend() override { unbind(); }
+
+    template <class Endpoint> void bind_pcm(Endpoint &endpoint, PortSpec device)
+    {
+        claim(endpoint);
+        const auto cleanup = [this]() noexcept { release(); };
+        ScopeExit<decltype(cleanup)> rollback(cleanup);
+
+        // Bound scratch size and the queue threshold for large endpoints.
+        const auto period = std::min(endpoint_period(), std::chrono::microseconds(10000));
+        set_device_max_frames(frames_in_period(device.sample_rate, period).value_or_throw());
+        const auto logical = endpoint.spec();
+        validate_channels(logical.channels, device.channels);
+        prepare(logical, device.sample_rate, 0.0);
+        complete_binding(device);
+        rollback.dismiss();
+    }
+
+  private:
+    bool running_ = false;
+};
+
+/// @brief Pumps PCM on a worker thread between an endpoint and a device, file, or callback.
+/// @note Serialize binding, lifecycle calls, and destruction on the control side.
+///       Query binding state and device specifications on that side.
+/// @note Derived destructors must call unbind() before destroying resources used by I/O hooks.
+class ActiveBackend : public Backend
+{
+  public:
     /// @brief Open the source via on_open(), prepare DSP buffers, and bind to a prepared Capture node.
     /// @throws Error If the endpoint is unprepared, occupied, or negotiation fails.
     void bind(Capture &endpoint);
@@ -4967,64 +4965,43 @@ class Backend
     /// @throws Error If the endpoint is unprepared, occupied, or negotiation fails.
     void bind(Playback &endpoint);
 
-    /// @brief Launch the I/O thread, wait for on_start() to finish on it, and bring the endpoint online.
+    /// @brief Launch the I/O worker, wait for on_start(), and bring the endpoint online.
     /// @throws Error If unbound, already running, or on_start() reports an error.
     /// @note Thread creation exceptions propagate and leave the backend bound for retry.
-    void start();
-    /// @brief Stop I/O, join the thread, take the endpoint offline, and reset DSP/drift state.
+    void start() final;
+    /// @brief Stop I/O, take the endpoint offline, and reset DSP/drift state.
     /// @note Sync playback closes graph writes and drains queued frames and the FIR tail before stopping.
     /// @note Keeps the endpoint bound and prepared buffers intact for fast restart.
-    void stop() noexcept;
+    void stop() noexcept final;
     /// @brief Stop I/O, release resources via on_close(), reset workspace, and detach the endpoint.
-    void unbind() noexcept;
+    void unbind() noexcept final;
 
-    /// @brief Report whether this backend has an endpoint and a prepared workspace.
-    bool bound() const noexcept { return capture_ != nullptr || playback_ != nullptr; }
-    /// @brief Report whether the worker is active, draining, or stopping.
-    bool running() const noexcept;
-    /// @brief Return the most recently recorded I/O error.
-    RetCode last_error() const noexcept { return last_error_.load(std::memory_order_acquire); }
-    /// @brief Return the negotiated PCM specification, or an empty specification when unbound.
-    PortSpec device_spec() const noexcept { return workspace_.device.spec; }
-    /// @brief Return the negotiated device batch limit, or zero when unbound.
-    std::size_t device_max_frames() const noexcept { return workspace_.device.max_frames; }
+    /// @brief Report whether I/O is running, draining, or stopping.
+    bool running() const noexcept final;
+    RetCode last_error() const noexcept final { return last_error_.load(std::memory_order_acquire); }
 
   protected:
-    struct DeviceFormat
-    {
-        PortSpec spec;
-        std::size_t max_frames = 0;
-    };
-
-    /// @param async True for external-clock hardware (ASRC + PI + timeout); false for graph-clock backends.
-    explicit Backend(bool async) noexcept : async_(async) {}
-
-    /// @brief Report whether the backend is bound to a capture endpoint.
-    /// @pre The backend is bound. Call on the control side or from an I/O hook.
-    bool is_capture() const noexcept { return capture_ != nullptr; }
+    /// @param async True for independent hardware clocks, false for graph-clocked I/O.
+    explicit ActiveBackend(bool async) noexcept : async_(async) {}
 
     /// @brief Publish an I/O failure for last_error().
     /// @pre Call from the worker or during control-side cleanup after it joins.
     void record_io_error(RetCode error) noexcept;
 
-    /// @brief Compute frames contained in one period at the given sample rate.
-    /// @pre The sample rate is valid and the period is positive.
-    static Result<std::size_t> frames_in_period(SampleRate rate, std::chrono::microseconds period) noexcept;
-
     /// @brief Return the rounded-up time left for the current async I/O batch, or zero at its deadline.
     /// @pre Call from an async I/O hook on the worker thread.
     int remaining_io_ms() const noexcept;
 
-    /// @brief Open underlying device/file and report negotiated interleaved PCM format and max batch size.
+    /// @brief Open the device or file and return its negotiated interleaved PCM specification.
+    /// @note Call set_device_max_frames() before returning success.
     /// @note Runs on the control thread. Setup exceptions propagate after on_close() rolls back the open.
-    virtual Result<DeviceFormat> on_open(bool capture, PortSpec logical,
-                                         std::chrono::microseconds target_period) = 0;
+    virtual Result<PortSpec> on_open(bool capture, PortSpec logical, std::chrono::microseconds target_period) = 0;
 
-    /// @brief Start the stream and acquire any thread-affine resources on the I/O worker thread.
+    /// @brief Start the stream and acquire thread-affine resources on the I/O worker.
     /// @note Synchronized with start(); on failure, roll back before returning the error.
     virtual RetCode on_start() noexcept { return {}; }
 
-    /// @brief Stop the stream and release worker-thread resources after a successful on_start().
+    /// @brief Stop the stream and release worker resources after a successful on_start().
     virtual void on_stop() noexcept {}
 
     /// @brief Wake blocked I/O hooks promptly so they return Cancelled. Idempotent and non-blocking.
@@ -5048,16 +5025,6 @@ class Backend
     virtual RetCode on_write_silence(OBBlock scratch) noexcept;
 
   private:
-    struct Workspace
-    {
-        DeviceFormat device;
-        std::size_t logical_frames = 0;
-        SincResampler resampler;
-        Buffer device_planar;  ///< Allocated only when resampler.needs_fir() is true.
-        Buffer logical_planar;
-        std::vector<std::uint8_t> device_bytes;
-    };
-
     struct ASRC
     {
         double filtered_error = 0;
@@ -5072,14 +5039,12 @@ class Backend
 
     enum class State { Stopped, Running, Draining, Stopping };
 
-    template <class Endpoint> void bind_endpoint(Endpoint &endpoint, Endpoint *&slot);
-    std::chrono::microseconds endpoint_period() const noexcept;
+    template <class Endpoint> void bind_endpoint(Endpoint &endpoint);
     std::chrono::milliseconds io_timeout() const noexcept;
     void wait_backpressure() noexcept;
     void go_offline(RetCode error) noexcept;
 
     OBBlock device_block(std::size_t frames) noexcept;
-    void emit_capture(IFBlock input, double scale) noexcept;
     RetCode transfer_capture(std::size_t &device_frames) noexcept;
     Result<std::size_t> next_playback_batch() noexcept;
     RetCode emit_playback(IFBlock input, std::size_t device_frames, double scale) noexcept;
@@ -5093,9 +5058,7 @@ class Backend
     RetCode drain_playback() noexcept;
 
     const bool async_;
-    Capture *capture_ = nullptr;
-    Playback *playback_ = nullptr;
-    Workspace workspace_;
+    std::vector<std::uint8_t> device_bytes_;
     ASRC asrc_;
     std::mutex wait_mutex_;
     std::condition_variable wait_cv_;
@@ -5111,7 +5074,8 @@ class Backend
 #endif
 
 ===== backend/CMakeLists.txt =====
-add_library(aereborn_backend STATIC backend.cpp null_backend.cpp wav_backend.cpp wav_file.cpp)
+add_library(aereborn_backend STATIC
+    backend.cpp null_backend.cpp pull_sink.cpp push_source.cpp usr_playback.cpp wav_backend.cpp wav_file.cpp)
 add_library(aereborn::backend ALIAS aereborn_backend)
 target_link_libraries(aereborn_backend PUBLIC aereborn::plugins PRIVATE Threads::Threads)
 
@@ -5138,19 +5102,20 @@ endif()
 namespace aereborn
 {
 
-NullBackend::NullBackend(SampleFormat format) : Backend(false), format_(format)
+NullBackend::NullBackend(SampleFormat format) : ActiveBackend(false), format_(format)
 {
     if (!is_interleaved_pcm(format_))
         throw Error(ErrorCode::InvalidArg);
 }
 
-Result<Backend::DeviceFormat> NullBackend::on_open(bool, PortSpec logical, std::chrono::microseconds period)
+Result<PortSpec> NullBackend::on_open(bool, PortSpec logical, std::chrono::microseconds period)
 {
     const auto count = frames_in_period(logical.sample_rate, period);
     if (!count)
         return count.ret_code();
     logical.format = format_;
-    return DeviceFormat{logical, count.value()};
+    set_device_max_frames(count.value());
+    return logical;
 }
 
 Result<std::size_t> NullBackend::on_read(OBBlock output) noexcept
@@ -5177,7 +5142,7 @@ namespace aereborn
 {
 
 /// @brief Graph-clocked source of silence or sink that discards PCM frames.
-class NullBackend final : public Backend
+class NullBackend final : public ActiveBackend
 {
   public:
     /// @brief Construct a null backend whose direction is selected at bind time.
@@ -5187,11 +5152,262 @@ class NullBackend final : public Backend
     ~NullBackend() override { unbind(); }
 
   private:
-    Result<DeviceFormat> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
+    Result<PortSpec> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
     Result<std::size_t> on_read(OBBlock output) noexcept override;
     RetCode on_write(IBBlock input) noexcept override;
 
     const SampleFormat format_;
+};
+
+} // namespace aereborn
+
+#endif
+
+===== backend/pull_sink.cpp =====
+#include "pull_sink.h"
+
+#include <algorithm>
+
+namespace aereborn
+{
+
+PullSink::PullSink(PortSpec output_spec) : output_spec_(output_spec)
+{
+    if (!valid_pcm_spec(output_spec_))
+        throw Error(ErrorCode::InvalidArg, "PullSink requires a valid interleaved PCM PortSpec");
+}
+
+void PullSink::bind(Playback &endpoint)
+{
+    bind_pcm(endpoint, output_spec_);
+}
+
+std::size_t PullSink::pull(OBBlock output)
+{
+    if (output.spec() != output_spec_)
+        throw Error(ErrorCode::FormatMismatch, "PullSink output spec mismatch");
+    const auto total_frames = output.frames();
+    if (!total_frames)
+        return 0;
+    auto *bytes = output.byte_view().data();
+    if (!bytes)
+        throw Error(ErrorCode::InvalidArg, "PullSink output data is null");
+    if (!running())
+        return 0;
+
+    const auto frame_bytes = output_spec_.channels * sample_bytes(output_spec_.format);
+    const auto max_frames = device_max_frames();
+    std::size_t produced = 0;
+    while (produced < total_frames)
+    {
+        const auto queued = available();
+        const auto frames = std::min(total_frames - produced, max_frames);
+        const auto requested = required_input(frames);
+        if (queued < requested && (frames == 1 || queued < required_input(1)))
+            break;
+
+        const auto logical = logical_block(std::min(requested, queued));
+        const auto received = read_playback(logical);
+        const OBBlock destination(bytes + produced * frame_bytes, output_spec_, frames);
+        const auto written = encode_from_playback(logical.subblock(0, received), destination, 1.0).frames();
+        produced += written;
+        if (written < frames)
+            break;
+    }
+    return produced;
+}
+
+} // namespace aereborn
+
+===== backend/pull_sink.h =====
+#ifndef AEREBORN_BACKEND_PULL_SINK_H
+#define AEREBORN_BACKEND_PULL_SINK_H
+
+#include "backend.h"
+
+namespace aereborn
+{
+
+/// @brief Caller-driven playback in a fixed interleaved PCM format.
+/// @note Serialize all calls, including queries and destruction, on the calling side.
+class PullSink final : public PassiveBackend
+{
+  public:
+    /// @throws Error InvalidArg if output_spec is invalid or is not interleaved PCM.
+    explicit PullSink(PortSpec output_spec);
+
+    /// @brief Bind to a prepared Playback endpoint and allocate conversion buffers.
+    void bind(Playback &endpoint);
+
+    /// @brief Pull available PCM without waiting for the graph to fill the queue.
+    /// @param output Borrowed writable PCM storage, valid until the call returns.
+    /// @return Output frames written. The unwritten suffix is left intact.
+    /// @throws Error FormatMismatch for a different PortSpec, or InvalidArg for a nonempty null buffer.
+    std::size_t pull(OBBlock output);
+
+  private:
+    const PortSpec output_spec_;
+};
+
+} // namespace aereborn
+
+#endif
+
+===== backend/push_source.cpp =====
+#include "push_source.h"
+
+#include <algorithm>
+
+namespace aereborn
+{
+
+PushSource::PushSource(PortSpec input_spec) : input_spec_(input_spec)
+{
+    if (!valid_pcm_spec(input_spec_))
+        throw Error(ErrorCode::InvalidArg, "PushSource requires a valid interleaved PCM PortSpec");
+}
+
+void PushSource::bind(Capture &endpoint)
+{
+    bind_pcm(endpoint, input_spec_);
+}
+
+std::size_t PushSource::push(IBBlock input)
+{
+    if (input.spec() != input_spec_)
+        throw Error(ErrorCode::FormatMismatch, "PushSource input spec mismatch");
+    const auto total_frames = input.frames();
+    if (!total_frames)
+        return 0;
+    const auto *bytes = input.byte_view().data();
+    if (!bytes)
+        throw Error(ErrorCode::InvalidArg, "PushSource input data is null");
+    if (!running())
+        return 0;
+
+    const auto frame_bytes = input_spec_.channels * sample_bytes(input_spec_.format);
+    const auto max_frames = device_max_frames();
+    const auto fir = needs_fir();
+    // FIR output depends on stream phase. Reserve room for the entire prepared output bound.
+    const auto min_free_frames = fir ? logical_frames() : std::size_t{1};
+
+    std::size_t accepted = 0;
+    while (accepted < total_frames)
+    {
+        const auto free_frames = capture_free_frames();
+        if (free_frames < min_free_frames)
+            break;
+        const auto limit = std::min(total_frames - accepted, max_frames);
+        const auto frames = fir ? limit : std::min(limit, free_frames);
+        decode_to_capture({bytes + accepted * frame_bytes, input_spec_, frames}, 1.0);
+        accepted += frames;
+    }
+    return accepted;
+}
+
+} // namespace aereborn
+
+===== backend/push_source.h =====
+#ifndef AEREBORN_BACKEND_PUSH_SOURCE_H
+#define AEREBORN_BACKEND_PUSH_SOURCE_H
+
+#include "backend.h"
+
+namespace aereborn
+{
+
+/// @brief Caller-driven capture of interleaved PCM into the audio graph.
+/// @note Serialize all calls, including queries and destruction, for each instance on the calling side.
+/// @note Borrows the Capture. Unbind or destroy this source before removing the node or destroying Engine.
+class PushSource final : public PassiveBackend
+{
+  public:
+    /// @throws Error InvalidArg if input_spec is invalid or is not interleaved PCM.
+    explicit PushSource(PortSpec input_spec);
+    /// @brief Prepare DSP buffers and bind to a prepared Capture node.
+    /// @throws Error If already bound, the endpoint is unprepared or occupied, or format validation fails.
+    void bind(Capture &endpoint);
+
+    /// @brief Push interleaved PCM without waiting for queue space.
+    /// @param input Borrowed PCM storage, valid until the call returns.
+    /// @return Input frames accepted. Resume a short write at this frame offset. Zero means no frames were accepted,
+    ///         including when stopped or when the queue has less space than the FIR output bound.
+    /// @throws Error FormatMismatch for a different PortSpec, or InvalidArg for nonzero frames with a null pointer.
+    std::size_t push(IBBlock input);
+
+  private:
+    const PortSpec input_spec_;
+};
+
+} // namespace aereborn
+
+#endif
+
+===== backend/usr_playback.cpp =====
+#include "usr_playback.h"
+
+#include <utility>
+
+namespace aereborn
+{
+
+UsrPlayback::UsrPlayback(PortSpec spec, Callback callback)
+    : ActiveBackend(false), spec_(spec), callback_(std::move(callback))
+{
+    if (!valid_pcm_spec(spec_) || !callback_)
+        throw Error(ErrorCode::InvalidArg, "UsrPlayback requires valid interleaved PCM and a callback");
+}
+
+Result<PortSpec> UsrPlayback::on_open(bool capture, PortSpec, std::chrono::microseconds target_period)
+{
+    if (capture)
+        return ErrorCode::InvalidArg;
+    const auto frames = frames_in_period(spec_.sample_rate, target_period);
+    if (!frames)
+        return frames.ret_code();
+    set_device_max_frames(frames.value());
+    return spec_;
+}
+
+RetCode UsrPlayback::on_write(IBBlock input) noexcept
+{
+    callback_(input);
+    return {};
+}
+
+} // namespace aereborn
+
+===== backend/usr_playback.h =====
+#ifndef AEREBORN_BACKEND_USR_PLAYBACK_H
+#define AEREBORN_BACKEND_USR_PLAYBACK_H
+
+#include "backend.h"
+#include <functional>
+
+namespace aereborn
+{
+
+/// @brief Deliver fixed interleaved PCM batches on a worker thread as graph data becomes available.
+/// @note The callback borrows the block for the duration of the call and must return without throwing.
+/// @note Serialize control operations outside the callback. Stop waits for the callback and drains queued audio.
+class UsrPlayback final : public ActiveBackend
+{
+  public:
+    using Callback = std::function<void(IBBlock)>;
+
+    /// @throws Error InvalidArg if spec is not valid interleaved PCM or callback is empty.
+    UsrPlayback(PortSpec spec, Callback callback);
+    ~UsrPlayback() override { unbind(); }
+
+    using ActiveBackend::bind;
+    void bind(Capture &) = delete;
+
+  private:
+    Result<PortSpec> on_open(bool capture, PortSpec logical, std::chrono::microseconds target_period) override;
+    RetCode on_write(IBBlock input) noexcept override;
+
+    const PortSpec spec_;
+    const Callback callback_;
 };
 
 } // namespace aereborn
@@ -5357,7 +5573,7 @@ Result<UINT32> initialize(IAudioClient &client, const WAVEFORMATEX &format, Wasa
 
 } // namespace
 
-Result<Backend::DeviceFormat> WasapiBackend::on_open(bool capture, PortSpec logical, std::chrono::microseconds period)
+Result<PortSpec> WasapiBackend::on_open(bool capture, PortSpec logical, std::chrono::microseconds period)
 {
     failure_ = {};
     ComApartment com(COINIT_APARTMENTTHREADED);
@@ -5375,7 +5591,7 @@ Result<Backend::DeviceFormat> WasapiBackend::on_open(bool capture, PortSpec logi
         return record_failure(failure_, "IAudioClient::GetMixFormat", rc);
     const std::unique_ptr<WAVEFORMATEX, FreeComBuffer> format(format_ptr);
     const PortSpec spec{static_cast<SampleRate>(format->nSamplesPerSec), format->nChannels, sample_format(*format)};
-    if (!spec.valid() || logical.channels != spec.channels ||
+    if (!valid_pcm_spec(spec) || logical.channels != spec.channels ||
         format->nBlockAlign != spec.channels * sample_bytes(spec.format) ||
         sizeof(*format) + format->cbSize > format_.size())
         return ErrorCode::FormatMismatch;
@@ -5409,7 +5625,8 @@ Result<Backend::DeviceFormat> WasapiBackend::on_open(bool capture, PortSpec logi
     packet_ = std::move(packet);
     ready_ = ready.release();
     cancelled_ = cancelled.release();
-    return DeviceFormat{spec, std::min<std::size_t>(budget.value(), capacity)};
+    set_device_max_frames(std::min<std::size_t>(budget.value(), capacity));
+    return spec;
 }
 
 void WasapiBackend::on_close() noexcept
@@ -5533,20 +5750,30 @@ Result<std::size_t> WasapiBackend::on_read(OBBlock output) noexcept
         }
 
         assert(frames <= capacity_);
-        const auto size = static_cast<std::size_t>(frames) * width;
-        const auto staged = size > dest.size();
-        auto *target = staged ? packet_.data() : dest.data();
+        const auto received = std::min<std::size_t>(frames, output.frames());
+        const auto copied = received * width;
+        const auto remaining = (frames - received) * width;
         if (flags & AUDCLNT_BUFFERFLAGS_SILENT)
-            std::memset(target, 0, size);
+        {
+            std::memset(dest.data(), 0, copied);
+            if (remaining)
+                std::memset(packet_.data(), 0, remaining);
+        }
         else
-            std::memcpy(target, bytes, size);
+        {
+            std::memcpy(dest.data(), bytes, copied);
+            if (remaining)
+                std::memcpy(packet_.data(), bytes + copied, remaining);
+        }
         rc = capture_->ReleaseBuffer(frames);
         if (FAILED(rc))
             return record_failure(failure_, "IAudioCaptureClient::ReleaseBuffer", rc);
-        if (!staged)
-            return frames;
-        packet_offset_ = 0;
-        packet_size_ = size;
+        if (remaining)
+        {
+            packet_offset_ = 0;
+            packet_size_ = remaining;
+        }
+        return received;
     }
 
     const auto size = std::min(dest.size(), packet_size_ - packet_offset_);
@@ -5594,7 +5821,7 @@ RetCode WasapiBackend::write(IAudioRenderClient &render, std::uint32_t frames, V
     return FAILED(rc) ? record_failure(failure_, "IAudioRenderClient::ReleaseBuffer", rc) : RetCode{};
 }
 
-WasapiBackend::WasapiBackend(std::wstring device) : Backend(true), device_(std::move(device))
+WasapiBackend::WasapiBackend(std::wstring device) : ActiveBackend(true), device_(std::move(device))
 {
 }
 
@@ -5620,7 +5847,7 @@ namespace aereborn
 {
 
 /// @brief Event-driven WASAPI backend for a Windows Vista or later SDK target.
-class WasapiBackend final : public Backend
+class WasapiBackend final : public ActiveBackend
 {
   public:
     /// @brief Native failure details. operation is null when no native failure was recorded.
@@ -5640,7 +5867,7 @@ class WasapiBackend final : public Backend
     Failure last_failure() const noexcept { return running() ? Failure{} : failure_; }
 
   private:
-    Result<DeviceFormat> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
+    Result<PortSpec> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
     RetCode on_start() noexcept override;
     void on_stop() noexcept override;
     void on_cancel() noexcept override;
@@ -5689,16 +5916,16 @@ constexpr auto segment_number_width = std::numeric_limits<std::uint32_t>::digits
 } // namespace
 
 WavCapture::WavCapture(std::string path, bool loop)
-    : Backend(false), path_(std::move(path)), loop_(loop)
+    : ActiveBackend(false), path_(std::move(path)), loop_(loop)
 {
 }
 
 WavCapture::WavCapture(std::string path, Repeat repeats)
-    : Backend(false), path_(std::move(path)), repeats_(repeats.count)
+    : ActiveBackend(false), path_(std::move(path)), repeats_(repeats.count)
 {
 }
 
-Result<Backend::DeviceFormat> WavCapture::on_open(bool capture, PortSpec, std::chrono::microseconds period)
+Result<PortSpec> WavCapture::on_open(bool capture, PortSpec, std::chrono::microseconds period)
 {
     if (!capture)
         return ErrorCode::InvalidArg;
@@ -5711,7 +5938,8 @@ Result<Backend::DeviceFormat> WavCapture::on_open(bool capture, PortSpec, std::c
         return count.ret_code();
 
     repeats_left_ = repeats_;
-    return DeviceFormat{spec, count.value()};
+    set_device_max_frames(count.value());
+    return spec;
 }
 
 void WavCapture::on_close() noexcept
@@ -5753,7 +5981,7 @@ WavPlayback::WavPlayback(std::string path, SampleFormat format)
 }
 
 WavPlayback::WavPlayback(std::string path, SampleFormat format, std::chrono::seconds segment_duration)
-    : Backend(false), path_(std::move(path)), format_(format), segment_duration_(segment_duration)
+    : ActiveBackend(false), path_(std::move(path)), format_(format), segment_duration_(segment_duration)
 {
     if (segment_duration_.count() < 0)
         throw Error(ErrorCode::InvalidArg);
@@ -5761,7 +5989,7 @@ WavPlayback::WavPlayback(std::string path, SampleFormat format, std::chrono::sec
         throw Error(ErrorCode::FormatMismatch);
 }
 
-Result<Backend::DeviceFormat> WavPlayback::on_open(bool capture, PortSpec logical, std::chrono::microseconds period)
+Result<PortSpec> WavPlayback::on_open(bool capture, PortSpec logical, std::chrono::microseconds period)
 {
     if (capture)
         return ErrorCode::InvalidArg;
@@ -5799,7 +6027,8 @@ Result<Backend::DeviceFormat> WavPlayback::on_open(bool capture, PortSpec logica
     const auto opened = open_file(logical);
     if (!opened)
         return opened;
-    return DeviceFormat{logical, count.value()};
+    set_device_max_frames(count.value());
+    return logical;
 }
 
 RetCode WavPlayback::on_start() noexcept
@@ -5810,7 +6039,9 @@ RetCode WavPlayback::on_start() noexcept
 
 void WavPlayback::on_stop() noexcept
 {
-    record_io_error(file_.flush());
+    const auto flushed = file_.flush();
+    if (flushed != ErrorCode::NotReady)
+        record_io_error(flushed);
 }
 
 RetCode WavPlayback::open_file(PortSpec spec) noexcept
@@ -5882,7 +6113,7 @@ namespace aereborn
 /// @brief Graph-clocked RIFF/WAVE source. Reports EndOfStream when all passes have been read.
 /// @note Unsigned 8-bit PCM and 64-bit float files are exposed as F32LE.
 /// @note Restart resumes at the next file frame to read. Rebinding opens the file from the beginning.
-class WavCapture final : public Backend
+class WavCapture final : public ActiveBackend
 {
   public:
     /// @brief Number of additional passes after the first one.
@@ -5896,11 +6127,11 @@ class WavCapture final : public Backend
     /// @brief Play once and then repeat the requested number of times.
     explicit WavCapture(std::string path, Repeat repeats);
     ~WavCapture() override { unbind(); }
-    using Backend::bind;
+    using ActiveBackend::bind;
     void bind(Playback &) = delete;
 
   private:
-    Result<DeviceFormat> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
+    Result<PortSpec> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
     void on_close() noexcept override;
     Result<std::size_t> on_read(OBBlock output) noexcept override;
 
@@ -5913,7 +6144,7 @@ class WavCapture final : public Backend
 
 /// @brief Graph-clocked RIFF/WAVE sink supporting S16LE, S24_3LE, S32LE and F32LE.
 /// @note Stop drains and flushes the audio. Unbind and rotation finalize the RIFF and data lengths.
-class WavPlayback final : public Backend
+class WavPlayback final : public ActiveBackend
 {
   public:
     /// @brief Record to one file, truncating its existing contents at bind time.
@@ -5924,11 +6155,11 @@ class WavPlayback final : public Backend
     /// @throws Error If the format is unsupported for WAV output or the duration is negative.
     WavPlayback(std::string path, SampleFormat format, std::chrono::seconds segment_duration);
     ~WavPlayback() override { unbind(); }
-    using Backend::bind;
+    using ActiveBackend::bind;
     void bind(Capture &) = delete;
 
   private:
-    Result<DeviceFormat> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
+    Result<PortSpec> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
     RetCode on_start() noexcept override;
     void on_stop() noexcept override;
     void on_close() noexcept override;

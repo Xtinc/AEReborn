@@ -1,3 +1,6 @@
+#include "backend/pull_sink.h"
+#include "backend/push_source.h"
+#include "backend/usr_playback.h"
 #include "plugins/endpoint.h"
 #include "support/test_backend.h"
 #include "plugins/matrix.h"
@@ -247,7 +250,8 @@ void backend_binding_rollback()
             source.unbind();
             break;
         }
-        check(!source.bound() && !source.device_max_frames() && calls.opens == calls.closes,
+        check(!source.bound() && source.device_spec() == PortSpec{} && !source.device_max_frames() &&
+                  calls.opens == calls.closes,
               "A bind exception closes the device and clears the batch limit");
         replacement.bind(capture);
         replacement.unbind();
@@ -304,6 +308,137 @@ void endpoint_uses_prepared_buffers()
     check(succeeded && allocation_test::heap_calls == 0 && allocation_test::worker_heap_calls.load() == 0,
           "The graph and device worker paths reuse prepared storage across restarts");
 }
+
+void push_uses_prepared_buffers()
+{
+    constexpr auto graph_period = BlockPeriod::Ms02;
+    for (const auto input_rate : {rate, SampleRate::Hz16000})
+    {
+        const PortSpec spec(input_rate, 1, SampleFormat::F32LE);
+        aereborn::Capture capture(rate, 1, std::chrono::milliseconds(2));
+        capture.prepare(graph_period);
+        PushSource source(spec);
+        source.bind(capture);
+        std::array<std::uint8_t, 96 * sizeof(float)> pcm{};
+        const IBBlock input(pcm.data(), spec, source.device_max_frames());
+        std::array<float, 96> samples{};
+        const OBBlock output(reinterpret_cast<std::uint8_t *>(samples.data()), capture.spec(), samples.size());
+
+        for (int restart = 0; restart < 3; ++restart)
+        {
+            bool accepted = true;
+            allocation_test::heap_calls = 0;
+            allocation_test::measure_heap = true;
+            source.start();
+            for (std::uint64_t tick = 0; tick < 16; ++tick)
+            {
+                accepted &= source.push(input) == input.frames();
+                capture.process({graph_period, tick, {}, {&output, 1}});
+            }
+            source.stop();
+            allocation_test::measure_heap = false;
+            check(accepted && allocation_test::heap_calls == 0,
+                  "Pushing, graph reads and restart reuse prepared storage with and without FIR");
+        }
+    }
+}
+
+void push_binding_rollback()
+{
+    const PortSpec pcm(SampleRate::Hz16000, 1, SampleFormat::F32LE);
+    aereborn::Capture capture(rate, 1, std::chrono::milliseconds(5));
+    capture.prepare(BlockPeriod::Ms02);
+    PushSource source(pcm);
+    TestBackend replacement({rate, 1, SampleFormat::F32LE}, 240, nullptr, false);
+
+    for (long failure = 0;; ++failure)
+    {
+        if (!allocation_fails_after(failure, [&] { source.bind(capture); }))
+        {
+            check(failure > 0, "Fault injection reaches the resampling workspace");
+            break;
+        }
+        check(!source.bound() && source.device_spec() == PortSpec{} && !source.device_max_frames(),
+              "A bind exception clears the push source state");
+        replacement.bind(capture);
+        replacement.unbind();
+    }
+}
+
+void pull_binding_rollback()
+{
+    using namespace std::chrono_literals;
+    const PortSpec pcm(SampleRate::Hz16000, 1, SampleFormat::F32LE);
+    aereborn::Playback playback(rate, 1, 5ms);
+    playback.prepare(BlockPeriod::Ms02);
+    PullSink sink(pcm);
+    TestBackend replacement({rate, 1, SampleFormat::F32LE}, 240, nullptr, false);
+
+    for (long failure = 0;; ++failure)
+    {
+        if (!allocation_fails_after(failure, [&] { sink.bind(playback); }))
+        {
+            check(failure > 0, "Fault injection reaches the pull resampling workspace");
+            break;
+        }
+        check(!sink.bound() && sink.device_spec() == PortSpec{} && !sink.device_max_frames(),
+              "A failed pull binding drops all provisional state");
+        replacement.bind(playback);
+        replacement.unbind();
+    }
+}
+
+void output_uses_prepared_buffers()
+{
+    const auto period = BlockPeriod::Ms02;
+    for (const auto output_rate : {rate, SampleRate::Hz16000})
+    {
+        constexpr std::size_t graph_frames = 96;
+        const PortSpec pcm(output_rate, 1, SampleFormat::F32LE);
+        aereborn::Playback playback(rate, 1, std::chrono::milliseconds(2));
+        playback.prepare(period);
+        std::array<float, graph_frames> samples{};
+        const IBBlock input(reinterpret_cast<const std::uint8_t *>(samples.data()), playback.spec(), graph_frames);
+        std::array<std::uint8_t, graph_frames * sizeof(float)> bytes{};
+        const OBBlock output(bytes.data(), pcm, graph_frames);
+
+        PullSink sink(pcm);
+        sink.bind(playback);
+        bool pulled = true;
+        allocation_test::heap_calls = 0;
+        allocation_test::measure_heap = true;
+        sink.start();
+        for (std::uint64_t tick = 0; tick < 8; ++tick)
+        {
+            playback.process({period, tick, {&input, 1}, {}});
+            pulled &= sink.pull(output) != 0;
+        }
+        sink.stop();
+        allocation_test::measure_heap = false;
+        check(pulled && allocation_test::heap_calls == 0, "Pull uses prepared buffers at both rates");
+        sink.unbind();
+
+        std::size_t calls = 0, worker_heap_calls = 0;
+        UsrPlayback callback(pcm, [&](IBBlock) noexcept {
+            if (calls++ == 0)
+            {
+                allocation_test::heap_calls = 0;
+                allocation_test::measure_heap = true;
+            }
+            worker_heap_calls = allocation_test::heap_calls;
+        });
+        callback.bind(playback);
+        callback.start();
+        allocation_test::heap_calls = 0;
+        allocation_test::measure_heap = true;
+        for (std::uint64_t tick = 0; tick < 4; ++tick)
+            playback.process({period, tick, {&input, 1}, {}});
+        allocation_test::measure_heap = false;
+        callback.stop();
+        check(calls > 1 && worker_heap_calls == 0 && allocation_test::heap_calls == 0,
+              "Callback delivery and graph writes use prepared buffers at both rates");
+    }
+}
 } // namespace
 int main(int argc, char **argv)
 {
@@ -314,6 +449,10 @@ int main(int argc, char **argv)
                       {"plan_allocation_rollback", plan_allocation_rollback},
                       {"render_uses_prepared_buffers", render_uses_prepared_buffers},
                       {"backend_binding_rollback", backend_binding_rollback},
-                      {"endpoint_uses_prepared_buffers", endpoint_uses_prepared_buffers}});
+                      {"endpoint_uses_prepared_buffers", endpoint_uses_prepared_buffers},
+                      {"push_uses_prepared_buffers", push_uses_prepared_buffers},
+                      {"push_binding_rollback", push_binding_rollback},
+                      {"pull_binding_rollback", pull_binding_rollback},
+                      {"output_uses_prepared_buffers", output_uses_prepared_buffers}});
 }
 #endif
