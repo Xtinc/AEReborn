@@ -1,60 +1,38 @@
 function(aereborn_test_group group source libraries)
-    set(target aereborn_${group}_tests)
-    add_executable(${target} ${source})
+    get_filename_component(suite "${source}" NAME_WE)
+    set(target aereborn_${group}_${suite})
+    add_executable(${target} ${group}/${source})
     target_link_libraries(${target} PRIVATE ${libraries})
+    if(group STREQUAL "bus" AND suite STREQUAL "wave_tests")
+        target_compile_definitions(${target} PRIVATE AEREBORN_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/data")
+    endif()
     foreach(case IN LISTS ARGN)
         add_test(NAME ${group}.${case} COMMAND ${target} ${case})
-        set_tests_properties(${group}.${case} PROPERTIES LABELS ${group} TIMEOUT 20)
+        set_tests_properties(${group}.${case} PROPERTIES LABELS ${group} TIMEOUT 20 SKIP_RETURN_CODE 77)
     endforeach()
 endfunction()
 
-aereborn_test_group(core engine_graph_tests.cpp aereborn::core
-    audio_block_layout frame_ring engine_timing_validation connection_validation feedback_rejection commit_retry buffer_pool_capacity
-    node_exception_propagation handle_uniqueness node_replacement)
-aereborn_test_group(runtime clocked_engine_tests.cpp aereborn::core
-    plan_switch commit_releases_replaced_node in_flight_commit clock_reentry clock_restart
-    live_graph_edits pause_shared_branch stop_barrier)
-aereborn_test_group(routing graph_routing_tests.cpp "aereborn::plugins;aereborn_test_plugins"
-    explicit_mix_and_fanout algorithm_chain silence_and_pruning shared_silence format_validation channel_split_same_tick)
-aereborn_test_group(convert convert_tests.cpp "aereborn::plugins;aereborn_test_plugins"
-    pcm_formats pcm_to_pcm float_layout bit_preservation unaligned_pcm converter_validation integer_limits empty_blocks
-    fixed_slices stereo_short_fir_output frame_bounds)
-aereborn_test_group(resampling pcm_resampling_tests.cpp aereborn::plugins rate_continuity antialias_filter late_join)
-aereborn_test_group(mix mix_tests.cpp aereborn::plugins
-    matrix_identity_bits matrix_mapping matrix_validation gain_ramp_and_zero mixer_mute empty_block_ramps)
-aereborn_test_group(device io_tests.cpp "aereborn::plugins;aereborn_test_plugins"
-    buffer_binding future_binding binding_period_change topology_format_switch)
+set(bus_libraries aereborn::backend aereborn_test_plugins)
+aereborn_test_group(bus wave_tests.cpp "${bus_libraries}"
+    four_channel_song_archive repeated_tracks_and_segments three_output_specs)
+aereborn_test_group(bus routing_tests.cpp "${bus_libraries}"
+    subgroup_and_monitor parallel_pcm_algorithm live_input_switch)
+aereborn_test_group(bus stream_tests.cpp "${bus_libraries}"
+    slow_callback_parallel_archive irregular_push_and_pull device_loss_and_rebind restart_shared_outputs)
+
+aereborn_test_group(core engine_tests.cpp "aereborn::plugins;aereborn_test_plugins"
+    graph_constraints commit_failure_and_retry clock_boundary_barriers fractional_frames_and_ring_wrap)
+aereborn_test_group(dsp plugin_tests.cpp "aereborn::plugins"
+    pcm_byte_values float_channel_bits matrix_and_mix_contracts fractional_rate_and_antialias)
+aereborn_test_group(io backend_tests.cpp aereborn::backend
+    endpoint_ownership_and_restart device_worker_errors wav_seek_and_padding sample_clock_drift)
 get_target_property(backend_definitions aereborn_backend INTERFACE_COMPILE_DEFINITIONS)
-set(platform_endpoint_tests)
-if("AEREBORN_HAS_ALSA=1" IN_LIST backend_definitions)
-    list(APPEND platform_endpoint_tests alsa_virtual)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-    list(APPEND platform_endpoint_tests wasapi_open_rollback)
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    aereborn_test_group(io platform_tests.cpp "aereborn::backend;ole32;uuid"
+        wasapi_rebind_after_open_error wasapi_capture wasapi_playback)
+    set_property(TEST io.wasapi_capture io.wasapi_playback APPEND PROPERTY LABELS hardware)
+elseif("AEREBORN_HAS_ALSA=1" IN_LIST backend_definitions)
+    aereborn_test_group(io platform_tests.cpp aereborn::backend alsa_interleaved alsa_prefer_mmap)
 endif()
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    list(APPEND platform_endpoint_tests wav_write_errors)
-endif()
-aereborn_test_group(endpoint endpoint_tests.cpp aereborn::backend
-    queue_ranges planar_playback stop_in_flight restart_graph streaming_ranges stream_step_changes
-    offline_capture playback_silence virtual_device_audio lifecycle thread_errors playback_stop sync_playback_restart io_timeout
-    empty_capture_timeout startup_empty_capture_timeout sync_playback_drain sync_capture_eos null_backends
-    wav_round_trip wav_reader wav_file_write wav_segments
-    ${platform_endpoint_tests})
-aereborn_test_group(push_source test_push_source.cpp aereborn::backend
-    lifecycle endpoint_ownership same_rate_stream resampled_stream mix_and_isolation)
-aereborn_test_group(pull_sink test_pull_sink.cpp aereborn::backend
-    lifecycle fixed_pcm resampled_stream clocked_round_trip)
-aereborn_test_group(usr_playback test_usr_playback.cpp aereborn::backend
-    lifecycle fixed_batches fir_drain graph_silence fanout_and_mix)
-aereborn_test_group(drift drift_tests.cpp aereborn::backend small_packet_jitter large_packet_jitter endpoint_integration)
-aereborn_test_group(tone tone_tests.cpp aereborn_test_plugins tone_timeline tone_validation)
-aereborn_test_group(allocation allocation_failure_tests.cpp aereborn::backend
-    buffer_resize_rollback conversion_rollback direct_conversion_needs_no_workspace
-    plan_allocation_rollback render_uses_prepared_buffers backend_binding_rollback endpoint_uses_prepared_buffers
-    push_uses_prepared_buffers push_binding_rollback pull_binding_rollback output_uses_prepared_buffers)
-set_tests_properties(allocation.buffer_resize_rollback allocation.conversion_rollback
-    allocation.direct_conversion_needs_no_workspace allocation.plan_allocation_rollback
-    allocation.render_uses_prepared_buffers allocation.backend_binding_rollback
-    allocation.endpoint_uses_prepared_buffers allocation.push_uses_prepared_buffers allocation.push_binding_rollback
-    allocation.pull_binding_rollback allocation.output_uses_prepared_buffers
-    PROPERTIES SKIP_RETURN_CODE 77)
+aereborn_test_group(regression allocation_tests.cpp aereborn::backend
+    commit_allocation_rollback backend_allocation_rollback render_and_passive_io_without_heap active_workers_without_heap)

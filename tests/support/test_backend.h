@@ -2,12 +2,9 @@
 #define AEREBORN_TESTS_TEST_BACKEND_H
 
 #include "backend/backend.h"
-#include <algorithm>
 #include <condition_variable>
 #include <cstring>
-#include <limits>
 #include <mutex>
-#include <new>
 
 namespace aereborn
 {
@@ -16,9 +13,6 @@ namespace test
 
 struct BackendCalls
 {
-    SampleRate rate{};
-    std::size_t channels = 0;
-    std::chrono::microseconds period{};
     unsigned opens = 0;
     unsigned starts = 0;
     unsigned stops = 0;
@@ -39,19 +33,10 @@ class TestBackend final : public ActiveBackend
 
     ~TestBackend() override { unbind(); }
 
-    Result<PortSpec> on_open(bool, PortSpec logical, std::chrono::microseconds period) override
+    Result<PortSpec> on_open(bool, PortSpec, std::chrono::microseconds) override
     {
         if (calls_)
-        {
-            calls_->rate = logical.sample_rate;
-            calls_->channels = logical.channels;
-            calls_->period = period;
             ++calls_->opens;
-        }
-        if (throw_on_open)
-            throw std::bad_alloc();
-        if (!open_result)
-            return open_result;
         set_device_max_frames(frames_);
         return spec_;
     }
@@ -104,10 +89,10 @@ class TestBackend final : public ActiveBackend
         changed_.notify_all();
     }
 
-    bool wait_for_io(unsigned calls = 1)
+    bool wait_for_io()
     {
         std::unique_lock<std::mutex> lock(mutex_);
-        return changed_.wait_for(lock, std::chrono::seconds(3), [&] { return entered_ >= calls; });
+        return changed_.wait_for(lock, std::chrono::seconds(3), [&] { return entered_ != 0; });
     }
 
     /// @brief Release one batch on a gated async worker and wait for the next gate.
@@ -122,87 +107,55 @@ class TestBackend final : public ActiveBackend
         return entered_ >= next;
     }
 
-    RetCode open_result;
-    bool throw_on_open = false;
     RetCode start_result;
     RetCode io_result;
     std::chrono::microseconds cadence{0};
-    unsigned slow_batch = 0;
-    std::chrono::microseconds slow_delay{0};
     bool gated = false;
     bool block = false;
+    bool empty_capture = false;
     void (*measure_io)(bool) = nullptr;
-    bool pace_write = false;
+    IBBlock input;
+    OBBlock output;
 
     Result<std::size_t> on_read(OBBlock output) noexcept override
     {
-        const auto batch = pace();
-        if (!batch)
-            return batch.ret_code();
-        if (batch.value() >= eof_batch)
-            return ErrorCode::EndOfStream;
-        if (batch.value() < first_data_batch || batch.value() > last_data_batch)
+        const auto status = pace();
+        if (!status)
+            return status;
+        if (empty_capture)
             return std::size_t{0};
-        const auto frames = read_frames == std::numeric_limits<std::size_t>::max()
-                                ? (input.frames() ? input.frames() : output.frames())
-                                : read_frames;
-        if (!frames || frames > output.frames())
-            return frames;
-        const auto width = output.spec().channels * sample_bytes(output.spec().format);
-        auto *bytes = output.byte_view().data();
-        const auto copied = std::min(frames, input.frames()) * width;
-        if (copied)
-            std::memcpy(bytes, input.byte_view().data(), copied);
-        std::memset(bytes + copied, 0, frames * width - copied);
-        return frames;
+        const auto destination = output.byte_view();
+        if (input.frames())
+        {
+            const auto source = input.byte_view();
+            if (source.size() <= destination.size())
+                std::memcpy(destination.data(), source.data(), source.size());
+            return input.frames();
+        }
+        if (!destination.empty())
+            std::memset(destination.data(), 0, destination.size());
+        return output.frames();
     }
-
-    IBBlock input;
-    std::size_t read_frames = std::numeric_limits<std::size_t>::max();
-    unsigned first_data_batch = 1;
-    unsigned eof_batch = std::numeric_limits<unsigned>::max();
-    unsigned last_data_batch = std::numeric_limits<unsigned>::max();
 
     Result<std::size_t> on_wait_writable() noexcept override
     {
-        if (!pace_write)
-        {
-            const auto batch = pace();
-            if (!batch)
-                return batch.ret_code();
-        }
-        return batch_frames == std::numeric_limits<std::size_t>::max() ? device_max_frames() : batch_frames;
+        const auto status = pace();
+        if (!status)
+            return status;
+        return device_max_frames();
     }
 
     RetCode on_write(IBBlock input) noexcept override
     {
-        if (pace_write)
-        {
-            const auto batch = pace();
-            if (!batch)
-                return batch.ret_code();
-        }
-        written = input.frames();
-        if (recorded)
-        {
-            const auto bytes = input.byte_view();
-            if (bytes.size() > recorded->capacity() - recorded->size())
-                return ErrorCode::TooLarge;
-            recorded->insert(recorded->end(), bytes.begin(), bytes.end());
-        }
-        if (output.frames() && input.byte_view().size() <= output.byte_view().size())
-            std::memcpy(output.byte_view().data(), input.byte_view().data(), input.byte_view().size());
-        return write_result;
+        const auto source = input.byte_view();
+        const auto destination = output.byte_view();
+        if (!source.empty() && source.size() <= destination.size())
+            std::memcpy(destination.data(), source.data(), source.size());
+        return {};
     }
 
-    std::vector<std::uint8_t> *recorded = nullptr;
-    OBBlock output;
-    std::size_t batch_frames = std::numeric_limits<std::size_t>::max();
-    std::size_t written = 0;
-    RetCode write_result;
-
   private:
-    Result<unsigned> pace() noexcept
+    RetCode pace() noexcept
     {
         std::unique_lock<std::mutex> lock(mutex_);
         const auto batch = ++entered_;
@@ -212,12 +165,8 @@ class TestBackend final : public ActiveBackend
         else if (block)
             changed_.wait(lock, [&] { return cancelled_; });
         else
-            changed_.wait_for(lock, batch == slow_batch ? slow_delay : cadence, [&] { return cancelled_; });
-        if (cancelled_)
-            return ErrorCode::Cancelled;
-        if (!io_result)
-            return io_result;
-        return batch;
+            changed_.wait_for(lock, cadence, [&] { return cancelled_; });
+        return cancelled_ ? RetCode{ErrorCode::Cancelled} : io_result;
     }
 
     PortSpec spec_;

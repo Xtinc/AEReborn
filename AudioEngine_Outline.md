@@ -35,7 +35,7 @@ Node A 的 OPort ── Connection ──> Node B 的 IPort
 一个 Port 表示一组声道，声道间的选择、复制和合并由 Matrix 表达。
 `NodeId` 标识图中的节点，替换节点实例时 ID 继续有效。`ConnId` 标识一次连接，重新连接相同端口会生成新的 ID。原型采用进程内不复用的唯一 ID。Node 不持有其他 Node 的共享所有权，也不各自维护连接列表或调度循环。
 
-Source、Processor、Mixer、Sink 是具体节点的用途。Convert 负责格式与采样率转换。Mixer、Matrix 和 Tone 使用 planar float，算法节点可以声明自己需要的 PCM 格式。测试使用 Capture、Playback 模拟设备缓冲交接，使用 Tone 生成信号。
+Source、Processor、Mixer、Sink 是具体节点的用途。Convert 负责格式与采样率转换。Mixer、Matrix 和 Tone 使用 planar float，算法节点可以声明自己需要的 PCM 格式。I/O 测试经 Capture、Playback 与实际后端交换音频，也可使用 Tone 生成可预测的信号。
 
 | 用途 | 职责 | 当前实现 |
 | --- | --- | --- |
@@ -199,13 +199,16 @@ cmake --build build --config Debug --parallel 4
 ctest --test-dir build -C Debug --output-on-failure
 cmake --build build --config Release --parallel 4
 ctest --test-dir build -C Release --output-on-failure
+ctest --test-dir build -C Release -L bus --output-on-failure
 ~~~
 
-测试按 core、runtime、routing、convert、resampling、mix、device、endpoint、push_source、pull_sink、usr_playback、drift、tone、allocation、example 分组。引擎测试使用内置时钟，通过测试节点在块边界与测试控制侧同步。混音、格式转换和重采样使用独立字节或数值参照。端点测试覆盖分数帧、队列换包、阻塞停机、错误下线、批次帧数越界、格式重开和模拟漂移。图处理、设备 I/O、推拉和回调交付的运行期数据通路验证零堆操作。带线程的后端在重新启动时创建新的工作线程。
+测试目录和 CTest 标签使用 `core`、`dsp`、`bus`、`io`、`regression`。单独运行四声道场景可使用 `ctest --test-dir build -C Release -R '^bus.four_channel_song_archive$' --output-on-failure`。引擎测试使用内置时钟，通过测试节点在块边界与测试控制侧同步。混音、PCM 转换和重采样使用独立字节或数值参照。
 
-MSVC Debug 的迭代器代理会在 noexcept 构造中分配内存，allocation 用例按项目规则跳过，在 Release 完整执行。示例由默认开启的 BUILD_EXAMPLES 控制。
+`tests/data/` 的两份 48 kHz 双声道 WAV 短片来自《渡口》第 30 秒起的 0.5 秒和 CaliforniaHotel 第 40 秒起的 0.75 秒。四声道测试将两段音乐交错到同一个输入，生成两份 48 kHz 拆分归档和一份 44.1 kHz 混音归档。录音和分段文件在构建目录内创建，正常退出时清理。
 
-设备测试覆盖测试后端、Null、WAV 往返及可用时的 ALSA 虚拟设备。后端生命周期、异步超时和 ALSA 参数见 [设备后端实施说明](AudioEngine_Backend_Plan.md)。
+`io` 包含后端绑定、设备超时、WAV 文件和时钟漂移检查。Linux 有 ALSA 时运行两种 `plug:null` 采集和播放配置。Windows 默认验证 WASAPI 绑定失败和 Null 接管。设置 `AEREBORN_WASAPI_CAPTURE_ID` 或 `AEREBORN_WASAPI_PLAYBACK_ID` 后，可用 `ctest --test-dir build -C Release -L hardware --output-on-failure` 运行对应实机用例。后端生命周期、异步超时和 ALSA 参数见 [设备后端实施说明](AudioEngine_Backend_Plan.md)。
+
+MSVC Debug 的迭代器代理会在 `noexcept` 构造中分配内存，`regression` 中的分配注入和零分配检查在 Release 执行。示例由默认开启的 `BUILD_EXAMPLES` 控制。
 
 ## 8. 实现顺序
 
@@ -217,6 +220,6 @@ MSVC Debug 的迭代器代理会在 noexcept 构造中分配内存，allocation 
 
 各阶段复用同一张图与同一套节点执行机制。
 
-第一步的验收用例包括 `core.audio_block_layout`、`core.commit_retry`、`routing.explicit_mix_and_fanout`、`routing.algorithm_chain`、`routing.silence_and_pruning` 和 `core.feedback_rejection`。路由走实际的 Convert、Mixer 和 Matrix，算法由声明固定 PCM 格式的测试节点提供。
+第一步的验收包括 `core.graph_constraints`、`core.commit_failure_and_retry`、`bus.subgroup_and_monitor` 和 `bus.parallel_pcm_algorithm`。路由走实际的 Convert、Mixer 和 Matrix，算法由声明固定 PCM 格式的测试节点提供。
 
-第二步的验收覆盖 `runtime` 用例、`allocation.render_uses_prepared_buffers` 和 `example.clocked_graph`。
+第二步的验收覆盖 `core.clock_boundary_barriers`、`bus.live_input_switch` 和 `regression.render_and_passive_io_without_heap`。可运行 `clocked_graph` 示例观察运行期间的音量更新。

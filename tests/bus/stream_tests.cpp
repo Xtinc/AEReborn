@@ -1,0 +1,265 @@
+#include "tests/support/io_fixture.h"
+#include "backend/null_backend.h"
+#include "backend/pull_sink.h"
+#include "backend/push_source.h"
+#include "backend/usr_playback.h"
+#include "backend/wav_backend.h"
+#include "plugins/mixer.h"
+#include "tests/support/test_backend.h"
+#include "tests/support/tone.h"
+
+namespace
+{
+using namespace aereborn;
+using namespace aereborn::test;
+using namespace std::chrono_literals;
+
+constexpr std::size_t frames = 240;
+const PortSpec planar(rate, 1, SampleFormat::F32P), pcm(rate, 1, SampleFormat::F32LE);
+
+void slow_callback_parallel_archive()
+{
+    TempWave files("slow-listener");
+    const auto path = files.path();
+    Engine engine(period);
+    ClockedGraph clock(engine);
+    const auto source = engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t frame, std::size_t) {
+        return static_cast<float>(frame) / 8192;
+    });
+    const auto extra = engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return -0.25f; });
+    const auto mix = engine.emplace_node<Mixer>(rate, 1, 2);
+    const auto raw = engine.emplace_node<Playback>(rate, 1, 5ms);
+    const auto live = engine.emplace_node<Playback>(rate, 1, 5ms);
+    const auto archive = engine.emplace_node<Playback>(rate, 1, 5ms);
+    connect(engine, source, raw);
+    connect(engine, source, mix);
+    connect(engine, extra, mix, 1);
+    connect(engine, mix, archive);
+    connect(engine, mix, live);
+    engine.commit();
+    constexpr std::size_t ticks = 16;
+    Pcm raw_pcm(pcm, ticks * frames), live_pcm(pcm, ticks * frames);
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered = false, release = false, fits = true;
+    std::size_t delivered = 0;
+    UsrPlayback callback(pcm, [&](IBBlock block) noexcept {
+        std::unique_lock<std::mutex> lock(mutex);
+        fits &= raw_pcm.copy_from(delivered, block);
+        delivered += block.frames();
+        entered = true;
+        changed.notify_one();
+        changed.wait(lock, [&] { return release; });
+    });
+    const auto unblock = [&]() noexcept {
+        const std::lock_guard<std::mutex> lock(mutex);
+        release = true;
+        changed.notify_one();
+    };
+    ScopeExit<decltype(unblock)> release_on_failure(unblock);
+    PullSink listener(pcm);
+    WavPlayback writer(path, SampleFormat::F32LE);
+    callback.bind(*engine.node<Playback>(raw));
+    listener.bind(*engine.node<Playback>(live));
+    writer.bind(*engine.node<Playback>(archive));
+    callback.start();
+    listener.start();
+    writer.start();
+    clock.start();
+    for (std::size_t tick = 0; tick < ticks; ++tick)
+    {
+        wait_for_playback(writer, frames);
+        clock.advance();
+        if (tick == 0)
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            check(changed.wait_for(lock, 3s, [&] { return entered; }), "The first callback is held");
+        }
+        check(listener.pull(live_pcm.output(tick * frames, frames)) == frames, "The live mix advances during the stall");
+    }
+    const auto queued = QueueState::queued(callback);
+    check(queued == 2 * QueueState::target(callback) && queued < (ticks - 1) * frames,
+          "The blocked callback's queue fills and overflows");
+    unblock();
+    release_on_failure.dismiss();
+    callback.stop();
+    writer.unbind();
+    check(fits && delivered == frames + queued && callback.last_error() == ErrorCode::Ok &&
+              writer.last_error() == ErrorCode::Ok,
+          "The slow branch delivers exactly its first block and the queued prefix");
+    for (std::size_t frame = 0; frame < delivered; ++frame)
+        check(raw_pcm.sample(frame) == static_cast<float>(frame) / 8192, "The retained callback prefix stays in order");
+    for (std::size_t frame = 0; frame < live_pcm.frames; ++frame)
+        check(live_pcm.sample(frame) == static_cast<float>(frame) / 8192 - 0.25f, "The fast mix loses no frames");
+    check(read_wave(path, pcm, live_pcm.frames).bytes == live_pcm.bytes, "The archive matches the continuous live mix");
+}
+
+void irregular_push_and_pull()
+{
+    Engine engine(period);
+    ClockedGraph clock(engine);
+    const auto source = engine.emplace_node<Capture>(rate, 1, 5ms);
+    const auto bias = engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return -0.125f; });
+    const auto mix = engine.emplace_node<Mixer>(rate, 1, 2);
+    const auto listener = engine.emplace_node<Playback>(rate, 1, 5ms);
+    const auto monitor = engine.emplace_node<PacketSink>(planar);
+    connect(engine, source, mix);
+    connect(engine, bias, mix, 1);
+    connect(engine, mix, listener);
+    connect(engine, source, monitor);
+    engine.commit();
+    auto &capture = *engine.node<Capture>(source);
+    const auto *dry = engine.node<PacketSink>(monitor);
+    PushSource push(pcm);
+    PullSink pull(pcm);
+    push.bind(capture);
+    pull.bind(*engine.node<Playback>(listener));
+    push.start();
+    pull.start();
+    clock.start();
+    const auto capacity = QueueState::capture_space(push);
+    const auto ticks = 4 * capacity / frames;
+    Pcm input(pcm, ticks * frames), output(pcm, ticks * frames);
+    for (std::size_t frame = 0; frame < input.frames; ++frame)
+        input.set(frame, 0, static_cast<float>(frame) / 16384);
+
+    const auto initial = push.push(input.input(0, capacity + 37));
+    check(initial == capacity && push.push(input.input(initial, 37)) == 0,
+          "A full queue accepts exactly its remaining capacity");
+    std::size_t pushed = initial, pulled = 0;
+    for (std::size_t tick = 0; tick < ticks; ++tick)
+    {
+        clock.advance();
+        for (std::size_t frame = 0; frame < frames; ++frame)
+            check(dry->sample(frame) == input.sample(tick * frames + frame), "The parallel dry tap keeps input order");
+        for (const auto size : {std::size_t{97}, std::size_t{317}})
+        {
+            const auto count = std::min(size, input.frames - pushed);
+            pushed += push.push(input.input(pushed, count));
+        }
+        // Leave a partial block queued on even ticks, then read across the boundary.
+        const std::size_t count = tick % 2 ? 367 : 113;
+        check(pull.pull(output.output(pulled, count)) == count, "Pull spans the requested blocks");
+        pulled += count;
+    }
+    check(pushed == input.frames && pulled == input.frames, "All partially offered input is delivered");
+    for (std::size_t frame = 0; frame < output.frames; ++frame)
+        check(output.sample(frame) == input.sample(frame) - 0.125f, "The mix retains every frame across ring wrap");
+}
+
+void device_loss_and_rebind()
+{
+    Engine engine(period);
+    ClockedGraph clock(engine);
+    const auto input = engine.emplace_node<Capture>(rate, 1, 5ms);
+    const auto steady = engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t frame, std::size_t) {
+        return static_cast<float>(frame % 19) / 128;
+    });
+    const auto mix = engine.emplace_node<Mixer>(rate, 1, 2);
+    const auto output = engine.emplace_node<Playback>(rate, 1, 5ms);
+    connect(engine, input, mix);
+    connect(engine, steady, mix, 1);
+    connect(engine, mix, output);
+    engine.commit();
+    auto &capture = *engine.node<Capture>(input);
+    Pcm packet(pcm, frames), rendered(pcm, frames);
+    for (std::size_t frame = 0; frame < frames; ++frame)
+        packet.set(frame, 0, 0.25f);
+    TestBackend device(pcm, frames, nullptr, false);
+    device.input = packet.input(0, frames);
+    device.gated = true;
+    NullBackend fallback(SampleFormat::S16LE);
+    PushSource recovered(pcm);
+    PullSink listener(pcm);
+    device.bind(capture);
+    listener.bind(*engine.node<Playback>(output));
+    device.start();
+    listener.start();
+    check(device.wait_for_io() && device.run_batch(), "The device supplies its first live block");
+    clock.start();
+    const auto verify = [&](float contribution) {
+        const auto tick = engine.tick_position();
+        clock.advance();
+        check(listener.pull(rendered.output(0, frames)) == frames, "Master playback continues through failover");
+        for (std::size_t frame = 0; frame < frames; ++frame)
+            check(rendered.sample(frame) == contribution + static_cast<float>((tick * frames + frame) % 19) / 128,
+                  "The healthy branch stays aligned while the device changes");
+    };
+    verify(0.25f);
+    device.io_result = ErrorCode::DeviceLost;
+    check(!device.run_batch(), "The next device transfer ends on loss");
+    wait_for([&] { return !device.running(); }, "The lost device worker stops");
+    check(device.last_error() == ErrorCode::DeviceLost && QueueState::queued(device) == 0,
+          "Loss closes the capture queue");
+    verify(0);
+    device.unbind();
+    fallback.bind(capture);
+    fallback.start();
+    wait_for_capture(fallback, frames);
+    verify(0);
+    fallback.unbind();
+    recovered.bind(capture);
+    recovered.start();
+    check(recovered.push(packet.input(0, frames)) == frames, "The recovered endpoint accepts input");
+    verify(0.25f);
+}
+
+void restart_shared_outputs()
+{
+    Engine engine(period);
+    ClockedGraph clock(engine);
+    const auto input = engine.emplace_node<Capture>(rate, 1, 5ms);
+    const auto tone = engine.emplace_node<Tone>(rate, 1, 1000, 0.125f);
+    const auto mix = engine.emplace_node<Mixer>(rate, 1, 2);
+    const auto pull_node = engine.emplace_node<Playback>(rate, 1, 5ms);
+    const auto null_node = engine.emplace_node<Playback>(rate, 1, 5ms);
+    connect(engine, input, mix);
+    connect(engine, tone, mix, 1);
+    connect(engine, mix, pull_node);
+    connect(engine, mix, null_node);
+    engine.commit();
+    auto &discard = *engine.node<Playback>(null_node);
+    PushSource source(pcm);
+    PullSink listener(pcm);
+    NullBackend sink(SampleFormat::S16LE);
+    source.bind(*engine.node<Capture>(input));
+    listener.bind(*engine.node<Playback>(pull_node));
+    sink.bind(discard);
+    Pcm input_pcm(pcm, 2 * frames), output(pcm, frames);
+    for (const auto level : {0.25f, -0.5f})
+    {
+        for (std::size_t frame = 0; frame < input_pcm.frames; ++frame)
+            input_pcm.set(frame, 0, level);
+        check(source.push(input_pcm.input(0, frames)) == 0 && listener.pull(output.output(0, frames)) == 0,
+              "Stopped handles transfer no frames");
+        source.start();
+        listener.start();
+        sink.start();
+        clock.start();
+        check(engine.tick_position() == 0, "A restarted timeline begins from tick zero");
+        check(source.push(input_pcm.input(0, input_pcm.frames)) == input_pcm.frames, "The input queues two blocks");
+        clock.advance();
+        check(listener.pull(output.output(0, frames)) == frames, "The listener delivers the first fresh block");
+        for (std::size_t frame = 0; frame < frames; ++frame)
+        {
+            const auto expected = level + 0.125 * std::sin(two_pi * 1000 * frame / 48000);
+            check(std::abs(output.sample(frame) - expected) < 1e-6, "The mix starts with new samples and zero tone phase");
+        }
+        wait_for([&] { return QueueState::queued(sink) == 0; }, "Null playback consumes the fresh block");
+        check(sink.running() && sink.last_error() == ErrorCode::Ok, "Null playback remains ready after consuming");
+        source.stop();
+        listener.stop();
+        sink.stop();
+        clock.stop();
+        engine.reset();
+    }
+}
+} // namespace
+
+int main(int argc, char **argv)
+{
+    return aereborn::test::run_tests(argc, argv, {{"slow_callback_parallel_archive", slow_callback_parallel_archive},
+                                                {"irregular_push_and_pull", irregular_push_and_pull},
+                                                {"device_loss_and_rebind", device_loss_and_rebind},
+                                                {"restart_shared_outputs", restart_shared_outputs}});
+}

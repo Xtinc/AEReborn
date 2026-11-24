@@ -1,12 +1,12 @@
 #ifndef AEREBORN_TESTS_AUDIO_FIXTURE_H
 #define AEREBORN_TESTS_AUDIO_FIXTURE_H
 #include "clocked_graph.h"
-#include "io.h"
 #include "pcm_reference.h"
-#include "plugins/convert.h"
 #include "test_harness.h"
 #include <algorithm>
+#include <cassert>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <vector>
 namespace aereborn
@@ -25,10 +25,6 @@ class FloatSource : public NodeT<0, 1>
         : NodeT({}, {PortSpec(rate, channels, SampleFormat::F32P)}), generate_(std::move(generate))
     {
     }
-    void prepare(BlockPeriod) override
-    {
-        ++prepares;
-    }
     void process(const ProcessContext &context) noexcept override
     {
         ++calls;
@@ -38,7 +34,7 @@ class FloatSource : public NodeT<0, 1>
             for (std::size_t frame = 0; frame < output.frames(); ++frame)
                 output.channel(ch)[frame] = generate_(start + frame, ch);
     }
-    std::size_t calls = 0, prepares = 0;
+    std::size_t calls = 0;
 
   private:
     const Generator generate_;
@@ -47,70 +43,34 @@ class FloatSource : public NodeT<0, 1>
 class PacketSink final : public NodeT<1, 0>
 {
   public:
-    explicit PacketSink(PortSpec spec) : NodeT({spec}, {}) {}
+    explicit PacketSink(PortSpec spec) : NodeT({spec}, {}) { assert(spec.format == SampleFormat::F32P); }
     void prepare(BlockPeriod period) override
     {
         const auto spec = inputs()[0];
-        bytes_.resize(spec.max_frames(period) * spec.channels * sample_bytes(spec.format));
+        samples_.resize(spec.max_frames(period) * spec.channels);
     }
     void process(const ProcessContext &context) noexcept override
     {
         const auto input = context.inputs[0];
         frames = input.frames();
-        size_ = input.byte_view().size();
-        address = input.byte_view().data();
-        std::copy(input.byte_view().begin(), input.byte_view().end(), bytes_.begin());
+        const auto bytes = input.byte_view();
+        if (!bytes.empty())
+            std::memcpy(samples_.data(), bytes.data(), bytes.size());
     }
-    View<const std::uint8_t> bytes() const noexcept { return {bytes_.data(), size_}; }
     float sample(std::size_t frame, std::size_t ch = 0) const noexcept
     {
-        const auto spec = inputs()[0];
-        if (spec.format == SampleFormat::F32LE)
-            return read_f32le(bytes_.data() + (frame * spec.channels + ch) * 4);
-        assert(spec.format == SampleFormat::F32P);
-        float value;
-        std::memcpy(&value, bytes_.data() + (ch * frames + frame) * 4, 4);
-        return value;
+        assert(frame < frames && ch < inputs()[0].channels);
+        return samples_[ch * frames + frame];
     }
     std::size_t frames = 0;
-    const void *address = nullptr;
 
   private:
-    std::vector<std::uint8_t> bytes_;
-    std::size_t size_ = 0;
+    std::vector<float> samples_;
 };
 
-struct Conversion
+inline ConnId connect(Engine &engine, NodeId from, NodeId to, std::size_t input = 0)
 {
-    Conversion(PortSpec input, PortSpec output, BlockPeriod period = test::period)
-        : engine(period), clock(engine)
-    {
-        const auto input_id = engine.emplace_node<Capture>(input);
-        const auto convert_id = engine.emplace_node<Convert>(input, output);
-        const auto sink_id = engine.emplace_node<PacketSink>(output);
-        engine.connect(OPORT(input_id, 0), IPORT(convert_id, 0));
-        engine.connect(OPORT(convert_id, 0), IPORT(sink_id, 0));
-        engine.commit();
-        capture = engine.node<Capture>(input_id);
-        sink = engine.node<PacketSink>(sink_id);
-        clock.start();
-    }
-    void run(View<const std::uint8_t> bytes)
-    {
-        capture->bind(bytes, engine.tick_position());
-        clock.advance();
-    }
-    Engine engine;
-    ClockedGraph clock;
-    Capture *capture;
-    PacketSink *sink;
-};
-
-inline std::vector<std::uint8_t> float_bytes(const std::vector<float> &samples)
-{
-    std::vector<std::uint8_t> result(samples.size() * sizeof(float));
-    std::memcpy(result.data(), samples.data(), result.size());
-    return result;
+    return engine.connect(OPORT(from, 0), IPORT(to, input));
 }
 } // namespace test
 } // namespace aereborn
