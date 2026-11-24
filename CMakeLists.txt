@@ -32,6 +32,10 @@ target_link_libraries(aereborn_plugins PUBLIC aereborn::core)
 
 add_subdirectory(backend)
 
+add_library(aereborn_diag STATIC diag/inspect.cpp)
+add_library(aereborn::diag ALIAS aereborn_diag)
+target_link_libraries(aereborn_diag PUBLIC aereborn::backend)
+
 include(CTest)
 option(BUILD_EXAMPLES "Build AEReborn examples" ON)
 

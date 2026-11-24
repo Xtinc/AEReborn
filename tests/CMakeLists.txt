@@ -26,6 +26,7 @@ aereborn_test_group(dsp plugin_tests.cpp "aereborn::plugins"
     pcm_byte_values float_channel_bits matrix_and_mix_contracts fractional_rate_and_antialias)
 aereborn_test_group(io backend_tests.cpp aereborn::backend
     endpoint_ownership_and_restart device_worker_errors wav_seek_and_padding sample_clock_drift)
+aereborn_test_group(io diagnostics_tests.cpp aereborn::diag diagnostic_reports endpoint_diagnostics)
 get_target_property(backend_definitions aereborn_backend INTERFACE_COMPILE_DEFINITIONS)
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     aereborn_test_group(io platform_tests.cpp "aereborn::backend;ole32;uuid"

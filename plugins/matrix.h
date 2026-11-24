@@ -12,6 +12,9 @@ namespace aereborn
 class Matrix final : public NodeT<1, 1>
 {
   public:
+    /// @copydoc Node::type_name
+    const char *type_name() const noexcept override { return "Matrix"; }
+
     /// @brief Construct an identity channel map with a gain applied to each channel.
     /// @param rate Sample rate of both ports.
     /// @param channels Channel count of both ports.

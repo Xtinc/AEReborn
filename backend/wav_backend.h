@@ -14,6 +14,9 @@ namespace aereborn
 class WavCapture final : public ActiveBackend
 {
   public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override { return "WavCapture"; }
+
     /// @brief Number of additional passes after the first one.
     struct Repeat
     {
@@ -45,6 +48,9 @@ class WavCapture final : public ActiveBackend
 class WavPlayback final : public ActiveBackend
 {
   public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override { return "WavPlayback"; }
+
     /// @brief Record to one file, truncating its existing contents at bind time.
     /// @throws Error If the format is unsupported for WAV output.
     explicit WavPlayback(std::string path, SampleFormat format);

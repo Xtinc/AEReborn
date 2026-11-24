@@ -11,6 +11,9 @@ namespace aereborn
 class Mixer final : public Node
 {
   public:
+    /// @copydoc Node::type_name
+    const char *type_name() const noexcept override { return "Mixer"; }
+
     /// @brief Construct a mixer with all inputs unmuted.
     /// @param rate Sample rate of every port.
     /// @param channels Channel count of every port.

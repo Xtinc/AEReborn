@@ -269,6 +269,14 @@ struct OPort
     }
 };
 
+/// @brief Directed connection in a committed render plan.
+struct Connection
+{
+    ConnId id;
+    OPort from;
+    IPort to;
+};
+
 /// @brief Timing and port blocks passed to a node for one process call.
 /// @note The port block views and their buffers are borrowed for the duration of that call.
 struct ProcessContext

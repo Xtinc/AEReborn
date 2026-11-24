@@ -80,6 +80,10 @@ void commit_failure_and_retry()
     const auto sink = engine.emplace_node<PacketSink>(mono);
     const auto direct = connect(engine, source, sink);
     engine.commit();
+    const auto original_generation = engine.plan_generation();
+    engine.commit();
+    check(engine.plan_generation() == original_generation && !engine.dirty(),
+          "An unchanged commit retains the active plan generation");
     auto *result = engine.node<PacketSink>(sink);
     clock.start();
     clock.advance();
@@ -90,6 +94,10 @@ void commit_failure_and_retry()
     connect(engine, source, inserted);
     connect(engine, inserted, sink);
     expect_error(ErrorCode::IoFailed, [&] { engine.commit(); });
+    const auto old_connections = engine.plan_connections();
+    check(old_connections.size() == 1 && old_connections[0].id == direct &&
+              engine.plan_generation() == original_generation && engine.dirty(),
+          "A failed commit preserves the published connections and generation");
     clock.advance();
     check(result->sample(1) == 0.125f && processor->calls == 0, "Failed preparation leaves the old plan live");
     processor->fail = false;
@@ -108,6 +116,15 @@ void commit_failure_and_retry()
     clock.stop();
     engine.reset();
     check(engine.tick_position() == 0 && processor->resets == 1, "Reset restarts graph time and node state");
+    auto replacement = std::make_unique<PreparingGain>();
+    replacement->fail = false;
+    const auto *new_processor = replacement.get();
+    engine.replace_node(inserted, std::move(replacement));
+    check(engine.plan_node(inserted) == processor, "The active plan keeps the old instance through a draft replacement");
+    const auto generation_before_replace = engine.plan_generation();
+    engine.commit();
+    check(engine.plan_node(inserted) == new_processor && engine.plan_generation() == generation_before_replace + 1,
+          "Publication changes the borrowed instance and generation together");
 }
 
 class InFlightSink final : public NodeT<1, 0>

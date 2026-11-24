@@ -37,6 +37,36 @@ class Capture final : public NodeT<0, 1>
     /// @brief Return the fixed F32P output specification.
     PortSpec spec() const noexcept { return outputs()[0]; }
 
+    /// @copydoc Node::type_name
+    const char *type_name() const noexcept override { return "Capture"; }
+
+    /// @brief Report whether a backend has claimed this endpoint.
+    bool bound() const noexcept { return backend_bound_.load(std::memory_order_acquire); }
+
+    /// @brief Report whether the graph gate is open.
+    bool online() const noexcept;
+
+    /// @brief Report whether the queue has released or bypassed its startup prefill gate.
+    bool steady() const noexcept { return primed_.load(std::memory_order_acquire); }
+
+    /// @brief Return the external batch duration budget used to size the queue.
+    std::chrono::microseconds io_period() const noexcept { return io_period_; }
+
+    /// @brief Return the queue capacity in frames, or zero before preparation.
+    /// @pre Serialize with prepare().
+    std::size_t capacity() const noexcept { return ring_.capacity(); }
+
+    /// @brief Sample queue occupancy without blocking the graph or I/O.
+    /// @return False if a usable estimate is unavailable.
+    /// @pre Serialize with prepare().
+    bool estimate_queued_frames(std::size_t &frames) const noexcept { return ring_.estimate(frames); }
+
+    /// @brief Count missing output frames on the graph side since open or reset.
+    std::size_t underrun_frames() const noexcept { return underrun_frames_.load(std::memory_order_relaxed); }
+
+    /// @copydoc Node::reset
+    void reset() noexcept override { underrun_frames_.store(0, std::memory_order_relaxed); }
+
   private:
     friend class Backend;
 
@@ -52,16 +82,6 @@ class Capture final : public NodeT<0, 1>
     /// @brief Queue as many input frames as space allows, from the I/O worker.
     void write(IFBlock input) noexcept { ring_.write(input); }
 
-    /// @brief Report whether the queue has released or bypassed its startup prefill gate.
-    bool steady() const noexcept { return primed_.load(std::memory_order_acquire); }
-
-    /// @brief Return the external batch duration budget used to size the queue.
-    std::chrono::microseconds io_period() const noexcept { return io_period_; }
-
-    /// @brief Return the queue capacity in frames, or zero before preparation.
-    /// @pre Serialize with prepare().
-    std::size_t capacity() const noexcept { return ring_.capacity(); }
-
     /// @brief Return the half-capacity prefill and drift target in frames.
     /// @pre Serialize with prepare().
     std::size_t target_frames() const noexcept { return ring_.capacity() / 2; }
@@ -76,6 +96,7 @@ class Capture final : public NodeT<0, 1>
     std::atomic<bool> backend_bound_{false};
     std::atomic<unsigned> graph_state_{0};
     std::atomic<bool> primed_{false};
+    std::atomic<std::size_t> underrun_frames_{0};
 };
 
 /// @brief Graph-side playback node delivering planar F32P frames to its bound backend.
@@ -103,6 +124,36 @@ class Playback final : public NodeT<1, 0>
     /// @brief Return the fixed F32P input specification.
     PortSpec spec() const noexcept { return inputs()[0]; }
 
+    /// @copydoc Node::type_name
+    const char *type_name() const noexcept override { return "Playback"; }
+
+    /// @brief Report whether a backend has claimed this endpoint.
+    bool bound() const noexcept { return backend_bound_.load(std::memory_order_acquire); }
+
+    /// @brief Report whether the graph gate is open.
+    bool online() const noexcept;
+
+    /// @brief Report whether the queue has released or bypassed its startup prefill gate.
+    bool steady() const noexcept { return primed_.load(std::memory_order_acquire); }
+
+    /// @brief Return the external batch duration budget used to size the queue.
+    std::chrono::microseconds io_period() const noexcept { return io_period_; }
+
+    /// @brief Return the queue capacity in frames, or zero before preparation.
+    /// @pre Serialize with prepare().
+    std::size_t capacity() const noexcept { return ring_.capacity(); }
+
+    /// @brief Sample queue occupancy without blocking the graph or I/O.
+    /// @return False if a usable estimate is unavailable.
+    /// @pre Serialize with prepare().
+    bool estimate_queued_frames(std::size_t &frames) const noexcept { return ring_.estimate(frames); }
+
+    /// @brief Count discarded input frames on the graph side since open or reset.
+    std::size_t overflow_frames() const noexcept { return overflow_frames_.load(std::memory_order_relaxed); }
+
+    /// @copydoc Node::reset
+    void reset() noexcept override { overflow_frames_.store(0, std::memory_order_relaxed); }
+
   private:
     friend class Backend;
 
@@ -124,16 +175,6 @@ class Playback final : public NodeT<1, 0>
     /// @pre A nonempty view matches the node's channel count. Call from the I/O worker.
     std::size_t read(OFBlock output) noexcept;
 
-    /// @brief Report whether the queue has released or bypassed its startup prefill gate.
-    bool steady() const noexcept { return primed_.load(std::memory_order_acquire); }
-
-    /// @brief Return the external batch duration budget used to size the queue.
-    std::chrono::microseconds io_period() const noexcept { return io_period_; }
-
-    /// @brief Return the queue capacity in frames, or zero before preparation.
-    /// @pre Serialize with prepare().
-    std::size_t capacity() const noexcept { return ring_.capacity(); }
-
     /// @brief Return the half-capacity prefill and drift target in frames.
     /// @pre Serialize with prepare().
     std::size_t target_frames() const noexcept { return ring_.capacity() / 2; }
@@ -148,6 +189,7 @@ class Playback final : public NodeT<1, 0>
     std::atomic<bool> backend_bound_{false};
     std::atomic<unsigned> graph_state_{0};
     std::atomic<bool> primed_{false};
+    std::atomic<std::size_t> overflow_frames_{0};
 };
 
 } // namespace aereborn

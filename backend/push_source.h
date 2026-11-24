@@ -12,6 +12,9 @@ namespace aereborn
 class PushSource final : public PassiveBackend
 {
   public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override { return "PushSource"; }
+
     /// @throws Error InvalidArg if input_spec is invalid or is not interleaved PCM.
     explicit PushSource(PortSpec input_spec);
     /// @brief Prepare DSP buffers and bind to a prepared Capture node.

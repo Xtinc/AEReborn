@@ -66,16 +66,14 @@ void open_graph_gate(std::atomic<unsigned> &state, std::atomic<bool> &primed, bo
     state.store(graph_open, std::memory_order_release);
 }
 
-std::size_t read_queue(FrameRing &ring, OFBlock output, std::atomic<bool> &primed,
-                       std::size_t target_frames) noexcept
+bool prefill_ready(const FrameRing &ring, std::atomic<bool> &primed, std::size_t target_frames) noexcept
 {
-    if (!primed.load(std::memory_order_relaxed))
-    {
-        if (ring.available() < target_frames)
-            return 0;
-        primed.store(true, std::memory_order_release);
-    }
-    return ring.read(output);
+    if (primed.load(std::memory_order_relaxed))
+        return true;
+    if (ring.available() < target_frames)
+        return false;
+    primed.store(true, std::memory_order_release);
+    return true;
 }
 } // namespace
 
@@ -86,7 +84,7 @@ Capture::Capture(SampleRate rate, std::size_t channels, std::chrono::microsecond
 
 void Capture::prepare(BlockPeriod period)
 {
-    prepare_ring(ring_, spec(), period, io_period_, period_, backend_bound_.load(std::memory_order_acquire));
+    prepare_ring(ring_, spec(), period, io_period_, period_, bound());
 }
 
 void Capture::process(const ProcessContext &context) noexcept
@@ -95,14 +93,25 @@ void Capture::process(const ProcessContext &context) noexcept
     std::size_t frames = 0;
     if (enter_graph(graph_state_))
     {
-        frames = read_queue(ring_, output, primed_, target_frames());
+        if (prefill_ready(ring_, primed_, target_frames()))
+        {
+            frames = ring_.read(output);
+            if (frames < output.frames())
+                underrun_frames_.fetch_add(output.frames() - frames, std::memory_order_relaxed);
+        }
         graph_state_.fetch_and(~graph_active, std::memory_order_release);
     }
     output.subblock(frames, output.frames() - frames).clear();
 }
 
+bool Capture::online() const noexcept
+{
+    return (graph_state_.load(std::memory_order_acquire) & graph_open) != 0;
+}
+
 void Capture::open(bool prefill) noexcept
 {
+    underrun_frames_.store(0, std::memory_order_relaxed);
     open_graph_gate(graph_state_, primed_, prefill);
 }
 
@@ -119,20 +128,29 @@ Playback::Playback(SampleRate rate, std::size_t channels, std::chrono::microseco
 
 void Playback::prepare(BlockPeriod period)
 {
-    prepare_ring(ring_, spec(), period, io_period_, period_, backend_bound_.load(std::memory_order_acquire));
+    prepare_ring(ring_, spec(), period, io_period_, period_, bound());
 }
 
 void Playback::process(const ProcessContext &context) noexcept
 {
     if (enter_graph(graph_state_))
     {
-        ring_.write(context.inputs[0].f32p_view());
+        const auto input = context.inputs[0].f32p_view();
+        const auto written = ring_.write(input);
+        if (written < input.frames())
+            overflow_frames_.fetch_add(input.frames() - written, std::memory_order_relaxed);
         graph_state_.fetch_and(~graph_active, std::memory_order_release);
     }
 }
 
+bool Playback::online() const noexcept
+{
+    return (graph_state_.load(std::memory_order_acquire) & graph_open) != 0;
+}
+
 void Playback::open(bool prefill) noexcept
 {
+    overflow_frames_.store(0, std::memory_order_relaxed);
     open_graph_gate(graph_state_, primed_, prefill);
 }
 
@@ -149,7 +167,7 @@ void Playback::close() noexcept
 
 std::size_t Playback::read(OFBlock output) noexcept
 {
-    return read_queue(ring_, output, primed_, target_frames());
+    return prefill_ready(ring_, primed_, target_frames()) ? ring_.read(output) : 0;
 }
 
 } // namespace aereborn

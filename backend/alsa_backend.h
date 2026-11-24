@@ -20,6 +20,12 @@ namespace aereborn
 class AlsaBackend final : public ActiveBackend
 {
   public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override
+    {
+        return bound() ? (is_capture() ? "AlsaCapture" : "AlsaPlayback") : "AlsaBackend";
+    }
+
     /// @brief Create an ALSA backend whose direction is selected when it binds.
     /// @param card Bare card name, explicit PCM name, or empty for the default PCM.
     /// @param device Hardware device index for a bare card name.

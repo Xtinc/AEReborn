@@ -20,6 +20,12 @@ namespace aereborn
 class WasapiBackend final : public ActiveBackend
 {
   public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override
+    {
+        return bound() ? (is_capture() ? "WasapiCapture" : "WasapiPlayback") : "WasapiBackend";
+    }
+
     /// @brief Native failure details. operation is null when no native failure was recorded.
     struct Failure
     {

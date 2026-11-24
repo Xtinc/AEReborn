@@ -189,6 +189,12 @@ Tone / BUS（48k F32P）
 - 调用方在控制侧串行执行控制接口和析构。同一 Engine 的时钟线程调用控制接口时抛出 `Error(Busy)`。节点需要请求修改引擎时，将操作延后投递到应用的串行执行器并直接返回，例如使用 `asio::post`。实例有效期间可并发读取 `block_period()` 与 `tick_position()`。
 - 处理路径尽量避免锁等待，禁止堆分配、释放和调用普通应用回调。异步使用块数据必须在 process() 返回前复制到后端自有缓冲。
 
+### 运行态诊断
+
+链接 `aereborn::diag` 并包含 `diag/inspect.h`，即可在串行控制侧调用 `dump_text()` 或 `dump_dot()`。两者都支持返回字符串或写入输出流。传入需要一起检查的后端，报告会按端点关联生效节点，并列出未进入生效 Plan 的后端。队列水位为近似值，`underrun` 和 `overflow` 分别累计图侧采集缺帧和播放丢帧。`late` 是时钟跳过的周期数，`tick_us` 是最近一拍含时钟收尾的估计耗时。
+
+用 `dot -Tsvg graph.dot -o graph.svg` 渲染信号流图。●、◐、○ 分别表示在线、预填充和离线，条形刻度和帧数一起表示近似队列水位，! 标记异常。图上直接显示设备采样率、声道数、增益和转换规格，悬停可查看完整诊断详情。`io.diagnostic_reports` 检查文本及 DOT 输出，`io.endpoint_diagnostics` 检查端点计数和重启。
+
 ### 构建与验证
 
 项目使用 C++14。`aereborn::core` 和 `aereborn::backend` 链接 `Threads::Threads`。静态库 `aereborn::backend` 包含 `PushSource`、`PullSink`、`UsrPlayback`、Null 和 RIFF/WAVE 后端。Linux 在查找到 ALSA 开发库时编译 ALSA 后端并定义 `AEREBORN_HAS_ALSA`，Windows 编译 WASAPI 后端。只构建库可设置 `-DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF`。

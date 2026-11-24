@@ -19,6 +19,9 @@ class Node
     Node(const Node &) = delete;
     Node &operator=(const Node &) = delete;
 
+    /// @brief Return a static diagnostic type name. May be called during processing.
+    virtual const char *type_name() const noexcept { return "Node"; }
+
     /// @brief Describe the input ports.
     /// @return A read-only view of the input port specifications in port index order.
     virtual View<const PortSpec> inputs() const noexcept = 0;

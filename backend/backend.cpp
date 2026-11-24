@@ -17,7 +17,8 @@ using Clock = std::chrono::steady_clock;
 using Milliseconds = std::chrono::milliseconds;
 using Microseconds = std::chrono::microseconds;
 
-constexpr double max_asrc_correction = max_clock_drift_ppm / 1000000.0;
+constexpr double ppm_per_unit = 1000000.0;
+constexpr double max_asrc_correction = max_clock_drift_ppm / ppm_per_unit;
 
 } // namespace
 
@@ -118,9 +119,20 @@ void Backend::close_playback_graph() noexcept
     playback_->close_graph();
 }
 
+const Node *Backend::endpoint_node() const noexcept
+{
+    if (!bound())
+        return nullptr;
+    if (capture_)
+        return capture_;
+    return playback_;
+}
+
 PortSpec Backend::logical_spec() const noexcept
 {
-    return capture_ ? capture_->spec() : playback_->spec();
+    if (capture_)
+        return capture_->spec();
+    return playback_ ? playback_->spec() : PortSpec{};
 }
 
 std::chrono::microseconds Backend::endpoint_period() const noexcept
@@ -281,7 +293,12 @@ template <class Endpoint> void ActiveBackend::bind_endpoint(Endpoint &endpoint)
 
 bool ActiveBackend::running() const noexcept
 {
-    return worker_state_.load(std::memory_order_acquire) != State::Stopped;
+    return state() != State::Stopped;
+}
+
+float ActiveBackend::drift_ppm() const noexcept
+{
+    return static_cast<float>(asrc_.correction.load(std::memory_order_relaxed) * ppm_per_unit);
 }
 
 Milliseconds ActiveBackend::io_timeout() const noexcept
@@ -416,6 +433,13 @@ void ActiveBackend::wait_backpressure() noexcept
     wait_cv_.wait_for(lock, wait, [this] { return worker_state_.load(std::memory_order_acquire) != State::Running; });
 }
 
+void ActiveBackend::ASRC::reset() noexcept
+{
+    filtered_error = 0;
+    integral = 0;
+    correction.store(0.0, std::memory_order_relaxed);
+}
+
 void ActiveBackend::ASRC::update(std::size_t queued_before, std::size_t queued_after, std::size_t target_frames,
                            SampleRate logical_rate, std::size_t device_frames, SampleRate device_rate) noexcept
 {
@@ -433,7 +457,8 @@ void ActiveBackend::ASRC::update(std::size_t queued_before, std::size_t queued_a
     const auto requested_correction = proportional + next_integral;
     if (std::abs(requested_correction) <= max_asrc_correction || requested_correction * filtered_error < 0)
         integral = next_integral;
-    correction = std::max(-max_asrc_correction, std::min(max_asrc_correction, proportional + integral));
+    const auto bounded = std::max(-max_asrc_correction, std::min(max_asrc_correction, proportional + integral));
+    correction.store(bounded, std::memory_order_relaxed);
 }
 
 OBBlock ActiveBackend::device_block(std::size_t frames) noexcept

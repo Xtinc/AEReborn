@@ -12,6 +12,9 @@ namespace aereborn
 class Convert final : public NodeT<1, 1>
 {
   public:
+    /// @copydoc Node::type_name
+    const char *type_name() const noexcept override { return "Convert"; }
+
     /// @brief Construct a converter with fixed input and output specifications.
     /// @param input Source sample format, sample rate, and channel count.
     /// @param output Destination specification with the same channel count.

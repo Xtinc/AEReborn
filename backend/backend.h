@@ -18,6 +18,7 @@ namespace aereborn
 
 /// @brief Owns endpoint occupation and the PCM workspace for external I/O.
 /// @note Unbind or destroy the backend before removing its endpoint or destroying Engine.
+/// Serialize diagnostic queries with backend lifecycle calls and destruction.
 class Backend
 {
   public:
@@ -29,6 +30,9 @@ class Backend
     virtual void stop() noexcept = 0;
     virtual void unbind() noexcept = 0;
 
+    /// @brief Return a static diagnostic name for the backend and its bound direction, when known.
+    virtual const char *type_name() const noexcept { return "Backend"; }
+
     /// @brief Report whether the endpoint and all working buffers are ready.
     bool bound() const noexcept { return device_spec_.channels != 0; }
     virtual bool running() const noexcept = 0;
@@ -38,6 +42,16 @@ class Backend
     PortSpec device_spec() const noexcept { return device_spec_; }
     /// @brief Return the device batch limit, including the provisional value set by on_open().
     std::size_t device_max_frames() const noexcept { return device_max_frames_; }
+
+    /// @brief Borrow the bound graph endpoint, or return null when unbound.
+    /// @note Use until unbind or destruction, subject to the endpoint lifetime contract.
+    const Node *endpoint_node() const noexcept;
+
+    /// @brief Return the endpoint layout, or an empty specification when no endpoint is claimed.
+    PortSpec logical_spec() const noexcept;
+
+    /// @brief Report whether the binding uses FIR resampling.
+    bool uses_resampler() const noexcept { return needs_fir(); }
 
   protected:
     Backend() = default;
@@ -59,7 +73,6 @@ class Backend
     void close_playback_graph() noexcept;
 
     bool is_capture() const noexcept { return capture_ != nullptr; }
-    PortSpec logical_spec() const noexcept;
     std::chrono::microseconds endpoint_period() const noexcept;
     void set_device_max_frames(std::size_t frames) noexcept { device_max_frames_ = frames; }
 
@@ -143,6 +156,9 @@ class PassiveBackend : public Backend
 class ActiveBackend : public Backend
 {
   public:
+    /// @brief I/O worker lifecycle state.
+    enum class State { Stopped, Running, Draining, Stopping };
+
     /// @brief Open the source via on_open(), prepare DSP buffers, and bind to a prepared Capture node.
     /// @throws Error If the endpoint is unprepared, occupied, or negotiation fails.
     void bind(Capture &endpoint);
@@ -164,6 +180,15 @@ class ActiveBackend : public Backend
     /// @brief Report whether I/O is running, draining, or stopping.
     bool running() const noexcept final;
     RetCode last_error() const noexcept final { return last_error_.load(std::memory_order_acquire); }
+
+    /// @brief Read the current I/O worker state.
+    State state() const noexcept { return worker_state_.load(std::memory_order_acquire); }
+
+    /// @brief Report whether the worker follows an independent device clock with ASRC.
+    bool is_async() const noexcept { return async_; }
+
+    /// @brief Read the latest ASRC correction in ppm. Zero before correction or while offline.
+    float drift_ppm() const noexcept;
 
   protected:
     /// @param async True for independent hardware clocks, false for graph-clocked I/O.
@@ -214,15 +239,13 @@ class ActiveBackend : public Backend
     {
         double filtered_error = 0;
         double integral = 0;
-        double correction = 0;
+        std::atomic<double> correction{0.0};
 
-        double scale() const noexcept { return 1.0 + correction; }
-        void reset() noexcept { *this = {}; }
+        double scale() const noexcept { return 1.0 + correction.load(std::memory_order_relaxed); }
+        void reset() noexcept;
         void update(std::size_t queued_before, std::size_t queued_after, std::size_t target_frames,
                     SampleRate logical_rate, std::size_t device_frames, SampleRate device_rate) noexcept;
     };
-
-    enum class State { Stopped, Running, Draining, Stopping };
 
     template <class Endpoint> void bind_endpoint(Endpoint &endpoint);
     std::chrono::milliseconds io_timeout() const noexcept;

@@ -11,6 +11,9 @@ namespace aereborn
 class PullSink final : public PassiveBackend
 {
   public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override { return "PullSink"; }
+
     /// @throws Error InvalidArg if output_spec is invalid or is not interleaved PCM.
     explicit PullSink(PortSpec output_spec);
 

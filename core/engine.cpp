@@ -111,6 +111,7 @@ struct Topology
 {
     std::vector<std::shared_ptr<NodeEntry>> nodes;
     std::vector<Link> links;
+    std::vector<Connection> connections;
 };
 } // namespace
 
@@ -190,7 +191,7 @@ class Engine::Graph
         if (would_cycle(from.node, to.node))
             throw Error(ErrorCode::Cycle);
         const ConnId id{next_identifier()};
-        connections_.emplace(id, Connection{from, to});
+        connections_.emplace(id, ConnectionPorts{from, to});
         input = from;
         dirty_ = true;
         return id;
@@ -213,6 +214,12 @@ class Engine::Graph
             if (!item.second.paused && item.second.entry->outputs.empty())
                 visit(item.second, topology, node_index);
 
+        for (const auto &item : connections_)
+        {
+            const auto &connection = item.second;
+            if (node_index.count(connection.from.node) && node_index.count(connection.to.node))
+                topology.connections.push_back({item.first, connection.from, connection.to});
+        }
         return topology;
     }
 
@@ -245,13 +252,13 @@ class Engine::Graph
         std::vector<OPort> inputs;
         bool paused = false;
     };
-    struct Connection
+    struct ConnectionPorts
     {
         OPort from;
         IPort to;
     };
     using Nodes = std::map<NodeId, DraftNode>;
-    using Connections = std::map<ConnId, Connection>;
+    using Connections = std::map<ConnId, ConnectionPorts>;
     using NodeIndex = std::map<NodeId, std::size_t>;
     Nodes::iterator find_node(NodeId id)
     {
@@ -357,12 +364,21 @@ class Engine::Clock
             while (!changed_.wait_until(lock, deadline, [this] { return stopping_; }))
             {
                 lock.unlock();
+                const auto started = std::chrono::steady_clock::now();
                 const bool swapped = engine.tick();
                 lock.lock();
                 if (swapped)
                     applied_.notify_one();
-                const auto lateness = std::chrono::steady_clock::now() - deadline;
-                deadline += interval * (lateness >= interval ? lateness / interval + 1 : 1);
+                const auto finished = std::chrono::steady_clock::now();
+                const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(finished - started);
+                engine.last_tick_us_.store(elapsed.count(), std::memory_order_relaxed);
+                deadline += interval;
+                if (finished >= deadline)
+                {
+                    const auto missed = (finished - deadline) / interval + 1;
+                    engine.missed_periods_.fetch_add(missed, std::memory_order_relaxed);
+                    deadline += interval * missed;
+                }
             }
         });
     }
@@ -404,12 +420,39 @@ class Engine::Runner
         measure_layout(*plan, topology, period, layout);
         bind_blocks(*plan, topology, period, layout);
 
+        plan->node_ids.reserve(topology.nodes.size());
+        for (const auto &entry : topology.nodes)
+            plan->node_ids.push_back(entry->id);
+        plan->connections = std::move(topology.connections);
         plan->owners = std::move(topology.nodes);
         if (live_clock)
             live_clock->submit_and_wait(submitted_, plan.get());
         else
             rendering_ = plan.get();
         current_ = std::move(plan);
+    }
+
+    View<const NodeId> nodes() const noexcept
+    {
+        if (!current_)
+            return {};
+        return {current_->node_ids.data(), current_->node_ids.size()};
+    }
+
+    View<const Connection> connections() const noexcept
+    {
+        if (!current_)
+            return {};
+        return {current_->connections.data(), current_->connections.size()};
+    }
+
+    const Node *node(NodeId id) const
+    {
+        if (current_)
+            for (const auto &entry : current_->owners)
+                if (entry->id == id)
+                    return entry->node.get();
+        throw Error(ErrorCode::UnknownNode);
     }
 
     /// @brief Reset nodes held by the current plan after removal or replacement in the draft.
@@ -484,6 +527,8 @@ class Engine::Runner
         std::vector<OBBlock> outputs;
         std::vector<Step> steps;
         std::vector<std::shared_ptr<NodeEntry>> owners;
+        std::vector<NodeId> node_ids;
+        std::vector<Connection> connections;
     };
 
     /// @brief Measure buffer capacity and record each node's port offsets.
@@ -654,6 +699,7 @@ void Engine::commit()
         return;
 
     runner_->commit(graph_->resolve(), period_, state_ == State::Running ? clock_.get() : nullptr);
+    ++plan_generation_;
     graph_->mark_clean();
     if (state_ == State::Unprepared)
         state_ = State::Ready;
@@ -688,6 +734,44 @@ void Engine::reset()
     runner_->reset(*graph_);
     graph_->reset_nodes();
     position_.store(0, std::memory_order_release);
+    missed_periods_.store(0, std::memory_order_relaxed);
+    last_tick_us_.store(0, std::memory_order_relaxed);
+}
+
+Engine::State Engine::state() const
+{
+    require_control_thread();
+    return state_;
+}
+
+bool Engine::dirty() const
+{
+    require_control_thread();
+    return graph_->dirty();
+}
+
+std::uint64_t Engine::plan_generation() const
+{
+    require_control_thread();
+    return plan_generation_;
+}
+
+View<const NodeId> Engine::plan_nodes() const
+{
+    require_control_thread();
+    return runner_->nodes();
+}
+
+View<const Connection> Engine::plan_connections() const
+{
+    require_control_thread();
+    return runner_->connections();
+}
+
+const Node *Engine::plan_node(NodeId node_id) const
+{
+    require_control_thread();
+    return runner_->node(node_id);
 }
 
 std::uint64_t Engine::tick_position() const noexcept

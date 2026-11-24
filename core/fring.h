@@ -37,6 +37,15 @@ class FrameRing
         return queued(write_.load(std::memory_order_acquire), read);
     }
 
+    /// @brief Sample queue occupancy from outside the producer and consumer.
+    /// @return False if the independently sampled cursors yield an out-of-range result.
+    /// @pre Serialize with prepare().
+    bool estimate(std::size_t &frames) const noexcept
+    {
+        frames = available();
+        return frames <= capacity_;
+    }
+
     /// @pre The ring is prepared and the input matches its layout.
     std::size_t write(IFBlock input) noexcept
     {

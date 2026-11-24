@@ -13,6 +13,9 @@ namespace aereborn
 class UsrPlayback final : public ActiveBackend
 {
   public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override { return "UsrPlayback"; }
+
     using Callback = std::function<void(IBBlock)>;
 
     /// @throws Error InvalidArg if spec is not valid interleaved PCM or callback is empty.

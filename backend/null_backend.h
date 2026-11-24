@@ -10,6 +10,12 @@ namespace aereborn
 class NullBackend final : public ActiveBackend
 {
   public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override
+    {
+        return bound() ? (is_capture() ? "NullCapture" : "NullPlayback") : "NullBackend";
+    }
+
     /// @brief Construct a null backend whose direction is selected at bind time.
     /// @param format Interleaved PCM format used by the device side.
     /// @throws Error If the format is not interleaved PCM.

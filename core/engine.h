@@ -18,6 +18,14 @@ namespace aereborn
 class Engine
 {
   public:
+    /// @brief Lifecycle state, as observed on the control side.
+    enum class State
+    {
+        Unprepared,
+        Ready,
+        Running
+    };
+
     /// @brief Construct an engine with an empty draft graph.
     /// @param block_period Fixed duration of each tick.
     /// @throws Error InvalidArg if the period is unsupported.
@@ -132,17 +140,39 @@ class Engine
     /// @return The zero-based position of the next tick, advanced after each completed block.
     std::uint64_t tick_position() const noexcept;
 
+    /// @brief Return the current lifecycle state on the serialized control side.
+    State state() const;
+
+    /// @brief Report whether the draft needs a commit, including its initial preparation.
+    bool dirty() const;
+
+    /// @brief Count published render plans. Failed and unchanged commits leave this unchanged.
+    std::uint64_t plan_generation() const;
+
+    /// @brief Count software-clock periods skipped since construction or reset.
+    /// @note May be read concurrently with rendering.
+    std::uint64_t missed_periods() const noexcept { return missed_periods_.load(std::memory_order_relaxed); }
+
+    /// @brief Estimate the most recent tick time in microseconds, including clock bookkeeping.
+    /// @note May be read concurrently with rendering. Zero until sampled after construction or reset.
+    std::uint64_t last_tick_us() const noexcept { return last_tick_us_.load(std::memory_order_relaxed); }
+
+    /// @brief Borrow committed node IDs in execution order, or an empty view before commit.
+    /// @note Use on the serialized control side until the next plan publication or destruction.
+    View<const NodeId> plan_nodes() const;
+
+    /// @brief Borrow committed connections, with the same lifetime as plan_nodes().
+    View<const Connection> plan_connections() const;
+
+    /// @brief Borrow a committed node instance, with the same lifetime as plan_nodes().
+    /// @throws Error UnknownNode if the node is outside the current plan.
+    /// @note Follow the node's own contract for access during rendering.
+    const Node *plan_node(NodeId node_id) const;
+
   private:
     class Graph;
     class Runner;
     class Clock;
-    enum class State
-    {
-        Unprepared,
-        Ready,
-        Running
-    };
-
     void require_control_thread() const;
     NodeId insert_node(std::unique_ptr<Node> instance);
     bool tick() noexcept;
@@ -150,6 +180,9 @@ class Engine
     const BlockPeriod period_;
     State state_ = State::Unprepared;
     std::atomic<std::uint64_t> position_{0};
+    std::uint64_t plan_generation_ = 0;
+    std::atomic<std::uint64_t> missed_periods_{0};
+    std::atomic<std::uint64_t> last_tick_us_{0};
     std::unique_ptr<Graph> graph_;
     std::unique_ptr<Runner> runner_;
     std::unique_ptr<Clock> clock_;
