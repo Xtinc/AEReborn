@@ -52,17 +52,12 @@ class Backend
     /// @brief Return the most recently recorded I/O error.
     RetCode last_error() const noexcept { return last_error_.load(std::memory_order_acquire); }
     /// @brief Return the negotiated PCM specification, or an empty specification when unbound.
-    PortSpec device_spec() const noexcept { return workspace_.device.spec; }
+    PortSpec device_spec() const noexcept { return workspace_.device_spec; }
     /// @brief Return the negotiated device batch limit, or zero when unbound.
-    std::size_t device_max_frames() const noexcept { return workspace_.device.max_frames; }
+    /// @note During on_open(), reports the limit set so far by the driver.
+    std::size_t device_max_frames() const noexcept { return workspace_.device_max_frames; }
 
   protected:
-    struct DeviceFormat
-    {
-        PortSpec spec;
-        std::size_t max_frames = 0;
-    };
-
     /// @param async True for external-clock hardware (ASRC + PI + timeout); false for graph-clock backends.
     explicit Backend(bool async) noexcept : async_(async) {}
 
@@ -82,10 +77,13 @@ class Backend
     /// @pre Call from an async I/O hook on the worker thread.
     int remaining_io_ms() const noexcept;
 
-    /// @brief Open underlying device/file and report negotiated interleaved PCM format and max batch size.
+    /// @brief Open the device or file and return its negotiated interleaved PCM specification.
+    /// @note Call set_device_max_frames() before returning success.
     /// @note Runs on the control thread. Setup exceptions propagate after on_close() rolls back the open.
-    virtual Result<DeviceFormat> on_open(bool capture, PortSpec logical,
-                                         std::chrono::microseconds target_period) = 0;
+    virtual Result<PortSpec> on_open(bool capture, PortSpec logical, std::chrono::microseconds target_period) = 0;
+
+    /// @brief Set the negotiated device batch limit during on_open().
+    void set_device_max_frames(std::size_t frames) noexcept { workspace_.device_max_frames = frames; }
 
     /// @brief Start the stream and acquire any thread-affine resources on the I/O worker thread.
     /// @note Synchronized with start(); on failure, roll back before returning the error.
@@ -117,7 +115,8 @@ class Backend
   private:
     struct Workspace
     {
-        DeviceFormat device;
+        PortSpec device_spec;
+        std::size_t device_max_frames = 0;
         std::size_t logical_frames = 0;
         SincResampler resampler;
         Buffer device_planar;  ///< Allocated only when resampler.needs_fir() is true.

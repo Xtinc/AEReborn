@@ -17,7 +17,7 @@ class NullBackend final : public Backend
     ~NullBackend() override { unbind(); }
 
   private:
-    Result<DeviceFormat> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
+    Result<PortSpec> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
     Result<std::size_t> on_read(OBBlock output) noexcept override;
     RetCode on_write(IBBlock input) noexcept override;
 

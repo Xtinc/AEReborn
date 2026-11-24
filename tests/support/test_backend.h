@@ -39,7 +39,7 @@ class TestBackend final : public Backend
 
     ~TestBackend() override { unbind(); }
 
-    Result<DeviceFormat> on_open(bool, PortSpec logical, std::chrono::microseconds period) override
+    Result<PortSpec> on_open(bool, PortSpec logical, std::chrono::microseconds period) override
     {
         if (calls_)
         {
@@ -52,7 +52,8 @@ class TestBackend final : public Backend
             throw std::bad_alloc();
         if (!open_result)
             return open_result;
-        return DeviceFormat{spec_, frames_};
+        set_device_max_frames(frames_);
+        return spec_;
     }
 
     void on_close() noexcept override

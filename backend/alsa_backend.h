@@ -31,7 +31,7 @@ class AlsaBackend final : public Backend
     }
 
   private:
-    Result<DeviceFormat> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
+    Result<PortSpec> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
     RetCode on_start() noexcept override;
     void on_stop() noexcept override;
     void on_cancel() noexcept override;
@@ -41,8 +41,8 @@ class AlsaBackend final : public Backend
     Result<std::size_t> on_wait_writable() noexcept override;
     RetCode on_write(IBBlock input) noexcept override;
 
-    static Result<DeviceFormat> configure_pcm(_snd_pcm *pcm, bool mmap, PortSpec logical,
-                                               std::chrono::microseconds duration) noexcept;
+    Result<PortSpec> configure_pcm(_snd_pcm *pcm, bool mmap, PortSpec logical,
+                                   std::chrono::microseconds duration) noexcept;
     RetCode prepare_stream() noexcept;
     RetCode wait_ready() noexcept;
     RetCode recover(int error) noexcept;

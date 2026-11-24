@@ -35,8 +35,8 @@ AlsaBackend::AlsaBackend(std::string card, unsigned int device, bool use_mmap)
 {
 }
 
-Result<Backend::DeviceFormat> AlsaBackend::configure_pcm(snd_pcm_t *handle, bool mmap, PortSpec logical,
-                                                         std::chrono::microseconds duration) noexcept
+Result<PortSpec> AlsaBackend::configure_pcm(snd_pcm_t *handle, bool mmap, PortSpec logical,
+                                            std::chrono::microseconds duration) noexcept
 {
     const auto access = mmap ? SND_PCM_ACCESS_MMAP_INTERLEAVED : SND_PCM_ACCESS_RW_INTERLEAVED;
     snd_pcm_hw_params_t *hw;
@@ -91,11 +91,11 @@ Result<Backend::DeviceFormat> AlsaBackend::configure_pcm(snd_pcm_t *handle, bool
         return ErrorCode::FormatMismatch;
     if (rc < 0)
         return alsa_error(rc);
-    return DeviceFormat{{rate, logical.channels, format}, std::min<std::size_t>(period, budget.value())};
+    set_device_max_frames(std::min<std::size_t>(period, budget.value()));
+    return PortSpec{rate, logical.channels, format};
 }
 
-Result<Backend::DeviceFormat> AlsaBackend::on_open(bool capture, PortSpec logical,
-                                                   std::chrono::microseconds duration)
+Result<PortSpec> AlsaBackend::on_open(bool capture, PortSpec logical, std::chrono::microseconds duration)
 {
     if (logical.channels > std::numeric_limits<unsigned>::max())
         return ErrorCode::TooLarge;
@@ -107,16 +107,16 @@ Result<Backend::DeviceFormat> AlsaBackend::on_open(bool capture, PortSpec logica
     std::unique_ptr<snd_pcm_t, decltype(&snd_pcm_close)> pcm(handle, snd_pcm_close);
 
     auto mmap = use_mmap_;
-    auto device = configure_pcm(handle, mmap, logical, duration);
-    if (mmap && device.ret_code() == ErrorCode::FormatMismatch)
+    auto spec = configure_pcm(handle, mmap, logical, duration);
+    if (mmap && spec.ret_code() == ErrorCode::FormatMismatch)
     {
         mmap = false;
-        device = configure_pcm(handle, mmap, logical, duration);
+        spec = configure_pcm(handle, mmap, logical, duration);
     }
-    if (!device)
-        return device;
+    if (!spec)
+        return spec;
 
-    const auto frames = device.value().max_frames;
+    const auto frames = device_max_frames();
     snd_pcm_sw_params_t *sw;
     snd_pcm_sw_params_alloca(&sw);
     if (snd_pcm_sw_params_current(handle, sw) < 0 || snd_pcm_sw_params_set_avail_min(handle, sw, frames) < 0)
@@ -147,7 +147,7 @@ Result<Backend::DeviceFormat> AlsaBackend::on_open(bool capture, PortSpec logica
     poll_ = std::move(descriptors);
     mmap_ = mmap;
     pcm_ = pcm.release();
-    return device;
+    return spec;
 }
 
 RetCode AlsaBackend::on_start() noexcept

@@ -11,13 +11,14 @@ NullBackend::NullBackend(SampleFormat format) : Backend(false), format_(format)
         throw Error(ErrorCode::InvalidArg);
 }
 
-Result<Backend::DeviceFormat> NullBackend::on_open(bool, PortSpec logical, std::chrono::microseconds period)
+Result<PortSpec> NullBackend::on_open(bool, PortSpec logical, std::chrono::microseconds period)
 {
     const auto count = frames_in_period(logical.sample_rate, period);
     if (!count)
         return count.ret_code();
     logical.format = format_;
-    return DeviceFormat{logical, count.value()};
+    set_device_max_frames(count.value());
+    return logical;
 }
 
 Result<std::size_t> NullBackend::on_read(OBBlock output) noexcept

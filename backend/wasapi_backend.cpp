@@ -156,7 +156,7 @@ Result<UINT32> initialize(IAudioClient &client, const WAVEFORMATEX &format, Wasa
 
 } // namespace
 
-Result<Backend::DeviceFormat> WasapiBackend::on_open(bool capture, PortSpec logical, std::chrono::microseconds period)
+Result<PortSpec> WasapiBackend::on_open(bool capture, PortSpec logical, std::chrono::microseconds period)
 {
     failure_ = {};
     ComApartment com(COINIT_APARTMENTTHREADED);
@@ -208,7 +208,8 @@ Result<Backend::DeviceFormat> WasapiBackend::on_open(bool capture, PortSpec logi
     packet_ = std::move(packet);
     ready_ = ready.release();
     cancelled_ = cancelled.release();
-    return DeviceFormat{spec, std::min<std::size_t>(budget.value(), capacity)};
+    set_device_max_frames(std::min<std::size_t>(budget.value(), capacity));
+    return spec;
 }
 
 void WasapiBackend::on_close() noexcept

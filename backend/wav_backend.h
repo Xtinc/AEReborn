@@ -29,7 +29,7 @@ class WavCapture final : public Backend
     void bind(Playback &) = delete;
 
   private:
-    Result<DeviceFormat> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
+    Result<PortSpec> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
     void on_close() noexcept override;
     Result<std::size_t> on_read(OBBlock output) noexcept override;
 
@@ -57,7 +57,7 @@ class WavPlayback final : public Backend
     void bind(Capture &) = delete;
 
   private:
-    Result<DeviceFormat> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
+    Result<PortSpec> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
     RetCode on_start() noexcept override;
     void on_stop() noexcept override;
     void on_close() noexcept override;

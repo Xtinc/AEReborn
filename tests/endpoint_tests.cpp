@@ -236,7 +236,8 @@ void lifecycle()
         TestBackend invalid(spec, frames, &calls);
         const auto before = calls.closes;
         expect_error(error, [&] { invalid.bind(capture); });
-        check(calls.closes == before + 1 && !invalid.bound(), "Failed negotiation closes the device");
+        check(calls.closes == before + 1 && !invalid.bound() && !invalid.device_max_frames(),
+              "Failed negotiation closes the device and clears the batch limit");
         check_rebind();
     };
     reject(PortSpec(rate, 1, SampleFormat::F32P), 128, ErrorCode::InvalidArg);

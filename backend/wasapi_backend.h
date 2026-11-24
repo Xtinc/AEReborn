@@ -37,7 +37,7 @@ class WasapiBackend final : public Backend
     Failure last_failure() const noexcept { return running() ? Failure{} : failure_; }
 
   private:
-    Result<DeviceFormat> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
+    Result<PortSpec> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
     RetCode on_start() noexcept override;
     void on_stop() noexcept override;
     void on_cancel() noexcept override;

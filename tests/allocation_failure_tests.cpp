@@ -247,8 +247,8 @@ void backend_binding_rollback()
             source.unbind();
             break;
         }
-        check(!source.bound() && calls.opens == calls.closes,
-              "A bind exception closes the device and leaves the backend unbound");
+        check(!source.bound() && !source.device_max_frames() && calls.opens == calls.closes,
+              "A bind exception closes the device and clears the batch limit");
         replacement.bind(capture);
         replacement.unbind();
     }

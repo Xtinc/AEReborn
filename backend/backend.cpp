@@ -81,19 +81,19 @@ template <class Endpoint> void Backend::bind_endpoint(Endpoint &endpoint, Endpoi
         throw Error(ErrorCode::Busy);
 
     const auto cleanup = [&]() noexcept {
+        workspace_ = {};
         on_close();
         endpoint.backend_bound_.store(false, std::memory_order_release);
     };
     ScopeExit<decltype(cleanup)> rollback(cleanup);
 
     constexpr bool capture = std::is_same<Endpoint, Capture>::value;
-    Workspace next;
     const auto logical = endpoint.spec();
     const auto period = endpoint.io_period();
-    next.device = on_open(capture, logical, period).value_or_throw();
+    workspace_.device_spec = on_open(capture, logical, period).value_or_throw();
 
-    const auto &device = next.device.spec;
-    const auto frames = next.device.max_frames;
+    const auto &device = workspace_.device_spec;
+    const auto frames = device_max_frames();
     if (!is_sample_rate(device.sample_rate) || !device.channels || !is_interleaved_pcm(device.format) || !frames)
         throw Error(ErrorCode::InvalidArg);
     if (device.channels != logical.channels)
@@ -104,21 +104,21 @@ template <class Endpoint> void Backend::bind_endpoint(Endpoint &endpoint, Endpoi
     const auto src_fs = capture ? device.sample_rate : logical.sample_rate;
     const auto dst_fs = capture ? logical.sample_rate : device.sample_rate;
     const auto max_rate_offset = async_ ? max_asrc_correction : 0.0;
-    next.logical_frames = capture ? SincResampler::max_output_frames(src_fs, dst_fs, frames, max_rate_offset)
-                                  : SincResampler::max_input_frames(src_fs, dst_fs, frames, max_rate_offset);
-    if (next.logical_frames > endpoint.target_frames())
+    const auto logical_frames = capture ? SincResampler::max_output_frames(src_fs, dst_fs, frames, max_rate_offset)
+                                        : SincResampler::max_input_frames(src_fs, dst_fs, frames, max_rate_offset);
+    if (logical_frames > endpoint.target_frames())
         throw Error(ErrorCode::TooLarge);
 
     const auto width = sample_bytes(device.format);
-    if (frames > next.device_bytes.max_size() / logical.channels / width)
+    if (frames > workspace_.device_bytes.max_size() / logical.channels / width)
         throw Error(ErrorCode::TooLarge);
-    next.resampler.prepare(logical.channels, src_fs, dst_fs, max_rate_offset);
-    if (next.resampler.needs_fir())
-        next.device_planar.resize(logical.channels, frames);
-    next.logical_planar.resize(logical.channels, next.logical_frames);
-    next.device_bytes.resize(frames * logical.channels * width);
+    workspace_.resampler.prepare(logical.channels, src_fs, dst_fs, max_rate_offset);
+    if (workspace_.resampler.needs_fir())
+        workspace_.device_planar.resize(logical.channels, frames);
+    workspace_.logical_planar.resize(logical.channels, logical_frames);
+    workspace_.device_bytes.resize(frames * logical.channels * width);
+    workspace_.logical_frames = logical_frames;
 
-    workspace_ = std::move(next);
     slot = &endpoint;
     last_error_.store({}, std::memory_order_release);
     rollback.dismiss();
@@ -298,7 +298,7 @@ void Backend::ASRC::update(std::size_t queued_before, std::size_t queued_after, 
 
 OBBlock Backend::device_block(std::size_t frames) noexcept
 {
-    return {workspace_.device_bytes.data(), workspace_.device.spec, frames};
+    return {workspace_.device_bytes.data(), workspace_.device_spec, frames};
 }
 
 void Backend::emit_capture(IFBlock input, double scale) noexcept
@@ -393,7 +393,7 @@ RetCode Backend::transfer_playback_async(std::size_t &device_frames) noexcept
                             : on_write_silence(device_block(device_frames));
     if (result && steady)
         asrc_.update(queued_before, playback_->available(), playback_->target_frames(), playback_->spec().sample_rate,
-                     device_frames, workspace_.device.spec.sample_rate);
+                     device_frames, workspace_.device_spec.sample_rate);
     return result;
 }
 

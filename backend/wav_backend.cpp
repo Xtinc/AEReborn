@@ -23,7 +23,7 @@ WavCapture::WavCapture(std::string path, Repeat repeats)
 {
 }
 
-Result<Backend::DeviceFormat> WavCapture::on_open(bool capture, PortSpec, std::chrono::microseconds period)
+Result<PortSpec> WavCapture::on_open(bool capture, PortSpec, std::chrono::microseconds period)
 {
     if (!capture)
         return ErrorCode::InvalidArg;
@@ -36,7 +36,8 @@ Result<Backend::DeviceFormat> WavCapture::on_open(bool capture, PortSpec, std::c
         return count.ret_code();
 
     repeats_left_ = repeats_;
-    return DeviceFormat{spec, count.value()};
+    set_device_max_frames(count.value());
+    return spec;
 }
 
 void WavCapture::on_close() noexcept
@@ -86,7 +87,7 @@ WavPlayback::WavPlayback(std::string path, SampleFormat format, std::chrono::sec
         throw Error(ErrorCode::FormatMismatch);
 }
 
-Result<Backend::DeviceFormat> WavPlayback::on_open(bool capture, PortSpec logical, std::chrono::microseconds period)
+Result<PortSpec> WavPlayback::on_open(bool capture, PortSpec logical, std::chrono::microseconds period)
 {
     if (capture)
         return ErrorCode::InvalidArg;
@@ -124,7 +125,8 @@ Result<Backend::DeviceFormat> WavPlayback::on_open(bool capture, PortSpec logica
     const auto opened = open_file(logical);
     if (!opened)
         return opened;
-    return DeviceFormat{logical, count.value()};
+    set_device_max_frames(count.value());
+    return logical;
 }
 
 RetCode WavPlayback::on_start() noexcept
