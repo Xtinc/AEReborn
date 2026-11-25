@@ -46,10 +46,12 @@ void Mixer::process(const ProcessContext &context) noexcept
     if (frames == 0)
         return;
     output.clear();
+    bool active = false;
     for (std::size_t i = 0; i < inputs_.size(); ++i)
     {
-        if (muted_[i].load(std::memory_order_acquire))
+        if (muted_[i].load(std::memory_order_acquire) || !context.has_input(i))
             continue;
+        active = true;
         const auto input = context.inputs[i].f32p_view();
         for (std::size_t ch = 0; ch < output.channels(); ++ch)
         {
@@ -59,5 +61,6 @@ void Mixer::process(const ProcessContext &context) noexcept
                 dst[frame] += src[frame];
         }
     }
+    context.set_output_active(0, active);
 }
 } // namespace aereborn

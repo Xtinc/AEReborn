@@ -1,5 +1,6 @@
 #include "convert.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace aereborn
@@ -32,12 +33,24 @@ void Convert::prepare(BlockPeriod period)
     }
     decoded_ = std::move(decoded);
     resampled_ = std::move(resampled);
+    tail_remaining_ = 0;
 }
 
 void Convert::process(const ProcessContext &context) noexcept
 {
     const auto input = context.inputs[0];
     const auto output = context.outputs[0];
+    const bool active = context.has_input(0);
+    if (!active && tail_remaining_ == 0)
+    {
+        context.set_output_active(0, false);
+        const auto bytes = output.byte_view();
+        if (!bytes.empty())
+            std::memset(bytes.data(), 0, bytes.size());
+        return;
+    }
+    context.set_output_active(0, true);
+
     if (same_spec_)
     {
         // The byte copy preserves float bit patterns and PCM padding.
@@ -62,6 +75,9 @@ void Convert::process(const ProcessContext &context) noexcept
 
     if (fir)
     {
+        // The block that finishes the flush may still contain tail samples.
+        tail_remaining_ =
+            active ? resampler_.tail_frames() : tail_remaining_ - std::min(tail_remaining_, input.frames());
         const auto dest = out_pcm ? resampled_.block(output.frames()) : output.f32p_view();
         resampler_.process_tick(source, dest, context.block_period, context.tick_position);
         source = dest;
@@ -73,6 +89,7 @@ void Convert::process(const ProcessContext &context) noexcept
 void Convert::reset() noexcept
 {
     resampler_.reset();
+    tail_remaining_ = 0;
 }
 
 } // namespace aereborn

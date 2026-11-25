@@ -71,12 +71,12 @@ struct PoolLayout
     }
 };
 
-template <class Block>
-View<const Block> port_range(const std::vector<Block> &blocks, std::size_t first, std::size_t count) noexcept
+template <class T>
+View<T> port_range(T *data, std::size_t first, std::size_t count) noexcept
 {
     if (count == 0)
         return {};
-    return {blocks.data() + first, count};
+    return {data + first, count};
 }
 struct NodeEntry
 {
@@ -514,9 +514,18 @@ class Engine::Runner
                     refresh_frames(output);
             }
 
+            // Leave slot zero inactive for all inputs without a source.
+            std::fill(output_active.begin() + 1, output_active.end(), std::uint8_t{1});
             for (const auto &step : steps)
-                step.node->process({period, tick, port_range(inputs, step.first_input, step.input_count),
-                                    port_range(outputs, step.first_output, step.output_count)});
+            {
+                for (std::size_t i = step.first_input; i < step.first_input + step.input_count; ++i)
+                    input_active[i] = output_active[input_sources[i]];
+
+                step.node->process({period, tick, port_range(inputs.data(), step.first_input, step.input_count),
+                                    port_range(outputs.data(), step.first_output, step.output_count),
+                                    port_range(input_active.data(), step.first_input, step.input_count),
+                                    port_range(output_active.data() + 1, step.first_output, step.output_count)});
+            }
         }
 
         bool has_fractional_ports = false;
@@ -525,6 +534,9 @@ class Engine::Runner
         std::vector<std::uint8_t> byte_pool;
         std::vector<IBBlock> inputs;
         std::vector<OBBlock> outputs;
+        std::vector<std::uint8_t> input_active;
+        std::vector<std::uint8_t> output_active; // Slot zero is shared by inputs without a source.
+        std::vector<std::size_t> input_sources;
         std::vector<Step> steps;
         std::vector<std::shared_ptr<NodeEntry>> owners;
         std::vector<NodeId> node_ids;
@@ -545,13 +557,15 @@ class Engine::Runner
         };
         if (topology.nodes.size() > plan.steps.max_size())
             throw Error(ErrorCode::TooLarge);
+        const auto max_inputs = std::min({plan.inputs.max_size(), plan.input_active.max_size(),
+                                          plan.input_sources.max_size()});
+        const auto max_outputs = std::min(plan.outputs.max_size(), plan.output_active.max_size() - 1);
         plan.steps.reserve(topology.nodes.size());
         for (const auto &entry : topology.nodes)
         {
             const auto inputs = entry->inputs;
             const auto outputs = entry->outputs;
-            if (inputs.size() > plan.inputs.max_size() - layout.input_count ||
-                outputs.size() > plan.outputs.max_size() - layout.output_count)
+            if (inputs.size() > max_inputs - layout.input_count || outputs.size() > max_outputs - layout.output_count)
                 throw Error(ErrorCode::TooLarge);
             plan.steps.push_back(
                 {entry->node.get(), layout.input_count, inputs.size(), layout.output_count, outputs.size()});
@@ -584,6 +598,9 @@ class Engine::Runner
     {
         plan.inputs.resize(layout.input_count);
         plan.outputs.resize(layout.output_count);
+        plan.input_active.resize(layout.input_count);
+        plan.output_active.resize(layout.output_count + 1);
+        plan.input_sources.resize(layout.input_count);
         plan.float_pool.resize(layout.floats.silence + layout.floats.outputs);
         plan.byte_pool.resize(layout.bytes.silence + layout.bytes.outputs);
         layout.floats.offset = layout.floats.silence;
@@ -606,7 +623,11 @@ class Engine::Runner
                 const auto input_index = step.first_input + port;
                 const auto link = topology.links[input_index];
                 if (link.node_index != Link::unconnected)
-                    plan.inputs[input_index] = plan.outputs[plan.steps[link.node_index].first_output + link.port_index];
+                {
+                    const auto source = plan.steps[link.node_index].first_output + link.port_index;
+                    plan.inputs[input_index] = plan.outputs[source];
+                    plan.input_sources[input_index] = source + 1;
+                }
                 else
                 {
                     const auto spec = entry.inputs[port];

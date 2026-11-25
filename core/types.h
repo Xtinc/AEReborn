@@ -277,14 +277,34 @@ struct Connection
     IPort to;
 };
 
-/// @brief Timing and port blocks passed to a node for one process call.
-/// @note The port block views and their buffers are borrowed for the duration of that call.
+/// @brief Timing, port blocks, and activity flags passed to a node for one process call.
+/// @note All views and their backing storage are borrowed for the duration of that call.
+/// @note Each supplied activity view has one flag per corresponding port.
 struct ProcessContext
 {
-    BlockPeriod block_period;       ///< Duration of the current engine tick.
-    std::uint64_t tick_position;    ///< Zero-based position of the current tick.
-    View<const IBBlock> inputs;  ///< Read-only input blocks in port index order.
-    View<const OBBlock> outputs; ///< Output blocks with writable samples in port index order.
+    BlockPeriod block_period;                ///< Duration of the current engine tick.
+    std::uint64_t tick_position;             ///< Zero-based position of the current tick.
+    View<const IBBlock> inputs;              ///< Read-only input blocks in port index order.
+    View<const OBBlock> outputs;             ///< Output blocks with writable samples in port index order.
+    View<const std::uint8_t> input_active{}; ///< Per-input flags. Zero guarantees a zero-filled block.
+    View<std::uint8_t> output_active{};      ///< Per-output flags, initially active in the graph.
+
+    /// @brief Check whether the input block should be processed as active.
+    /// @pre index is a valid input port index.
+    /// @note Returns true when a standalone caller omits the activity view.
+    bool has_input(std::size_t index) const noexcept
+    {
+        return input_active.empty() || input_active[index] != 0;
+    }
+
+    /// @brief Set the output block's activity flag.
+    /// @pre index is a valid output port index.
+    /// @note An inactive output must be filled with zero bytes. With no activity view, this is a no-op.
+    void set_output_active(std::size_t index, bool active) const noexcept
+    {
+        if (!output_active.empty())
+            output_active[index] = active ? 1 : 0;
+    }
 };
 
 } // namespace aereborn

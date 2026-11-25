@@ -48,6 +48,96 @@ void graph_constraints()
     expect_error(ErrorCode::UnknownConn, [&] { engine.disconnect(input); });
 }
 
+class SplitSignal final : public NodeT<1, 2>
+{
+  public:
+    SplitSignal() : NodeT({mono}, {mono, mono}) {}
+
+    void process(const ProcessContext &context) noexcept override
+    {
+        const auto input = context.inputs[0].f32p_view();
+        const auto generated = context.outputs[0].f32p_view();
+        const auto copied = context.outputs[1].f32p_view();
+        const bool copy = context.has_input(0) && copy_enabled.load(std::memory_order_relaxed);
+        for (std::size_t frame = 0; frame < input.frames(); ++frame)
+        {
+            generated.channel(0)[frame] = input.channel(0)[frame] + 0.25f;
+            copied.channel(0)[frame] = copy ? input.channel(0)[frame] : 0.0f;
+        }
+        if (!copy)
+            context.set_output_active(1, false);
+    }
+
+    std::atomic<bool> copy_enabled{true};
+};
+
+void port_activity()
+{
+    Engine engine(period);
+    ClockedGraph clock(engine);
+    const auto tone = engine.emplace_node<Tone>(rate, 1, 1000, 0.125f);
+    const auto split = engine.emplace_node<SplitSignal>();
+    const auto mixer = engine.emplace_node<Mixer>(rate, 1, 1);
+    const auto mixed = engine.emplace_node<PacketSink>(mono);
+    const auto direct = engine.emplace_node<PacketSink>(mono);
+    const auto copied = engine.emplace_node<PacketSink>(mono);
+    const auto fanout = engine.emplace_node<PacketSink>(mono);
+    const auto source = engine.emplace_node<PacketSink>(mono);
+    connect(engine, tone, source);
+    connect(engine, split, mixer);
+    connect(engine, mixer, mixed);
+    connect(engine, split, direct);
+    engine.connect(OPORT(split, 1), IPORT(copied, 0));
+    engine.connect(OPORT(split, 1), IPORT(fanout, 0));
+    engine.commit();
+    const auto *mixed_result = engine.node<PacketSink>(mixed);
+    const auto *direct_result = engine.node<PacketSink>(direct);
+    const auto *copied_result = engine.node<PacketSink>(copied);
+    const auto *fanout_result = engine.node<PacketSink>(fanout);
+    const auto *source_result = engine.node<PacketSink>(source);
+    const auto check_gap = [&] {
+        check(mixed_result->active && direct_result->active && mixed_result->sample(1) == 0.25f &&
+                  direct_result->sample(1) == 0.25f,
+              "A generated signal stays active on both routes even with an inactive input");
+        check(!copied_result->active && !fanout_result->active && copied_result->sample(1) == 0.0f &&
+                  fanout_result->sample(1) == 0.0f,
+              "Both readers of the second output see its independent inactive flag and zero samples");
+    };
+    const auto check_signal = [&] {
+        check(source_result->active && source_result->sample(1) > 0.0f,
+              "A source with no inputs defaults to active");
+        check(copied_result->active && fanout_result->active &&
+                  copied_result->sample(1) == source_result->sample(1) &&
+                  fanout_result->sample(1) == source_result->sample(1),
+              "Output defaults are restored before each process call");
+    };
+
+    clock.start();
+    clock.advance();
+    check_gap();
+    connect(engine, tone, split);
+    clock.commit();
+    clock.advance();
+    check_signal();
+    auto &copy_enabled = engine.node<SplitSignal>(split)->copy_enabled;
+    copy_enabled.store(false, std::memory_order_relaxed);
+    clock.advance();
+    check(!copied_result->active && copied_result->sample(1) == 0.0f,
+          "An inactive output clears samples left by the last active block");
+    copy_enabled.store(true, std::memory_order_relaxed);
+    clock.advance();
+    check_signal();
+    engine.set_paused(tone, true);
+    clock.commit();
+    clock.advance();
+    check_gap();
+    check(!source_result->active, "A paused source leaves its directly connected sink inactive");
+    engine.set_paused(tone, false);
+    clock.commit();
+    clock.advance();
+    check_signal();
+}
+
 class PreparingGain final : public NodeT<1, 1>
 {
   public:
@@ -220,6 +310,7 @@ void fractional_frames_and_ring_wrap()
 int main(int argc, char **argv)
 {
     return aereborn::test::run_tests(argc, argv, {{"graph_constraints", graph_constraints},
+                                                {"port_activity", port_activity},
                                                 {"commit_failure_and_retry", commit_failure_and_retry},
                                                 {"clock_boundary_barriers", clock_boundary_barriers},
                                                 {"fractional_frames_and_ring_wrap", fractional_frames_and_ring_wrap}});

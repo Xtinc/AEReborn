@@ -102,6 +102,7 @@ void Capture::process(const ProcessContext &context) noexcept
         graph_state_.fetch_and(~graph_active, std::memory_order_release);
     }
     output.subblock(frames, output.frames() - frames).clear();
+    context.set_output_active(0, frames != 0);
 }
 
 bool Capture::online() const noexcept

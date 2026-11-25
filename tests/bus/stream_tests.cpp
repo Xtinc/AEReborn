@@ -147,6 +147,81 @@ void irregular_push_and_pull()
         check(output.sample(frame) == input.sample(frame) - 0.125f, "The mix retains every frame across ring wrap");
 }
 
+void capture_gaps_keep_playback_timeline()
+{
+    TempWave files("capture-gaps");
+    const auto input_path = files.path("-input.wav"), output_path = files.path("-recorded.wav");
+    constexpr std::size_t short_frames = 7;
+    Pcm wave(pcm, frames + short_frames), expected(pcm, 8 * frames);
+    for (std::size_t frame = 0; frame < short_frames; ++frame)
+    {
+        wave.set(frames + frame, 0, -0.5f);
+        expected.set(3 * frames + frame, 0, 0.25f);
+        expected.set(6 * frames + frame, 0, -0.5f);
+    }
+    write_wave(input_path, wave);
+
+    Engine engine(period);
+    ClockedGraph clock(engine);
+    const auto capture = engine.emplace_node<Capture>(rate, 1, 5ms);
+    const auto monitor = engine.emplace_node<PacketSink>(planar);
+    const auto mix = engine.emplace_node<Mixer>(rate, 1, 2);
+    const auto playback = engine.emplace_node<Playback>(rate, 1, 5ms);
+    connect(engine, capture, monitor);
+    connect(engine, capture, mix);
+    connect(engine, mix, playback);
+    engine.commit();
+    auto &source = *engine.node<Capture>(capture);
+    const auto *dry = engine.node<PacketSink>(monitor);
+    WavPlayback writer(output_path, SampleFormat::F32LE);
+    writer.bind(*engine.node<Playback>(playback));
+    writer.start();
+    clock.start();
+    const auto advance = [&](bool active, const char *message) {
+        wait_for_playback(writer, frames);
+        clock.advance();
+        check(dry->frames == frames && dry->active == active, message);
+    };
+    advance(false, "Offline capture delivers an inactive block");
+
+    TestBackend prefilling(pcm, frames);
+    prefilling.block = true;
+    prefilling.bind(source);
+    prefilling.start();
+    advance(false, "Capture stays inactive while waiting for prefill");
+    check(source.online() && !source.steady(), "The capture is online and still prefilling");
+    prefilling.unbind();
+
+    PushSource push(pcm);
+    push.bind(source);
+    push.start();
+    Pcm packet(pcm, frames);
+    check(push.push(packet.input(0, frames)) == frames, "The queue accepts an intentional zero block");
+    advance(true, "Pushed zero samples keep the capture active");
+    for (std::size_t frame = 0; frame < short_frames; ++frame)
+        packet.set(frame, 0, 0.25f);
+    check(push.push(packet.input(0, short_frames)) == short_frames, "The queue accepts a partial block");
+    advance(true, "A short read keeps the capture active");
+    check(dry->sample(short_frames - 1) == 0.25f && dry->sample(short_frames) == 0.0f,
+          "Capture zero-fills the missing suffix of an active short read");
+    advance(false, "An empty queue makes the next block inactive");
+    check(source.online(), "The sender can stay online across an empty tick");
+    push.unbind();
+
+    WavCapture reader(input_path, false);
+    reader.bind(source);
+    reader.start();
+    wait_for_capture(reader, wave.frames);
+    advance(true, "Intentional silence from a WAV file is active");
+    advance(true, "The final partial WAV block is active");
+    wait_for([&] { return !reader.running(); }, "WAV capture reaches EOF after the graph consumes the queue");
+    advance(false, "A drained WAV capture becomes inactive");
+    reader.unbind();
+    writer.unbind();
+    check(read_wave(output_path, pcm, expected.frames).bytes == expected.bytes,
+          "WAV playback records every tick, including inactive blocks and partial-block padding");
+}
+
 void device_loss_and_rebind()
 {
     Engine engine(period);
@@ -260,6 +335,7 @@ int main(int argc, char **argv)
 {
     return aereborn::test::run_tests(argc, argv, {{"slow_callback_parallel_archive", slow_callback_parallel_archive},
                                                 {"irregular_push_and_pull", irregular_push_and_pull},
+                                                {"capture_gaps_keep_playback_timeline", capture_gaps_keep_playback_timeline},
                                                 {"device_loss_and_rebind", device_loss_and_rebind},
                                                 {"restart_shared_outputs", restart_shared_outputs}});
 }

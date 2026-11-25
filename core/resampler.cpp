@@ -153,16 +153,31 @@ void calc_coffs(const float *kernel, std::size_t phase_index, float phase_frac, 
 float interpolate(const float *history, const float *input, std::size_t history_taps,
                   const Coefficients &coffs) noexcept
 {
-    double sum = 0;
-    for (std::size_t i = 0; i < history_taps; ++i)
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    std::size_t i = 0;
+    for (; i + 4 <= history_taps; i += 4)
     {
-        sum += history[i] * coffs[i];
+        sum0 += history[i] * coffs[i];
+        sum1 += history[i + 1] * coffs[i + 1];
+        sum2 += history[i + 2] * coffs[i + 2];
+        sum3 += history[i + 3] * coffs[i + 3];
     }
-    for (std::size_t i = history_taps; i < taps; ++i)
+    for (; i < history_taps; ++i)
+        sum0 += history[i] * coffs[i];
+
+    const auto input_taps = taps - history_taps;
+    const auto *input_coffs = coffs.data() + history_taps;
+    i = 0;
+    for (; i + 4 <= input_taps; i += 4)
     {
-        sum += input[i - history_taps] * coffs[i];
+        sum0 += input[i] * input_coffs[i];
+        sum1 += input[i + 1] * input_coffs[i + 1];
+        sum2 += input[i + 2] * input_coffs[i + 2];
+        sum3 += input[i + 3] * input_coffs[i + 3];
     }
-    return static_cast<float>(sum);
+    for (; i < input_taps; ++i)
+        sum0 += input[i] * input_coffs[i];
+    return (sum0 + sum1) + (sum2 + sum3);
 }
 
 void prepare_filter(Buffer &history, std::vector<float> &kernel, std::size_t channels, double cutoff)
@@ -187,15 +202,15 @@ void prepare_filter(Buffer &history, std::vector<float> &kernel, std::size_t cha
 void filter_frame(OFBlock past, const std::vector<float> &kernel, IFBlock input, OFBlock output, std::size_t out_frame,
                   std::size_t through, std::size_t phase_index, float phase_fraction) noexcept
 {
-    const auto history_offset = std::min(through, taps);
-    const auto input_offset = through - history_offset;
+    const auto input_taps = std::min(through, taps);
+    const auto input_offset = through - input_taps;
     Coefficients coffs;
     calc_coffs(kernel.data(), phase_index, phase_fraction, coffs);
     for (std::size_t ch = 0; ch < output.channels(); ++ch)
     {
+        const auto *history = past.channel(ch) + input_taps;
         const auto *samples = through ? input.channel(ch) + input_offset : nullptr;
-        output.channel(ch)[out_frame] =
-            interpolate(past.channel(ch) + history_offset, samples, taps - history_offset, coffs);
+        output.channel(ch)[out_frame] = interpolate(history, samples, taps - input_taps, coffs);
     }
 }
 
@@ -254,8 +269,7 @@ double nominal_step(SampleRate src_fs, SampleRate dst_fs) noexcept
     return static_cast<double>(static_cast<std::uint32_t>(src_fs)) / static_cast<std::uint32_t>(dst_fs);
 }
 
-std::size_t workspace_bound(SampleRate src_fs, SampleRate dst_fs, std::size_t frames, double offset,
-                            bool bound_input)
+std::size_t workspace_bound(SampleRate src_fs, SampleRate dst_fs, std::size_t frames, double offset, bool bound_input)
 {
     if (!is_sample_rate(src_fs) || !is_sample_rate(dst_fs) || !valid_offset(offset))
         throw Error(ErrorCode::InvalidArg);
@@ -430,14 +444,12 @@ SincResampler::Transfer SincResampler::run(IFBlock input, OFBlock output, Positi
     return result;
 }
 
-std::size_t SincResampler::max_output_frames(SampleRate src_fs, SampleRate dst_fs, std::size_t frames,
-                                             double offset)
+std::size_t SincResampler::max_output_frames(SampleRate src_fs, SampleRate dst_fs, std::size_t frames, double offset)
 {
     return workspace_bound(src_fs, dst_fs, frames, offset, false);
 }
 
-std::size_t SincResampler::max_input_frames(SampleRate src_fs, SampleRate dst_fs, std::size_t frames,
-                                            double offset)
+std::size_t SincResampler::max_input_frames(SampleRate src_fs, SampleRate dst_fs, std::size_t frames, double offset)
 {
     return workspace_bound(src_fs, dst_fs, frames, offset, true);
 }

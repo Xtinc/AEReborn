@@ -37,6 +37,7 @@ class Convert final : public NodeT<1, 1>
 
   private:
     bool same_spec_ = false;
+    std::size_t tail_remaining_ = 0; ///< Zero input frames still needed to clear FIR history.
     SincResampler resampler_;
     Buffer decoded_;   ///< Allocated only when input is PCM and (resampler_.needs_fir() || output is different PCM).
     Buffer resampled_; ///< Allocated only when resampler_.needs_fir() && output is PCM.

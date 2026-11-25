@@ -204,9 +204,11 @@ void render_and_passive_io_without_heap()
     for (std::size_t tick = 0; tick < 8; ++tick)
     {
         const std::size_t frames = tick % 2 ? 220 : 221;
+        // Cover the initial idle block, streaming, tail flush, idle, and resumed input.
+        const bool active = tick != 0 && (tick < 4 || tick >= 6);
         heap::operations = 0;
         heap::measuring = true;
-        const auto pushed = input.push(source.input(0, frames));
+        const auto pushed = active ? input.push(source.input(0, frames)) : 0;
         heap::measuring = false;
         transfers += heap::operations;
         clock.advance();
@@ -215,7 +217,8 @@ void render_and_passive_io_without_heap()
         const auto pulled = output.pull(sink.output(0, 240));
         heap::measuring = false;
         transfers += heap::operations;
-        check(pushed == frames && pulled == 240, "Both passive I/O directions transfer every rendered block");
+        check(pushed == (active ? frames : 0) && pulled == 240,
+              "Passive playback keeps transferring blocks across capture gaps");
     }
     check(render->blocks == 8 && render->operations == 0 && transfers == 0,
           "DSP, render buffers and passive backend I/O reuse prepared memory");

@@ -1,4 +1,306 @@
 
+===== aereborn_dot.md =====
+# AEReborn 诊断实现核对与 DOT 可视化重构计划
+
+本文档分两部分：一是核对当前已落地的诊断实现与原设计方案的一致性并收口 2 处边界隐患；二是对 `diag/inspect.cpp` 的 Graphviz DOT 输出进行彻底重构，淘汰晦涩的几何符号与扁平文本框，改为面向排障的 **Patchbay 卡片式可视化方案**。
+
+---
+
+## 1. 已落地实现核对与边界收口
+
+对照原计划 `AudioEngine_Diagnostics_Plan.md`，当前 `core/`、`plugins/`、`backend/` 与 `diag/` 的整体架构完全符合“无冗余 Snapshot 结构体、仅查生效计划、后端方向由 `type_name()` 表达、零热路径开销”的原则，且多处落地细节更为严谨：
+
+| 模块 | 超出原计划的优秀落地细节 |
+| --- | --- |
+| `core/fring.h`、`plugins/endpoint.h` | 引入 `FrameRing::estimate(std::size_t&)` 与 `estimate_queued_frames()`，自动过滤并发采样双游标时偶发的越界撕裂值。 |
+| `core/engine.h/.cpp` | 更名为语义更精确的 `missed_periods()` 与 `uint64_t last_tick_us()`；`state()`、`plan_generation()` 统一补充 `require_control_thread()` 守卫。 |
+| `Graph::resolve()` | 保持 `DraftNode::inputs` 结构不变，直接按 `node_index` 过滤生效连接，改动面更小。 |
+| `backend/backend.h/.cpp` | `ASRC::correction` 直接原子化保持单一事实来源；`Backend::type_name()` 提供默认实现，降低测试桩负担。 |
+| `diag/inspect.cpp` | 全部 `std::ostringstream` 显式设置 `std::locale::classic()`，避免受系统 locale 影响小数格式。 |
+
+### 需收口的 2 处边界隐患
+
+#### 隐患 1：`Capture::close()` / `Playback::close()` 下线后未复位 `primed_`
+
+* **现状**：`Capture::close()` 和 `Playback::close()` 仅关闭了 `graph_open` 并清空 `ring_`，未将 `primed_` 重置为 `false`。后端 `stop()` 后，`online()` 返回 `false`，但直接查询 `endpoint.steady()` 仍返回 `true`（`diag/inspect.cpp` 目前被迫写为 `online && endpoint.steady()` 兜底）。
+* **修复方案**：在 `Capture::close()` 和 `Playback::close()` 清空 `ring_` 时同步复位 `primed_.store(false, std::memory_order_release);`。
+* **关键约束**：**严禁在 `close_graph_gate()` 或 `Playback::close_graph()` 中复位 `primed_`**。同步播放停机排空（`ActiveBackend::stop()` $\to$ `close_playback_graph()` $\to$ `drain_playback()`）期间，I/O 线程仍需调用 `Playback::read()` 排空剩余帧；若提前清零 `primed_`，队列低于 50% 水位时会被预填充门控重新拦截导致排空失败。
+
+#### 隐患 2：`diag/inspect.cpp` 中 `Convert` 标签遗漏格式转换
+
+* **现状**：当前 DOT 生成使用 `if (input.sample_rate != output.sample_rate) ... else if (input.format != output.format) ...`，当 `Convert` 同时改变采样率和样本格式时（如 `48k F32P` 转 `16k S16LE`），`else if` 会静默丢弃格式转换信息。
+* **修复方案**：并入本轮 DOT 重构，同时比对 `sample_rate` 与 `format` 并按实际变化完整展示。
+
+---
+
+## 2. 当前 DOT 图的核心痛点
+
+1. **符号表意不明且易乱码**：使用 `●`、`◐`、`○` 表示在线/预填充/离线，`▰▱` 拼装进度条，`Σ`、`↔`、`×` 修饰插件，`!` 混用表示 XRUN 与后端故障。既需要对照图例猜测含义，又容易在常规无衬线字体下出现字宽错位或回退乱码。
+2. **关键排障信息隐藏在 `tooltip`**：静态导出（PNG/PDF）或快速浏览时无法直接看到连线的音频规格、端口号、`Mixer` 静音通道、`Backend` 的具体错误码以及 `Engine` 的 `dirty` / `late` 告警。
+3. **信息主次倒置**：正常节点堆砌装饰符号，而真正影响“为何无声/卡顿”的核心状态（`Mixer` 静音路、`Matrix` 声道映射与零增益、`Backend` 的 `Draining`/`Stopped` 与错误码）在主图缺失。
+4. **扁平文本框缺结构层次**：普通 `shape=box` 靠换行堆叠文本，多总线、多分支场景下难以分辨端口映射与硬件边界。
+
+---
+
+## 3. 新版 DOT 可视化设计：Patchbay 卡片式架构
+
+保持 `diag/inspect.h` 公开 API 与 Graphviz 工具链完全不变，在 `diag/inspect.cpp` 内部改用 Graphviz 原生 **HTML-Like Table 卡片（`shape=plain`）**，通过以下四项规则实现“一眼定位拓扑与故障”：
+
+### 3.1 核心表达规则
+
+1. **零神秘符号，统一使用短英文状态词 + 语义色板**
+   * 不再需要顶部符号图例，文字自解释：
+     * 引擎状态：`UNPREPARED`、`READY`、`RUNNING`
+     * 端点状态：`ONLINE`、`PREFILL`、`OFFLINE`
+     * 后端状态：`RUN`、`DRAIN`、`STOPPING`、`STOP`、`ERR: <ErrorCode>`（使用短枚举名，如 `ERR: DeviceLost`、`ERR: Timeout`、`ERR: EndOfStream`）
+2. **正常静默、异常高亮**
+   * `dirty == false`、`missed_periods == 0`、`underrun == 0`、`overflow == 0` 时不占用卡片版面。
+   * 一旦出现异常（未提交草稿、时钟逾期、队列 XRUN、后端报错），立即弹出高对比度琥珀/红色徽章或告警行。
+3. **显式端口插槽与静音连线可视化**
+   * `Mixer` 及任意多端口节点（`inputs.size() > 1 || outputs.size() > 1`）在卡片内逐行绘制左入右出端口插槽（`PORT="i0"`、`PORT="o0"`），连线经 `:e` / `:w` 锚点精确对接。
+   * `Mixer` 已静音的输入槽标注 `[MUTE]` 并置灰；连向该输入槽的边自动渲染为**灰色虚线**并附 `(muted)`，阻断点一目了然。
+4. **主图信息凝练，完整细节保留在 `tooltip`**
+   * 节点卡片与边标签直接展示最关键的拓扑与运行事实；完整的端口明细、未截断的 `RetCode::message()` 及 Windows WASAPI 原生 `HRESULT` 仍保留在 SVG `tooltip` 中供悬停深查。
+
+### 3.2 语义色板规范
+
+| 角色 / 状态 | 标题栏底色 | 边框色 | 标题 / 徽章文字色 | 适用场景 |
+| --- | --- | --- | --- | --- |
+| **端点（正常）** | `#DFF4F0` | `#2E8B7D` | `#0F172A` / `#15803D` | `Capture`、`Playback` 稳态在线 |
+| **图内 DSP 节点** | `#E8EEF7` | `#4A6FA5` | `#0F172A` | `Mixer`、`Matrix`、`Convert` 及自定义节点 |
+| **外部后端（正常）** | `#F1F5F9` | `#64748B` | `#0F172A` / `#15803D` | `Alsa*`、`Wasapi*`、`Wav*`、`Null*`、`PushSource`、`PullSink`、`UsrPlayback` |
+| **告警 / 过渡态** | `#FEF3C7` | `#D97706` | `#92400E` / `#B45309` | `PREFILL`、`DRAIN`、`STOPPING`、`DIRTY`、`LATE`、存在 XRUN |
+| **错误态** | `#FEE2E2` | `#DC2626` | `#991B1B` / `#DC2626` | `!backend.last_error()` |
+| **静默 / 离线态** | `#F3F4F6` | `#9CA3AF` | `#64748B` / `#9CA3AF` | `OFFLINE`、`STOP`、`[MUTE]` 槽位、静音入边、`Detached` 后端 |
+
+### 3.3 各类元素的卡片与连线规范
+
+#### (1) 顶部引擎状态横幅（Graph Label）
+
+单行无边框表格，紧凑呈现核心遥测：
+
+* 固定项：`AEReborn` + 引擎状态徽章（`RUNNING` 绿 / `READY` 蓝 / `UNPREPARED` 灰）+ `period | Plan #gen | tick N | M us`
+* 按需告警徽章：
+  * `engine.dirty() == true` 时追加琥珀徽章 `DIRTY`
+  * `engine.missed_periods() > 0` 时追加红/琥珀徽章 `LATE <count>`
+
+#### (2) `Capture` / `Playback` 端点卡片
+
+* 边框采用 `<TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED">` + `<HR/>` 分隔标题栏与正文（兼顾圆角轮廓与清晰分隔线）。
+* 标题栏：`Capture #id`（或 `Playback #id`）+ 状态徽章：
+  * `online() && steady()` $\to$ `ONLINE`（绿）
+  * `online() && !steady()` $\to$ `PREFILL`（琥珀）
+  * `!online()` $\to$ `OFFLINE`（灰）
+* 正文行：
+  * 队列水位：`Queue 960/1920 (50%)`（当 `estimate_queued_frames()` 不可用时显示 `Queue -/1920`）。
+  * 异常行（仅在 `lost > 0` 时显示）：`Underrun: <N>f` 或 `Overflow: <N>f`（琥珀加粗，同时卡片边框与标题栏切至告警色）。
+
+#### (3) `Mixer` 与多端口节点卡片
+
+* 只要节点满足 `inputs.size() > 1 || outputs.size() > 1`，使用两列端口表（标题栏 `COLSPAN="2"`，下方用 `<HR/>` 分隔，左右列用 `<VR/>` 分隔）：
+  * 左列逐行渲染 `in0`、`in1`…（`PORT="i0"`、`PORT="i1"`…）；若为 `Mixer` 且 `muted(i) == true`，该单元格底色 `#F3F4F6`、字色 `#9CA3AF`，文本为 `in<i> [MUTE]`。
+  * 右列逐行渲染 `out0`…（`PORT="o0"`…）；当左右端口数不等（如 `Mixer` 为 $N$ 入 1 出）时，较少一侧最后一行用 `ROWSPAN` 纵向合并对齐。
+
+#### (4) `Matrix`、`Convert` 与单端口节点卡片
+
+* **`Matrix`**：
+  * 声道数变化时显示 `<in_ch>ch -> <out_ch>ch | `，否则省略声道映射前缀。
+  * 增益显示 `Gain 0.50`；当 `gain() == 0.0f` 时显示 `Gain 0.00 [MUTE]`（标题与边框可保持 DSP 色，文字标灰提示零输出）。
+* **`Convert`**：
+  * 同时检查 `sample_rate` 与 `format`：
+    * 两者均变化：`48k F32P -> 16k S16LE`
+    * 仅采样率变化：`48k -> 44.1k`
+    * 仅格式变化：`F32P -> S16LE`
+    * 规格相同：`passthrough`
+* **其他单端口自定义节点（如 `Tone`、`Meter` 或算法节点）**：
+  * 标题栏显示 `type_name() #id`，正文按端口规格显示紧凑概要（如 `48k 1ch F32P`）。
+
+#### (5) `Backend` 外部驱动卡片与 `Detached` 分组
+
+* 标题栏：`backend.type_name()` + 状态徽章：
+  * `!error` $\to$ `ERR: <ShortErrorCode>`（红，卡片整体切换错误色）
+  * `ActiveBackend`: `Running` $\to$ `RUN`、`Draining` $\to$ `DRAIN`（琥珀）、`Stopping` $\to$ `STOPPING`（琥珀）、`Stopped` $\to$ `STOP`（灰）
+  * `PassiveBackend`: `running()` $\to$ `RUN` / `STOP`
+* 正文两行：
+  * 第 1 行（已绑定时）：设备原生规格 + 批次上限，例如 `48k 2ch S32LE (max 240f)`；未绑定时显示 `unbound`。
+  * 第 2 行：时钟与处理摘要：
+    * `ActiveBackend` 异步：`async · FIR · drift +12.4 ppm`（仅在 `uses_resampler()` 时含 `FIR`，异步始终含 `drift`）
+    * `ActiveBackend` 同步：`sync`（若 `uses_resampler()` 则 `sync · FIR`）
+    * `PassiveBackend`：`passive`（若 `uses_resampler()` 则 `passive · FIR`）
+* **Detached Backends**：未关联到任何生效 Plan 节点的后端归入 `subgraph cluster_detached`，虚线灰框标注 `Detached Backends`。
+
+#### (6) 连线（Edge）规范
+
+* **图内连接（`plan_connections()`）**：
+  * 锚点：若源/目标节点为多端口卡片，分别使用 `n<from>:o<idx>:e` 和 `n<to>:i<idx>:w`；单端口卡片使用 `n<from>:e` 和 `n<to>:w`。
+  * 标签：直接显示紧凑格式（如 `48k 2ch F32P`），字体 9pt 浅灰 `#64748B`。
+  * 静音检测：若目标节点为 `Mixer` 且 `mixer->muted(conn.to.index)`，边样式设为 `style=dashed, color="#9CA3AF", fontcolor="#9CA3AF"`，标签追加 `(muted)`。
+* **后端与端点边界连线**：
+  * 方向：`Capture` 为 `b<id>:e -> n<id>:w`，`Playback` 为 `n<id>:e -> b<id>:w`。
+  * 样式：虚线 `style=dashed`；若 `!backend.last_error()` 线条标红 `#DC2626`，否则 `#64748B`。
+  * 标签：按边界处理模式简洁标注——异步标 `ASRC`，同步/被动带重采样标 `FIR`，无重采样标 `PCM`。
+
+---
+
+## 4. 完整 DOT 输出示例
+
+以下为典型多路总线场景（1 路 ALSA 正常采集 + 1 路 WAV 采集 EOF 欠载且在 Mixer 被静音 + Matrix 声道缩混 + Convert 采样率与格式双转 + WASAPI 异步播放）的目标 DOT 输出，可直接通过 `dot -Tsvg` 渲染验证：
+
+~~~dot
+digraph AEReborn {
+  graph [
+    rankdir=LR, splines=true, bgcolor="#FFFFFF",
+    pad=0.32, nodesep=0.42, ranksep=0.72, labelloc=t,
+    fontname="Helvetica,Arial,sans-serif",
+    label=<
+      <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="4">
+        <TR>
+          <TD><B><FONT POINT-SIZE="15" COLOR="#0F172A">AEReborn</FONT></B></TD>
+          <TD BGCOLOR="#DCFCE7"><B><FONT POINT-SIZE="10" COLOR="#166534"> RUNNING </FONT></B></TD>
+          <TD><FONT POINT-SIZE="10" COLOR="#475569">5ms | Plan #3 | tick 12480 | 138 us</FONT></TD>
+          <TD BGCOLOR="#FEF3C7"><B><FONT POINT-SIZE="10" COLOR="#B45309"> DIRTY </FONT></B></TD>
+        </TR>
+      </TABLE>
+    >
+  ];
+  node [shape=plain, fontname="Helvetica,Arial,sans-serif"];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9, fontcolor="#64748B", color="#475569", arrowsize=0.7, penwidth=1.4];
+
+  b1 [label=<
+    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED" COLOR="#64748B" BGCOLOR="#FFFFFF">
+      <TR><TD BGCOLOR="#F1F5F9" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#0F172A">AlsaCapture</FONT></B>  <FONT POINT-SIZE="9" COLOR="#15803D"><B>RUN</B></FONT></TD></TR>
+      <HR/>
+      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#334155">48k 2ch S32LE (max 240f)<BR ALIGN="LEFT"/>async | FIR | drift +12.4 ppm</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  n1 [label=<
+    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED" COLOR="#2E8B7D" BGCOLOR="#FFFFFF">
+      <TR><TD BGCOLOR="#DFF4F0" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#0F172A">Capture</FONT></B> <FONT POINT-SIZE="9" COLOR="#64748B">#1</FONT>  <FONT POINT-SIZE="9" COLOR="#15803D"><B>ONLINE</B></FONT></TD></TR>
+      <HR/>
+      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#334155">Queue 960/1920 (50%)</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  b2 [label=<
+    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED" COLOR="#DC2626" BGCOLOR="#FFFFFF">
+      <TR><TD BGCOLOR="#FEE2E2" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#991B1B">WavCapture</FONT></B>  <FONT POINT-SIZE="9" COLOR="#DC2626"><B>ERR: EndOfStream</B></FONT></TD></TR>
+      <HR/>
+      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#7F1D1D">44.1k 2ch S16LE (max 220f)<BR ALIGN="LEFT"/>sync | FIR</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  n2 [label=<
+    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED" COLOR="#D97706" BGCOLOR="#FFFFFF">
+      <TR><TD BGCOLOR="#FEF3C7" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#0F172A">Capture</FONT></B> <FONT POINT-SIZE="9" COLOR="#64748B">#2</FONT>  <FONT POINT-SIZE="9" COLOR="#64748B"><B>OFFLINE</B></FONT></TD></TR>
+      <HR/>
+      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#334155">Queue 0/1920 (0%)<BR ALIGN="LEFT"/></FONT><FONT POINT-SIZE="9" COLOR="#B45309"><B>Underrun: 480f</B></FONT></TD></TR>
+    </TABLE>
+  >];
+
+  n3 [label=<
+    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="4" STYLE="ROUNDED" COLOR="#4A6FA5" BGCOLOR="#FFFFFF">
+      <TR><TD COLSPAN="2" BGCOLOR="#E8EEF7" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#0F172A">Mixer</FONT></B> <FONT POINT-SIZE="9" COLOR="#64748B">#3</FONT></TD></TR>
+      <HR/>
+      <TR>
+        <TD PORT="i0" ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#334155">in0</FONT></TD>
+        <VR/>
+        <TD PORT="o0" ROWSPAN="2" ALIGN="RIGHT"><FONT POINT-SIZE="9" COLOR="#334155">out0</FONT></TD>
+      </TR>
+      <TR>
+        <TD PORT="i1" BGCOLOR="#F3F4F6" ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#9CA3AF">in1 [MUTE]</FONT></TD>
+      </TR>
+    </TABLE>
+  >];
+
+  n4 [label=<
+    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED" COLOR="#4A6FA5" BGCOLOR="#FFFFFF">
+      <TR><TD BGCOLOR="#E8EEF7" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#0F172A">Matrix</FONT></B> <FONT POINT-SIZE="9" COLOR="#64748B">#4</FONT></TD></TR>
+      <HR/>
+      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#334155">2ch -&gt; 1ch | Gain 0.50</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  n5 [label=<
+    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED" COLOR="#4A6FA5" BGCOLOR="#FFFFFF">
+      <TR><TD BGCOLOR="#E8EEF7" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#0F172A">Convert</FONT></B> <FONT POINT-SIZE="9" COLOR="#64748B">#5</FONT></TD></TR>
+      <HR/>
+      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#334155">48k F32P -&gt; 16k S16LE</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  n6 [label=<
+    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED" COLOR="#2E8B7D" BGCOLOR="#FFFFFF">
+      <TR><TD BGCOLOR="#DFF4F0" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#0F172A">Playback</FONT></B> <FONT POINT-SIZE="9" COLOR="#64748B">#6</FONT>  <FONT POINT-SIZE="9" COLOR="#15803D"><B>ONLINE</B></FONT></TD></TR>
+      <HR/>
+      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#334155">Queue 952/1920 (50%)</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  b6 [label=<
+    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED" COLOR="#64748B" BGCOLOR="#FFFFFF">
+      <TR><TD BGCOLOR="#F1F5F9" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#0F172A">WasapiPlayback</FONT></B>  <FONT POINT-SIZE="9" COLOR="#15803D"><B>RUN</B></FONT></TD></TR>
+      <HR/>
+      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#334155">48k 2ch F32LE (max 480f)<BR ALIGN="LEFT"/>async | FIR | drift -8.1 ppm</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  b1:e -> n1:w [style=dashed, color="#64748B", label=" ASRC "];
+  b2:e -> n2:w [style=dashed, color="#DC2626", label=" FIR "];
+  n1:e -> n3:i0:w [label=" 48k 2ch F32P "];
+  n2:e -> n3:i1:w [style=dashed, color="#9CA3AF", fontcolor="#9CA3AF", label=" 48k 2ch F32P (muted) "];
+  n3:o0:e -> n4:w [label=" 48k 2ch F32P "];
+  n4:e -> n5:w [label=" 48k 1ch F32P "];
+  n3:o0:e -> n6:w [label=" 48k 2ch F32P "];
+  n6:e -> b6:w [style=dashed, color="#64748B", label=" ASRC "];
+}
+~~~
+
+---
+
+## 5. 逐文件改造清单与实现细节
+
+### 5.1 `plugins/endpoint.cpp`（2 行修复）
+
+* 在 `Capture::close()` 和 `Playback::close()` 中，于 `ring_.clear()` 旁补充 `primed_.store(false, std::memory_order_release);`。
+* 保持 `close_graph_gate()` 与 `Playback::close_graph()` 不变，确保同步播放排空流程不受影响。
+
+### 5.2 `diag/inspect.cpp`（集中重构 `dump_dot()`）
+
+`diag/inspect.h` 与 `dump_text()` 均无需改动。`diag/inspect.cpp` 内部调整如下：
+
+1. **移除旧 Unicode 常量**：删除 `online_symbol`、`prefill_symbol`、`offline_symbol`、`▰`/`▱`、`Σ`/`↔`/`×` 等符号拼接逻辑。
+2. **新增 3 个纯辅助函数（匿名命名空间）**：
+   * `write_html_escaped(std::ostream &, const std::string &)`：将 `&`、`<`、`>`、`"` 分别转义为 `&amp;`、`&lt;`、`&gt;`、`&quot;`，确保自定义节点名或平台错误串不会破坏 HTML-Like Label 语法。
+   * `error_code_name(ErrorCode)`：覆盖 `core/retcode.h` 全部 18 个枚举值，返回紧凑短名（如 `"DeviceLost"`、`"EndOfStream"`、`"Timeout"`），用于后端卡片红标；`tooltip` 继续输出完整 `RetCode::message()` 与 WASAPI `HRESULT`。
+   * `write_short_rate(std::ostream &, SampleRate)`：纯整数格式化采样率（`48000` $\to$ `48k`，`44100` $\to$ `44.1k`，`11025` $\to$ `11.025k`），不修改 `std::ostream` 的浮点格式标志位。
+3. **重写卡片与边生成函数**：
+   * `is_multiport_node(const Node &)`：判断 `inputs().size() > 1 || outputs().size() > 1`，统一驱动多端口插槽渲染与连线端口锚点（`:o<idx>:e` / `:i<idx>:w`）。
+   * `write_dot_endpoint(...)`：渲染 `Capture`/`Playback` 卡片，含 `ONLINE`/`PREFILL`/`OFFLINE` 徽章、`Queue frames/cap (pct%)` 与按需 XRUN 告警行。
+   * `write_dot_node(...)`：分发端点卡片、多端口插槽卡片（`Mixer` 标记 `[MUTE]`）、以及 `Matrix`（声道变化 + `Gain` / `[MUTE]`）、`Convert`（同时比较 `sample_rate` 与 `format`）、其他单端口节点卡片。
+   * `write_dot_backend(...)`：渲染外部驱动卡片，区分 `RUN` / `DRAIN` / `STOPPING` / `STOP` / `ERR: <ShortCode>`，展示设备规格、批次上限、`async`/`sync`/`passive`、`FIR` 与 `drift`。
+   * 边循环：为图内连线标注紧凑规格、识别 `Mixer` 静音输入并灰虚化连线；为后端↔端点虚线标注 `ASRC` / `FIR` / `PCM`。
+   * 全部节点、后端、连线及根图仍保留 `tooltip` 输出完整诊断信息。
+
+### 5.3 文档与测试同步
+
+| 文件 | 同步内容 |
+| --- | --- |
+| `AudioEngine_Outline.md` | 更新第 7 节“运行态诊断”：删去 `●、◐、○`、条形刻度和 `!` 的旧描述，改为文字状态徽章、端口插槽与静音连线说明。 |
+| `tests/`（`io.endpoint_diagnostics`） | 补充验证：后端 `stop()` 后 `Capture::steady()` 与 `Playback::steady()` 归回 `false`；同时确认同步播放停机排空（`WavPlayback` / `UsrPlayback`）回归无破坏。 |
+| `tests/`（`io.diagnostic_reports`） | 更新 DOT 断言：校验 HTML 卡片与文字状态（`RUNNING`/`ONLINE`/`OFFLINE`/`ERR: ...`）、`Mixer` 端口插槽与静音虚线、`Convert` 同变采样率与格式输出、`Matrix` 声道映射与增益、`DIRTY` 徽章以及 `Detached` 分组。 |
+
+---
+
+## 6. 验收清单
+
+1. **视觉与语法正确性**：将测试生成的 DOT 输出经 `dot -Tsvg` 渲染，零语法告警；图内无豆腐块/错位 Unicode 符号，节点层次、端口对接、静音支路、错误高亮与孤立后端一眼可辨。
+2. **信息完备性**：
+   * `Convert(48k F32P -> 16k S16LE)` 同时完整展示采样率与格式变化。
+   * `Mixer` 静音输入在卡片槽位与对应入边上均有清晰灰显标记。
+   * 后端报错卡片直接显示具体短错误码（如 `ERR: DeviceLost` / `ERR: EndOfStream`），而非单个 `!`。
+3. **转义安全性**：自定义节点 `type_name()` 返回含 `<`、`>`、`&`、`"` 的字符串时，生成的 DOT 仍为合法语法。
+4. **生命周期与并发回归**：`Capture::close()` / `Playback::close()` 复位 `primed_` 后，`steady()` 语义自洽，且同步播放排空（含队列剩余帧小于 50% 水位时）全部通过；Debug 与 Release 全量 CTest（含 `regression` 零堆分配检查）全绿。
 ===== AudioEngine_Backend_Plan.md =====
 # 设备后端实施说明
 
@@ -110,7 +412,7 @@ Node A 的 OPort ── Connection ──> Node B 的 IPort
 一个 Port 表示一组声道，声道间的选择、复制和合并由 Matrix 表达。
 `NodeId` 标识图中的节点，替换节点实例时 ID 继续有效。`ConnId` 标识一次连接，重新连接相同端口会生成新的 ID。原型采用进程内不复用的唯一 ID。Node 不持有其他 Node 的共享所有权，也不各自维护连接列表或调度循环。
 
-Source、Processor、Mixer、Sink 是具体节点的用途。Convert 负责格式与采样率转换。Mixer、Matrix 和 Tone 使用 planar float，算法节点可以声明自己需要的 PCM 格式。测试使用 Capture、Playback 模拟设备缓冲交接，使用 Tone 生成信号。
+Source、Processor、Mixer、Sink 是具体节点的用途。Convert 负责格式与采样率转换。Mixer、Matrix 和 Tone 使用 planar float，算法节点可以声明自己需要的 PCM 格式。I/O 测试经 Capture、Playback 与实际后端交换音频，也可使用 Tone 生成可预测的信号。
 
 | 用途 | 职责 | 当前实现 |
 | --- | --- | --- |
@@ -264,6 +566,12 @@ Tone / BUS（48k F32P）
 - 调用方在控制侧串行执行控制接口和析构。同一 Engine 的时钟线程调用控制接口时抛出 `Error(Busy)`。节点需要请求修改引擎时，将操作延后投递到应用的串行执行器并直接返回，例如使用 `asio::post`。实例有效期间可并发读取 `block_period()` 与 `tick_position()`。
 - 处理路径尽量避免锁等待，禁止堆分配、释放和调用普通应用回调。异步使用块数据必须在 process() 返回前复制到后端自有缓冲。
 
+### 运行态诊断
+
+链接 `aereborn::diag` 并包含 `diag/inspect.h`，即可在串行控制侧调用 `dump_text()` 或 `dump_dot()`。两者都支持返回字符串或写入输出流。传入需要一起检查的后端，报告会按端点关联生效节点，并列出未进入生效 Plan 的后端。队列水位为近似值，`underrun` 和 `overflow` 分别累计图侧采集缺帧和播放丢帧。`late` 是时钟跳过的周期数，`tick_us` 是最近一拍含时钟收尾的估计耗时。
+
+用 `dot -Tsvg graph.dot -o graph.svg` 渲染信号流图。卡片标题显示端点状态和后端错误短码，橙色标记预填充、排空、跳拍或队列缺帧。多端口节点按插槽接线，Mixer 的静音端口置灰，对应入边用灰色虚线标识。卡片和连线直接显示关键规格，SVG 悬停可查看完整诊断详情。`io.diagnostic_reports` 检查文本和 DOT 输出，`io.endpoint_diagnostics` 检查端点计数、重启及短批次排空。
+
 ### 构建与验证
 
 项目使用 C++14。`aereborn::core` 和 `aereborn::backend` 链接 `Threads::Threads`。静态库 `aereborn::backend` 包含 `PushSource`、`PullSink`、`UsrPlayback`、Null 和 RIFF/WAVE 后端。Linux 在查找到 ALSA 开发库时编译 ALSA 后端并定义 `AEREBORN_HAS_ALSA`，Windows 编译 WASAPI 后端。只构建库可设置 `-DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF`。
@@ -274,13 +582,16 @@ cmake --build build --config Debug --parallel 4
 ctest --test-dir build -C Debug --output-on-failure
 cmake --build build --config Release --parallel 4
 ctest --test-dir build -C Release --output-on-failure
+ctest --test-dir build -C Release -L bus --output-on-failure
 ~~~
 
-测试按 core、runtime、routing、convert、resampling、mix、device、endpoint、push_source、pull_sink、usr_playback、drift、tone、allocation、example 分组。引擎测试使用内置时钟，通过测试节点在块边界与测试控制侧同步。混音、格式转换和重采样使用独立字节或数值参照。端点测试覆盖分数帧、队列换包、阻塞停机、错误下线、批次帧数越界、格式重开和模拟漂移。图处理、设备 I/O、推拉和回调交付的运行期数据通路验证零堆操作。带线程的后端在重新启动时创建新的工作线程。
+测试目录和 CTest 标签使用 `core`、`dsp`、`bus`、`io`、`regression`。单独运行四声道场景可使用 `ctest --test-dir build -C Release -R '^bus.four_channel_song_archive$' --output-on-failure`。引擎测试使用内置时钟，通过测试节点在块边界与测试控制侧同步。混音、PCM 转换和重采样使用独立字节或数值参照。
 
-MSVC Debug 的迭代器代理会在 noexcept 构造中分配内存，allocation 用例按项目规则跳过，在 Release 完整执行。示例由默认开启的 BUILD_EXAMPLES 控制。
+`tests/data/` 的两份 48 kHz 双声道 WAV 短片来自《渡口》第 30 秒起的 0.5 秒和 CaliforniaHotel 第 40 秒起的 0.75 秒。四声道测试将两段音乐交错到同一个输入，生成两份 48 kHz 拆分归档和一份 44.1 kHz 混音归档。录音和分段文件在构建目录内创建，正常退出时清理。
 
-设备测试覆盖测试后端、Null、WAV 往返及可用时的 ALSA 虚拟设备。后端生命周期、异步超时和 ALSA 参数见 [设备后端实施说明](AudioEngine_Backend_Plan.md)。
+`io` 包含后端绑定、设备超时、WAV 文件和时钟漂移检查。Linux 有 ALSA 时运行两种 `plug:null` 采集和播放配置。Windows 默认验证 WASAPI 绑定失败和 Null 接管。设置 `AEREBORN_WASAPI_CAPTURE_ID` 或 `AEREBORN_WASAPI_PLAYBACK_ID` 后，可用 `ctest --test-dir build -C Release -L hardware --output-on-failure` 运行对应实机用例。后端生命周期、异步超时和 ALSA 参数见 [设备后端实施说明](AudioEngine_Backend_Plan.md)。
+
+MSVC Debug 的迭代器代理会在 `noexcept` 构造中分配内存，`regression` 中的分配注入和零分配检查在 Release 执行。示例由默认开启的 `BUILD_EXAMPLES` 控制。
 
 ## 8. 实现顺序
 
@@ -292,9 +603,9 @@ MSVC Debug 的迭代器代理会在 noexcept 构造中分配内存，allocation 
 
 各阶段复用同一张图与同一套节点执行机制。
 
-第一步的验收用例包括 `core.audio_block_layout`、`core.commit_retry`、`routing.explicit_mix_and_fanout`、`routing.algorithm_chain`、`routing.silence_and_pruning` 和 `core.feedback_rejection`。路由走实际的 Convert、Mixer 和 Matrix，算法由声明固定 PCM 格式的测试节点提供。
+第一步的验收包括 `core.graph_constraints`、`core.commit_failure_and_retry`、`bus.subgroup_and_monitor` 和 `bus.parallel_pcm_algorithm`。路由走实际的 Convert、Mixer 和 Matrix，算法由声明固定 PCM 格式的测试节点提供。
 
-第二步的验收覆盖 `runtime` 用例、`allocation.render_uses_prepared_buffers` 和 `example.clocked_graph`。
+第二步的验收覆盖 `core.clock_boundary_barriers`、`bus.live_input_switch` 和 `regression.render_and_passive_io_without_heap`。可运行 `clocked_graph` 示例观察运行期间的音量更新。
 
 ===== CODING_GUIDELINES.md =====
 # AEReborn 编程约束
@@ -436,6 +747,10 @@ add_library(aereborn::plugins ALIAS aereborn_plugins)
 target_link_libraries(aereborn_plugins PUBLIC aereborn::core)
 
 add_subdirectory(backend)
+
+add_library(aereborn_diag STATIC diag/inspect.cpp)
+add_library(aereborn::diag ALIAS aereborn_diag)
+target_link_libraries(aereborn_diag PUBLIC aereborn::backend)
 
 include(CTest)
 option(BUILD_EXAMPLES "Build AEReborn examples" ON)
@@ -767,6 +1082,7 @@ struct Topology
 {
     std::vector<std::shared_ptr<NodeEntry>> nodes;
     std::vector<Link> links;
+    std::vector<Connection> connections;
 };
 } // namespace
 
@@ -846,7 +1162,7 @@ class Engine::Graph
         if (would_cycle(from.node, to.node))
             throw Error(ErrorCode::Cycle);
         const ConnId id{next_identifier()};
-        connections_.emplace(id, Connection{from, to});
+        connections_.emplace(id, ConnectionPorts{from, to});
         input = from;
         dirty_ = true;
         return id;
@@ -869,6 +1185,12 @@ class Engine::Graph
             if (!item.second.paused && item.second.entry->outputs.empty())
                 visit(item.second, topology, node_index);
 
+        for (const auto &item : connections_)
+        {
+            const auto &connection = item.second;
+            if (node_index.count(connection.from.node) && node_index.count(connection.to.node))
+                topology.connections.push_back({item.first, connection.from, connection.to});
+        }
         return topology;
     }
 
@@ -901,13 +1223,13 @@ class Engine::Graph
         std::vector<OPort> inputs;
         bool paused = false;
     };
-    struct Connection
+    struct ConnectionPorts
     {
         OPort from;
         IPort to;
     };
     using Nodes = std::map<NodeId, DraftNode>;
-    using Connections = std::map<ConnId, Connection>;
+    using Connections = std::map<ConnId, ConnectionPorts>;
     using NodeIndex = std::map<NodeId, std::size_t>;
     Nodes::iterator find_node(NodeId id)
     {
@@ -1013,12 +1335,21 @@ class Engine::Clock
             while (!changed_.wait_until(lock, deadline, [this] { return stopping_; }))
             {
                 lock.unlock();
+                const auto started = std::chrono::steady_clock::now();
                 const bool swapped = engine.tick();
                 lock.lock();
                 if (swapped)
                     applied_.notify_one();
-                const auto lateness = std::chrono::steady_clock::now() - deadline;
-                deadline += interval * (lateness >= interval ? lateness / interval + 1 : 1);
+                const auto finished = std::chrono::steady_clock::now();
+                const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(finished - started);
+                engine.last_tick_us_.store(elapsed.count(), std::memory_order_relaxed);
+                deadline += interval;
+                if (finished >= deadline)
+                {
+                    const auto missed = (finished - deadline) / interval + 1;
+                    engine.missed_periods_.fetch_add(missed, std::memory_order_relaxed);
+                    deadline += interval * missed;
+                }
             }
         });
     }
@@ -1060,12 +1391,39 @@ class Engine::Runner
         measure_layout(*plan, topology, period, layout);
         bind_blocks(*plan, topology, period, layout);
 
+        plan->node_ids.reserve(topology.nodes.size());
+        for (const auto &entry : topology.nodes)
+            plan->node_ids.push_back(entry->id);
+        plan->connections = std::move(topology.connections);
         plan->owners = std::move(topology.nodes);
         if (live_clock)
             live_clock->submit_and_wait(submitted_, plan.get());
         else
             rendering_ = plan.get();
         current_ = std::move(plan);
+    }
+
+    View<const NodeId> nodes() const noexcept
+    {
+        if (!current_)
+            return {};
+        return {current_->node_ids.data(), current_->node_ids.size()};
+    }
+
+    View<const Connection> connections() const noexcept
+    {
+        if (!current_)
+            return {};
+        return {current_->connections.data(), current_->connections.size()};
+    }
+
+    const Node *node(NodeId id) const
+    {
+        if (current_)
+            for (const auto &entry : current_->owners)
+                if (entry->id == id)
+                    return entry->node.get();
+        throw Error(ErrorCode::UnknownNode);
     }
 
     /// @brief Reset nodes held by the current plan after removal or replacement in the draft.
@@ -1140,6 +1498,8 @@ class Engine::Runner
         std::vector<OBBlock> outputs;
         std::vector<Step> steps;
         std::vector<std::shared_ptr<NodeEntry>> owners;
+        std::vector<NodeId> node_ids;
+        std::vector<Connection> connections;
     };
 
     /// @brief Measure buffer capacity and record each node's port offsets.
@@ -1310,6 +1670,7 @@ void Engine::commit()
         return;
 
     runner_->commit(graph_->resolve(), period_, state_ == State::Running ? clock_.get() : nullptr);
+    ++plan_generation_;
     graph_->mark_clean();
     if (state_ == State::Unprepared)
         state_ = State::Ready;
@@ -1344,6 +1705,44 @@ void Engine::reset()
     runner_->reset(*graph_);
     graph_->reset_nodes();
     position_.store(0, std::memory_order_release);
+    missed_periods_.store(0, std::memory_order_relaxed);
+    last_tick_us_.store(0, std::memory_order_relaxed);
+}
+
+Engine::State Engine::state() const
+{
+    require_control_thread();
+    return state_;
+}
+
+bool Engine::dirty() const
+{
+    require_control_thread();
+    return graph_->dirty();
+}
+
+std::uint64_t Engine::plan_generation() const
+{
+    require_control_thread();
+    return plan_generation_;
+}
+
+View<const NodeId> Engine::plan_nodes() const
+{
+    require_control_thread();
+    return runner_->nodes();
+}
+
+View<const Connection> Engine::plan_connections() const
+{
+    require_control_thread();
+    return runner_->connections();
+}
+
+const Node *Engine::plan_node(NodeId node_id) const
+{
+    require_control_thread();
+    return runner_->node(node_id);
 }
 
 std::uint64_t Engine::tick_position() const noexcept
@@ -1374,6 +1773,14 @@ namespace aereborn
 class Engine
 {
   public:
+    /// @brief Lifecycle state, as observed on the control side.
+    enum class State
+    {
+        Unprepared,
+        Ready,
+        Running
+    };
+
     /// @brief Construct an engine with an empty draft graph.
     /// @param block_period Fixed duration of each tick.
     /// @throws Error InvalidArg if the period is unsupported.
@@ -1488,17 +1895,39 @@ class Engine
     /// @return The zero-based position of the next tick, advanced after each completed block.
     std::uint64_t tick_position() const noexcept;
 
+    /// @brief Return the current lifecycle state on the serialized control side.
+    State state() const;
+
+    /// @brief Report whether the draft needs a commit, including its initial preparation.
+    bool dirty() const;
+
+    /// @brief Count published render plans. Failed and unchanged commits leave this unchanged.
+    std::uint64_t plan_generation() const;
+
+    /// @brief Count software-clock periods skipped since construction or reset.
+    /// @note May be read concurrently with rendering.
+    std::uint64_t missed_periods() const noexcept { return missed_periods_.load(std::memory_order_relaxed); }
+
+    /// @brief Estimate the most recent tick time in microseconds, including clock bookkeeping.
+    /// @note May be read concurrently with rendering. Zero until sampled after construction or reset.
+    std::uint64_t last_tick_us() const noexcept { return last_tick_us_.load(std::memory_order_relaxed); }
+
+    /// @brief Borrow committed node IDs in execution order, or an empty view before commit.
+    /// @note Use on the serialized control side until the next plan publication or destruction.
+    View<const NodeId> plan_nodes() const;
+
+    /// @brief Borrow committed connections, with the same lifetime as plan_nodes().
+    View<const Connection> plan_connections() const;
+
+    /// @brief Borrow a committed node instance, with the same lifetime as plan_nodes().
+    /// @throws Error UnknownNode if the node is outside the current plan.
+    /// @note Follow the node's own contract for access during rendering.
+    const Node *plan_node(NodeId node_id) const;
+
   private:
     class Graph;
     class Runner;
     class Clock;
-    enum class State
-    {
-        Unprepared,
-        Ready,
-        Running
-    };
-
     void require_control_thread() const;
     NodeId insert_node(std::unique_ptr<Node> instance);
     bool tick() noexcept;
@@ -1506,6 +1935,9 @@ class Engine
     const BlockPeriod period_;
     State state_ = State::Unprepared;
     std::atomic<std::uint64_t> position_{0};
+    std::uint64_t plan_generation_ = 0;
+    std::atomic<std::uint64_t> missed_periods_{0};
+    std::atomic<std::uint64_t> last_tick_us_{0};
     std::unique_ptr<Graph> graph_;
     std::unique_ptr<Runner> runner_;
     std::unique_ptr<Clock> clock_;
@@ -1553,6 +1985,15 @@ class FrameRing
     {
         const auto read = read_.load(std::memory_order_acquire);
         return queued(write_.load(std::memory_order_acquire), read);
+    }
+
+    /// @brief Sample queue occupancy from outside the producer and consumer.
+    /// @return False if the independently sampled cursors yield an out-of-range result.
+    /// @pre Serialize with prepare().
+    bool estimate(std::size_t &frames) const noexcept
+    {
+        frames = available();
+        return frames <= capacity_;
     }
 
     /// @pre The ring is prepared and the input matches its layout.
@@ -1646,6 +2087,9 @@ class Node
     virtual ~Node() = default;
     Node(const Node &) = delete;
     Node &operator=(const Node &) = delete;
+
+    /// @brief Return a static diagnostic type name. May be called during processing.
+    virtual const char *type_name() const noexcept { return "Node"; }
 
     /// @brief Describe the input ports.
     /// @return A read-only view of the input port specifications in port index order.
@@ -2889,6 +3333,14 @@ struct OPort
     }
 };
 
+/// @brief Directed connection in a committed render plan.
+struct Connection
+{
+    ConnId id;
+    OPort from;
+    IPort to;
+};
+
 /// @brief Timing and port blocks passed to a node for one process call.
 /// @note The port block views and their buffers are borrowed for the duration of that call.
 struct ProcessContext
@@ -3003,6 +3455,9 @@ namespace aereborn
 class Convert final : public NodeT<1, 1>
 {
   public:
+    /// @copydoc Node::type_name
+    const char *type_name() const noexcept override { return "Convert"; }
+
     /// @brief Construct a converter with fixed input and output specifications.
     /// @param input Source sample format, sample rate, and channel count.
     /// @param output Destination specification with the same channel count.
@@ -3103,16 +3558,14 @@ void open_graph_gate(std::atomic<unsigned> &state, std::atomic<bool> &primed, bo
     state.store(graph_open, std::memory_order_release);
 }
 
-std::size_t read_queue(FrameRing &ring, OFBlock output, std::atomic<bool> &primed,
-                       std::size_t target_frames) noexcept
+bool prefill_ready(const FrameRing &ring, std::atomic<bool> &primed, std::size_t target_frames) noexcept
 {
-    if (!primed.load(std::memory_order_relaxed))
-    {
-        if (ring.available() < target_frames)
-            return 0;
-        primed.store(true, std::memory_order_release);
-    }
-    return ring.read(output);
+    if (primed.load(std::memory_order_relaxed))
+        return true;
+    if (ring.available() < target_frames)
+        return false;
+    primed.store(true, std::memory_order_release);
+    return true;
 }
 } // namespace
 
@@ -3123,7 +3576,7 @@ Capture::Capture(SampleRate rate, std::size_t channels, std::chrono::microsecond
 
 void Capture::prepare(BlockPeriod period)
 {
-    prepare_ring(ring_, spec(), period, io_period_, period_, backend_bound_.load(std::memory_order_acquire));
+    prepare_ring(ring_, spec(), period, io_period_, period_, bound());
 }
 
 void Capture::process(const ProcessContext &context) noexcept
@@ -3132,14 +3585,25 @@ void Capture::process(const ProcessContext &context) noexcept
     std::size_t frames = 0;
     if (enter_graph(graph_state_))
     {
-        frames = read_queue(ring_, output, primed_, target_frames());
+        if (prefill_ready(ring_, primed_, target_frames()))
+        {
+            frames = ring_.read(output);
+            if (frames < output.frames())
+                underrun_frames_.fetch_add(output.frames() - frames, std::memory_order_relaxed);
+        }
         graph_state_.fetch_and(~graph_active, std::memory_order_release);
     }
     output.subblock(frames, output.frames() - frames).clear();
 }
 
+bool Capture::online() const noexcept
+{
+    return (graph_state_.load(std::memory_order_acquire) & graph_open) != 0;
+}
+
 void Capture::open(bool prefill) noexcept
 {
+    underrun_frames_.store(0, std::memory_order_relaxed);
     open_graph_gate(graph_state_, primed_, prefill);
 }
 
@@ -3147,6 +3611,7 @@ void Capture::close() noexcept
 {
     close_graph_gate(graph_state_);
     ring_.clear();
+    primed_.store(false, std::memory_order_release);
 }
 
 Playback::Playback(SampleRate rate, std::size_t channels, std::chrono::microseconds io_period)
@@ -3156,20 +3621,29 @@ Playback::Playback(SampleRate rate, std::size_t channels, std::chrono::microseco
 
 void Playback::prepare(BlockPeriod period)
 {
-    prepare_ring(ring_, spec(), period, io_period_, period_, backend_bound_.load(std::memory_order_acquire));
+    prepare_ring(ring_, spec(), period, io_period_, period_, bound());
 }
 
 void Playback::process(const ProcessContext &context) noexcept
 {
     if (enter_graph(graph_state_))
     {
-        ring_.write(context.inputs[0].f32p_view());
+        const auto input = context.inputs[0].f32p_view();
+        const auto written = ring_.write(input);
+        if (written < input.frames())
+            overflow_frames_.fetch_add(input.frames() - written, std::memory_order_relaxed);
         graph_state_.fetch_and(~graph_active, std::memory_order_release);
     }
 }
 
+bool Playback::online() const noexcept
+{
+    return (graph_state_.load(std::memory_order_acquire) & graph_open) != 0;
+}
+
 void Playback::open(bool prefill) noexcept
 {
+    overflow_frames_.store(0, std::memory_order_relaxed);
     open_graph_gate(graph_state_, primed_, prefill);
 }
 
@@ -3182,11 +3656,12 @@ void Playback::close() noexcept
 {
     close_graph();
     ring_.clear();
+    primed_.store(false, std::memory_order_release);
 }
 
 std::size_t Playback::read(OFBlock output) noexcept
 {
-    return read_queue(ring_, output, primed_, target_frames());
+    return prefill_ready(ring_, primed_, target_frames()) ? ring_.read(output) : 0;
 }
 
 } // namespace aereborn
@@ -3231,6 +3706,36 @@ class Capture final : public NodeT<0, 1>
     /// @brief Return the fixed F32P output specification.
     PortSpec spec() const noexcept { return outputs()[0]; }
 
+    /// @copydoc Node::type_name
+    const char *type_name() const noexcept override { return "Capture"; }
+
+    /// @brief Report whether a backend has claimed this endpoint.
+    bool bound() const noexcept { return backend_bound_.load(std::memory_order_acquire); }
+
+    /// @brief Report whether the graph gate is open.
+    bool online() const noexcept;
+
+    /// @brief Report whether the queue has released or bypassed its startup prefill gate.
+    bool steady() const noexcept { return primed_.load(std::memory_order_acquire); }
+
+    /// @brief Return the external batch duration budget used to size the queue.
+    std::chrono::microseconds io_period() const noexcept { return io_period_; }
+
+    /// @brief Return the queue capacity in frames, or zero before preparation.
+    /// @pre Serialize with prepare().
+    std::size_t capacity() const noexcept { return ring_.capacity(); }
+
+    /// @brief Sample queue occupancy without blocking the graph or I/O.
+    /// @return False if a usable estimate is unavailable.
+    /// @pre Serialize with prepare().
+    bool estimate_queued_frames(std::size_t &frames) const noexcept { return ring_.estimate(frames); }
+
+    /// @brief Count missing output frames on the graph side since open or reset.
+    std::size_t underrun_frames() const noexcept { return underrun_frames_.load(std::memory_order_relaxed); }
+
+    /// @copydoc Node::reset
+    void reset() noexcept override { underrun_frames_.store(0, std::memory_order_relaxed); }
+
   private:
     friend class Backend;
 
@@ -3246,16 +3751,6 @@ class Capture final : public NodeT<0, 1>
     /// @brief Queue as many input frames as space allows, from the I/O worker.
     void write(IFBlock input) noexcept { ring_.write(input); }
 
-    /// @brief Report whether the queue has released or bypassed its startup prefill gate.
-    bool steady() const noexcept { return primed_.load(std::memory_order_acquire); }
-
-    /// @brief Return the external batch duration budget used to size the queue.
-    std::chrono::microseconds io_period() const noexcept { return io_period_; }
-
-    /// @brief Return the queue capacity in frames, or zero before preparation.
-    /// @pre Serialize with prepare().
-    std::size_t capacity() const noexcept { return ring_.capacity(); }
-
     /// @brief Return the half-capacity prefill and drift target in frames.
     /// @pre Serialize with prepare().
     std::size_t target_frames() const noexcept { return ring_.capacity() / 2; }
@@ -3270,6 +3765,7 @@ class Capture final : public NodeT<0, 1>
     std::atomic<bool> backend_bound_{false};
     std::atomic<unsigned> graph_state_{0};
     std::atomic<bool> primed_{false};
+    std::atomic<std::size_t> underrun_frames_{0};
 };
 
 /// @brief Graph-side playback node delivering planar F32P frames to its bound backend.
@@ -3297,6 +3793,36 @@ class Playback final : public NodeT<1, 0>
     /// @brief Return the fixed F32P input specification.
     PortSpec spec() const noexcept { return inputs()[0]; }
 
+    /// @copydoc Node::type_name
+    const char *type_name() const noexcept override { return "Playback"; }
+
+    /// @brief Report whether a backend has claimed this endpoint.
+    bool bound() const noexcept { return backend_bound_.load(std::memory_order_acquire); }
+
+    /// @brief Report whether the graph gate is open.
+    bool online() const noexcept;
+
+    /// @brief Report whether the queue has released or bypassed its startup prefill gate.
+    bool steady() const noexcept { return primed_.load(std::memory_order_acquire); }
+
+    /// @brief Return the external batch duration budget used to size the queue.
+    std::chrono::microseconds io_period() const noexcept { return io_period_; }
+
+    /// @brief Return the queue capacity in frames, or zero before preparation.
+    /// @pre Serialize with prepare().
+    std::size_t capacity() const noexcept { return ring_.capacity(); }
+
+    /// @brief Sample queue occupancy without blocking the graph or I/O.
+    /// @return False if a usable estimate is unavailable.
+    /// @pre Serialize with prepare().
+    bool estimate_queued_frames(std::size_t &frames) const noexcept { return ring_.estimate(frames); }
+
+    /// @brief Count discarded input frames on the graph side since open or reset.
+    std::size_t overflow_frames() const noexcept { return overflow_frames_.load(std::memory_order_relaxed); }
+
+    /// @copydoc Node::reset
+    void reset() noexcept override { overflow_frames_.store(0, std::memory_order_relaxed); }
+
   private:
     friend class Backend;
 
@@ -3318,16 +3844,6 @@ class Playback final : public NodeT<1, 0>
     /// @pre A nonempty view matches the node's channel count. Call from the I/O worker.
     std::size_t read(OFBlock output) noexcept;
 
-    /// @brief Report whether the queue has released or bypassed its startup prefill gate.
-    bool steady() const noexcept { return primed_.load(std::memory_order_acquire); }
-
-    /// @brief Return the external batch duration budget used to size the queue.
-    std::chrono::microseconds io_period() const noexcept { return io_period_; }
-
-    /// @brief Return the queue capacity in frames, or zero before preparation.
-    /// @pre Serialize with prepare().
-    std::size_t capacity() const noexcept { return ring_.capacity(); }
-
     /// @brief Return the half-capacity prefill and drift target in frames.
     /// @pre Serialize with prepare().
     std::size_t target_frames() const noexcept { return ring_.capacity() / 2; }
@@ -3342,6 +3858,7 @@ class Playback final : public NodeT<1, 0>
     std::atomic<bool> backend_bound_{false};
     std::atomic<unsigned> graph_state_{0};
     std::atomic<bool> primed_{false};
+    std::atomic<std::size_t> overflow_frames_{0};
 };
 
 } // namespace aereborn
@@ -3519,6 +4036,9 @@ namespace aereborn
 class Matrix final : public NodeT<1, 1>
 {
   public:
+    /// @copydoc Node::type_name
+    const char *type_name() const noexcept override { return "Matrix"; }
+
     /// @brief Construct an identity channel map with a gain applied to each channel.
     /// @param rate Sample rate of both ports.
     /// @param channels Channel count of both ports.
@@ -3653,6 +4173,9 @@ namespace aereborn
 class Mixer final : public Node
 {
   public:
+    /// @copydoc Node::type_name
+    const char *type_name() const noexcept override { return "Mixer"; }
+
     /// @brief Construct a mixer with all inputs unmuted.
     /// @param rate Sample rate of every port.
     /// @param channels Channel count of every port.
@@ -3771,10 +4294,6 @@ int main()
 ===== examples/CMakeLists.txt =====
 add_executable(clocked_graph clocked_graph.cpp)
 target_link_libraries(clocked_graph PRIVATE aereborn::plugins aereborn_test_plugins)
-if(BUILD_TESTING)
-    add_test(NAME example.clocked_graph COMMAND clocked_graph)
-    set_tests_properties(example.clocked_graph PROPERTIES LABELS example TIMEOUT 20)
-endif()
 
 ===== backend/alsa_backend.cpp =====
 #include "alsa_backend.h"
@@ -4134,6 +4653,12 @@ namespace aereborn
 class AlsaBackend final : public ActiveBackend
 {
   public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override
+    {
+        return bound() ? (is_capture() ? "AlsaCapture" : "AlsaPlayback") : "AlsaBackend";
+    }
+
     /// @brief Create an ALSA backend whose direction is selected when it binds.
     /// @param card Bare card name, explicit PCM name, or empty for the default PCM.
     /// @param device Hardware device index for a bare card name.
@@ -4193,7 +4718,8 @@ using Clock = std::chrono::steady_clock;
 using Milliseconds = std::chrono::milliseconds;
 using Microseconds = std::chrono::microseconds;
 
-constexpr double max_asrc_correction = max_clock_drift_ppm / 1000000.0;
+constexpr double ppm_per_unit = 1000000.0;
+constexpr double max_asrc_correction = max_clock_drift_ppm / ppm_per_unit;
 
 } // namespace
 
@@ -4294,9 +4820,20 @@ void Backend::close_playback_graph() noexcept
     playback_->close_graph();
 }
 
+const Node *Backend::endpoint_node() const noexcept
+{
+    if (!bound())
+        return nullptr;
+    if (capture_)
+        return capture_;
+    return playback_;
+}
+
 PortSpec Backend::logical_spec() const noexcept
 {
-    return capture_ ? capture_->spec() : playback_->spec();
+    if (capture_)
+        return capture_->spec();
+    return playback_ ? playback_->spec() : PortSpec{};
 }
 
 std::chrono::microseconds Backend::endpoint_period() const noexcept
@@ -4457,7 +4994,12 @@ template <class Endpoint> void ActiveBackend::bind_endpoint(Endpoint &endpoint)
 
 bool ActiveBackend::running() const noexcept
 {
-    return worker_state_.load(std::memory_order_acquire) != State::Stopped;
+    return state() != State::Stopped;
+}
+
+float ActiveBackend::drift_ppm() const noexcept
+{
+    return static_cast<float>(asrc_.correction.load(std::memory_order_relaxed) * ppm_per_unit);
 }
 
 Milliseconds ActiveBackend::io_timeout() const noexcept
@@ -4592,6 +5134,13 @@ void ActiveBackend::wait_backpressure() noexcept
     wait_cv_.wait_for(lock, wait, [this] { return worker_state_.load(std::memory_order_acquire) != State::Running; });
 }
 
+void ActiveBackend::ASRC::reset() noexcept
+{
+    filtered_error = 0;
+    integral = 0;
+    correction.store(0.0, std::memory_order_relaxed);
+}
+
 void ActiveBackend::ASRC::update(std::size_t queued_before, std::size_t queued_after, std::size_t target_frames,
                            SampleRate logical_rate, std::size_t device_frames, SampleRate device_rate) noexcept
 {
@@ -4609,7 +5158,8 @@ void ActiveBackend::ASRC::update(std::size_t queued_before, std::size_t queued_a
     const auto requested_correction = proportional + next_integral;
     if (std::abs(requested_correction) <= max_asrc_correction || requested_correction * filtered_error < 0)
         integral = next_integral;
-    correction = std::max(-max_asrc_correction, std::min(max_asrc_correction, proportional + integral));
+    const auto bounded = std::max(-max_asrc_correction, std::min(max_asrc_correction, proportional + integral));
+    correction.store(bounded, std::memory_order_relaxed);
 }
 
 OBBlock ActiveBackend::device_block(std::size_t frames) noexcept
@@ -4833,6 +5383,7 @@ namespace aereborn
 
 /// @brief Owns endpoint occupation and the PCM workspace for external I/O.
 /// @note Unbind or destroy the backend before removing its endpoint or destroying Engine.
+/// Serialize diagnostic queries with backend lifecycle calls and destruction.
 class Backend
 {
   public:
@@ -4844,6 +5395,9 @@ class Backend
     virtual void stop() noexcept = 0;
     virtual void unbind() noexcept = 0;
 
+    /// @brief Return a static diagnostic name for the backend and its bound direction, when known.
+    virtual const char *type_name() const noexcept { return "Backend"; }
+
     /// @brief Report whether the endpoint and all working buffers are ready.
     bool bound() const noexcept { return device_spec_.channels != 0; }
     virtual bool running() const noexcept = 0;
@@ -4853,6 +5407,16 @@ class Backend
     PortSpec device_spec() const noexcept { return device_spec_; }
     /// @brief Return the device batch limit, including the provisional value set by on_open().
     std::size_t device_max_frames() const noexcept { return device_max_frames_; }
+
+    /// @brief Borrow the bound graph endpoint, or return null when unbound.
+    /// @note Use until unbind or destruction, subject to the endpoint lifetime contract.
+    const Node *endpoint_node() const noexcept;
+
+    /// @brief Return the endpoint layout, or an empty specification when no endpoint is claimed.
+    PortSpec logical_spec() const noexcept;
+
+    /// @brief Report whether the binding uses FIR resampling.
+    bool uses_resampler() const noexcept { return needs_fir(); }
 
   protected:
     Backend() = default;
@@ -4874,7 +5438,6 @@ class Backend
     void close_playback_graph() noexcept;
 
     bool is_capture() const noexcept { return capture_ != nullptr; }
-    PortSpec logical_spec() const noexcept;
     std::chrono::microseconds endpoint_period() const noexcept;
     void set_device_max_frames(std::size_t frames) noexcept { device_max_frames_ = frames; }
 
@@ -4958,6 +5521,9 @@ class PassiveBackend : public Backend
 class ActiveBackend : public Backend
 {
   public:
+    /// @brief I/O worker lifecycle state.
+    enum class State { Stopped, Running, Draining, Stopping };
+
     /// @brief Open the source via on_open(), prepare DSP buffers, and bind to a prepared Capture node.
     /// @throws Error If the endpoint is unprepared, occupied, or negotiation fails.
     void bind(Capture &endpoint);
@@ -4979,6 +5545,15 @@ class ActiveBackend : public Backend
     /// @brief Report whether I/O is running, draining, or stopping.
     bool running() const noexcept final;
     RetCode last_error() const noexcept final { return last_error_.load(std::memory_order_acquire); }
+
+    /// @brief Read the current I/O worker state.
+    State state() const noexcept { return worker_state_.load(std::memory_order_acquire); }
+
+    /// @brief Report whether the worker follows an independent device clock with ASRC.
+    bool is_async() const noexcept { return async_; }
+
+    /// @brief Read the latest ASRC correction in ppm. Zero before correction or while offline.
+    float drift_ppm() const noexcept;
 
   protected:
     /// @param async True for independent hardware clocks, false for graph-clocked I/O.
@@ -5029,15 +5604,13 @@ class ActiveBackend : public Backend
     {
         double filtered_error = 0;
         double integral = 0;
-        double correction = 0;
+        std::atomic<double> correction{0.0};
 
-        double scale() const noexcept { return 1.0 + correction; }
-        void reset() noexcept { *this = {}; }
+        double scale() const noexcept { return 1.0 + correction.load(std::memory_order_relaxed); }
+        void reset() noexcept;
         void update(std::size_t queued_before, std::size_t queued_after, std::size_t target_frames,
                     SampleRate logical_rate, std::size_t device_frames, SampleRate device_rate) noexcept;
     };
-
-    enum class State { Stopped, Running, Draining, Stopping };
 
     template <class Endpoint> void bind_endpoint(Endpoint &endpoint);
     std::chrono::milliseconds io_timeout() const noexcept;
@@ -5145,6 +5718,12 @@ namespace aereborn
 class NullBackend final : public ActiveBackend
 {
   public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override
+    {
+        return bound() ? (is_capture() ? "NullCapture" : "NullPlayback") : "NullBackend";
+    }
+
     /// @brief Construct a null backend whose direction is selected at bind time.
     /// @param format Interleaved PCM format used by the device side.
     /// @throws Error If the format is not interleaved PCM.
@@ -5233,6 +5812,9 @@ namespace aereborn
 class PullSink final : public PassiveBackend
 {
   public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override { return "PullSink"; }
+
     /// @throws Error InvalidArg if output_spec is invalid or is not interleaved PCM.
     explicit PullSink(PortSpec output_spec);
 
@@ -5322,6 +5904,9 @@ namespace aereborn
 class PushSource final : public PassiveBackend
 {
   public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override { return "PushSource"; }
+
     /// @throws Error InvalidArg if input_spec is invalid or is not interleaved PCM.
     explicit PushSource(PortSpec input_spec);
     /// @brief Prepare DSP buffers and bind to a prepared Capture node.
@@ -5393,6 +5978,9 @@ namespace aereborn
 class UsrPlayback final : public ActiveBackend
 {
   public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override { return "UsrPlayback"; }
+
     using Callback = std::function<void(IBBlock)>;
 
     /// @throws Error InvalidArg if spec is not valid interleaved PCM or callback is empty.
@@ -5850,6 +6438,12 @@ namespace aereborn
 class WasapiBackend final : public ActiveBackend
 {
   public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override
+    {
+        return bound() ? (is_capture() ? "WasapiCapture" : "WasapiPlayback") : "WasapiBackend";
+    }
+
     /// @brief Native failure details. operation is null when no native failure was recorded.
     struct Failure
     {
@@ -6116,6 +6710,9 @@ namespace aereborn
 class WavCapture final : public ActiveBackend
 {
   public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override { return "WavCapture"; }
+
     /// @brief Number of additional passes after the first one.
     struct Repeat
     {
@@ -6147,6 +6744,9 @@ class WavCapture final : public ActiveBackend
 class WavPlayback final : public ActiveBackend
 {
   public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override { return "WavPlayback"; }
+
     /// @brief Record to one file, truncating its existing contents at bind time.
     /// @throws Error If the format is unsupported for WAV output.
     explicit WavPlayback(std::string path, SampleFormat format);
@@ -6669,6 +7269,750 @@ class WavFile
     std::size_t position_ = 0;
     std::size_t write_limit_ = 0;
 };
+
+} // namespace aereborn
+
+#endif
+
+===== diag/inspect.cpp =====
+#include "inspect.h"
+
+#include "backend/wasapi_backend.h"
+#include "plugins/convert.h"
+#include "plugins/matrix.h"
+#include "plugins/mixer.h"
+#include <algorithm>
+#include <iomanip>
+#include <locale>
+#include <map>
+#include <set>
+#include <sstream>
+
+namespace aereborn
+{
+namespace
+{
+const char *state_name(Engine::State state)
+{
+    switch (state)
+    {
+    case Engine::State::Unprepared: return "Unprepared";
+    case Engine::State::Ready: return "Ready";
+    case Engine::State::Running: return "Running";
+    }
+    return "?";
+}
+
+const char *state_name(ActiveBackend::State state)
+{
+    switch (state)
+    {
+    case ActiveBackend::State::Stopped: return "Stopped";
+    case ActiveBackend::State::Running: return "Running";
+    case ActiveBackend::State::Draining: return "Draining";
+    case ActiveBackend::State::Stopping: return "Stopping";
+    }
+    return "?";
+}
+
+const char *format_name(SampleFormat format)
+{
+    switch (format)
+    {
+    case SampleFormat::F32P: return "F32P";
+    case SampleFormat::S16LE: return "S16LE";
+    case SampleFormat::S24_3LE: return "S24_3LE";
+    case SampleFormat::S24LE: return "S24LE";
+    case SampleFormat::S32LE: return "S32LE";
+    case SampleFormat::F32LE: return "F32LE";
+    }
+    return "?";
+}
+
+void write_spec(std::ostream &out, PortSpec spec)
+{
+    if (spec.channels)
+        out << static_cast<std::uint32_t>(spec.sample_rate) << '/' << spec.channels << "ch/" << format_name(spec.format);
+    else
+        out << '-';
+}
+
+void write_ports(std::ostream &out, const char *name, View<const PortSpec> ports)
+{
+    for (std::size_t first = 0; first < ports.size();)
+    {
+        auto last = first;
+        while (last + 1 < ports.size() && ports[last + 1] == ports[first])
+            ++last;
+        out << ' ' << name << first;
+        if (last != first)
+            out << ".." << last;
+        out << '=';
+        write_spec(out, ports[first]);
+        first = last + 1;
+    }
+}
+
+template <class Endpoint> void write_queue(std::ostream &out, const Endpoint &endpoint)
+{
+    const auto online = endpoint.online();
+    out << "bound=" << endpoint.bound() << " online=" << online << " steady=" << (online && endpoint.steady())
+        << " fill=";
+    std::size_t frames = 0;
+    if (endpoint.estimate_queued_frames(frames))
+        out << frames;
+    else
+        out << "\xE2\x80\x94"; // Em dash.
+    out << '/' << endpoint.capacity();
+}
+
+void write_node_details(std::ostream &out, const Node &node)
+{
+    if (const auto *capture = dynamic_cast<const Capture *>(&node))
+    {
+        out << " | ";
+        write_queue(out, *capture);
+        out << " underrun=" << capture->underrun_frames();
+    }
+    else if (const auto *playback = dynamic_cast<const Playback *>(&node))
+    {
+        out << " | ";
+        write_queue(out, *playback);
+        out << " overflow=" << playback->overflow_frames();
+    }
+    else if (const auto *matrix = dynamic_cast<const Matrix *>(&node))
+    {
+        out << " | gain=" << std::fixed << std::setprecision(2) << matrix->gain();
+    }
+    else if (const auto *mixer = dynamic_cast<const Mixer *>(&node))
+    {
+        out << " | muted=[";
+        for (std::size_t i = 0; i < mixer->inputs().size(); ++i)
+        {
+            if (i)
+                out << ", ";
+            out << mixer->muted(i);
+        }
+        out << ']';
+    }
+}
+
+void write_backend(std::ostream &out, const Backend &backend, RetCode error)
+{
+    out << backend.type_name();
+    const auto *active = dynamic_cast<const ActiveBackend *>(&backend);
+    const auto async = active && active->is_async();
+    out << " (" << (async ? "async" : "sync") << ") state=";
+    out << (active ? state_name(active->state()) : (backend.running() ? "Running" : "Stopped"));
+    out << " dev=";
+    write_spec(out, backend.device_spec());
+    out << " max=" << backend.device_max_frames() << " fir=" << backend.uses_resampler();
+    if (async)
+        out << " drift=" << std::fixed << std::setprecision(1) << std::showpos << active->drift_ppm()
+            << std::noshowpos << "ppm";
+    out << " err=" << (error ? "Ok" : error.message());
+#if WINDOWS_OS_ENVIRONMENT
+    if (const auto *wasapi = dynamic_cast<const WasapiBackend *>(&backend))
+    {
+        const auto failure = wasapi->last_failure();
+        if (failure.operation)
+            out << " (" << failure.operation << " HRESULT=0x" << std::hex
+                << static_cast<std::uint32_t>(failure.hresult) << std::dec << ')';
+    }
+#endif
+}
+
+class BackendLinks
+{
+  public:
+    explicit BackendLinks(View<const Backend *const> backends)
+    {
+        for (const auto *backend : backends)
+            if (backend)
+                if (const auto *endpoint = backend->endpoint_node())
+                    unvisited_.emplace(endpoint, backend);
+    }
+
+    const Backend *take(const Node &node)
+    {
+        const auto found = unvisited_.find(&node);
+        if (found == unvisited_.end())
+            return nullptr;
+        const auto *backend = found->second;
+        unvisited_.erase(found);
+        return backend;
+    }
+
+    bool detached(const Backend &backend) const
+    {
+        const auto *endpoint = backend.endpoint_node();
+        return !endpoint || unvisited_.count(endpoint);
+    }
+
+  private:
+    std::map<const Node *, const Backend *> unvisited_;
+};
+
+void write_engine(std::ostream &out, const Engine &engine)
+{
+    out << "Engine: " << state_name(engine.state()) << " | period=" << static_cast<std::uint32_t>(engine.block_period())
+        << "ms | tick=" << engine.tick_position() << " | plan_gen=" << engine.plan_generation()
+        << " | dirty=" << (engine.dirty() ? "true" : "false") << " | late=" << engine.missed_periods()
+        << " | tick_us=" << engine.last_tick_us();
+}
+
+struct CardColors
+{
+    const char *fill;
+    const char *border;
+    const char *accent;
+};
+
+constexpr CardColors endpoint_colors{"#DFF4F0", "#2E8B7D", "#15803D"};
+constexpr CardColors dsp_colors{"#E8EEF7", "#4A6FA5", "#1E4D83"};
+constexpr CardColors backend_colors{"#F1F5F9", "#64748B", "#15803D"};
+constexpr CardColors warning_colors{"#FEF3C7", "#D97706", "#92400E"};
+constexpr CardColors error_colors{"#FEE2E2", "#DC2626", "#991B1B"};
+constexpr CardColors inactive_colors{"#F3F4F6", "#9CA3AF", "#64748B"};
+
+void write_dot_escaped(std::ostream &out, const std::string &text)
+{
+    for (const auto ch : text)
+    {
+        if (ch == '\r')
+            continue;
+        if (ch == '\n')
+        {
+            out << "\\n";
+            continue;
+        }
+        if (ch == '"' || ch == '\\')
+            out << '\\';
+        out << ch;
+    }
+}
+
+void write_html_escaped(std::ostream &out, const std::string &text)
+{
+    for (const auto ch : text)
+    {
+        switch (ch)
+        {
+        case '&': out << "&amp;"; break;
+        case '<': out << "&lt;"; break;
+        case '>': out << "&gt;"; break;
+        case '"': out << "&quot;"; break;
+        default: out << ch; break;
+        }
+    }
+}
+
+const char *error_code_name(ErrorCode code)
+{
+    switch (code)
+    {
+    case ErrorCode::Ok: return "Ok";
+    case ErrorCode::InvalidArg: return "InvalidArg";
+    case ErrorCode::InvalidPort: return "InvalidPort";
+    case ErrorCode::InvalidType: return "InvalidType";
+    case ErrorCode::TooLarge: return "TooLarge";
+    case ErrorCode::NotReady: return "NotReady";
+    case ErrorCode::Busy: return "Busy";
+    case ErrorCode::UnknownNode: return "UnknownNode";
+    case ErrorCode::UnknownConn: return "UnknownConn";
+    case ErrorCode::DuplicateConn: return "DuplicateConn";
+    case ErrorCode::InputBusy: return "InputBusy";
+    case ErrorCode::Cycle: return "Cycle";
+    case ErrorCode::FormatMismatch: return "FormatMismatch";
+    case ErrorCode::IoFailed: return "IoFailed";
+    case ErrorCode::DeviceLost: return "DeviceLost";
+    case ErrorCode::EndOfStream: return "EndOfStream";
+    case ErrorCode::Cancelled: return "Cancelled";
+    case ErrorCode::Timeout: return "Timeout";
+    }
+    return "Unknown";
+}
+
+void write_short_rate(std::ostream &out, SampleRate rate)
+{
+    const auto hz = static_cast<std::uint32_t>(rate);
+    out << hz / 1000;
+    auto remainder = hz % 1000;
+    if (remainder)
+    {
+        out << '.';
+        for (auto place = 100u; remainder; place /= 10)
+        {
+            out << remainder / place;
+            remainder %= place;
+        }
+    }
+    out << 'k';
+}
+
+void write_short_spec(std::ostream &out, PortSpec spec)
+{
+    write_short_rate(out, spec.sample_rate);
+    out << ' ' << spec.channels << "ch " << format_name(spec.format);
+}
+
+void begin_card(std::ostream &out, const CardColors &colors, const char *title, NodeId id = {}, bool ports = false)
+{
+    // Graphviz draws cell fills as rectangles. Keep the fill on the rounded table.
+    out << " [label=<<TABLE BORDER=\"1\" CELLBORDER=\"0\" CELLSPACING=\"0\" CELLPADDING=\"5\""
+           " STYLE=\"ROUNDED\" BGCOLOR=\"" << colors.fill << "\" COLOR=\"" << colors.border << '"';
+    if (ports)
+        out << " COLUMNS=\"*\"";
+    out << "><TR><TD ALIGN=\"LEFT\"";
+    if (ports)
+        out << " COLSPAN=\"2\"";
+    out << "><FONT POINT-SIZE=\"11\"><B>";
+    write_html_escaped(out, title);
+    out << "</B></FONT>";
+    if (id)
+        out << " <FONT POINT-SIZE=\"9\" COLOR=\"#475569\">#" << id.value << "</FONT>";
+}
+
+void write_badge(std::ostream &out, const char *text, const CardColors &colors)
+{
+    out << " <FONT POINT-SIZE=\"9\" COLOR=\"" << colors.accent << "\"><B>" << text << "</B></FONT>";
+}
+
+void end_card(std::ostream &out, const std::string &details)
+{
+    out << "</TABLE>>, tooltip=\"";
+    write_dot_escaped(out, details);
+    out << "\"];\n";
+}
+
+template <class Endpoint>
+void write_dot_endpoint(std::ostream &out, NodeId id, const Endpoint &endpoint, std::size_t lost, const char *loss_name)
+{
+    const auto online = endpoint.online();
+    const auto steady = online && endpoint.steady();
+    const auto &status_color = online ? (steady ? endpoint_colors : warning_colors) : inactive_colors;
+    begin_card(out, lost ? warning_colors : status_color, endpoint.type_name(), id);
+    write_badge(out, steady ? "ONLINE" : (online ? "PREFILL" : "OFFLINE"), status_color);
+    out << "</TD></TR><HR/><TR><TD ALIGN=\"LEFT\">Queue ";
+
+    std::size_t frames = 0;
+    const auto capacity = endpoint.capacity();
+    if (capacity && endpoint.estimate_queued_frames(frames))
+    {
+        const auto percent = static_cast<unsigned>(static_cast<double>(frames) * 100 / capacity + 0.5);
+        out << frames << '/' << capacity << " (" << percent << "%)";
+    }
+    else
+        out << "-/" << capacity;
+    if (lost)
+        out << "<BR ALIGN=\"LEFT\"/><FONT COLOR=\"" << warning_colors.accent << "\"><B>"
+            << loss_name << ": " << lost << "f</B></FONT>";
+    out << "</TD></TR>";
+}
+
+bool is_multiport_node(const Node &node)
+{
+    return node.inputs().size() > 1 || node.outputs().size() > 1;
+}
+
+using MutedInputs = std::set<std::pair<NodeId, std::size_t>>;
+
+void write_port_cell(std::ostream &out, bool input, std::size_t index, std::size_t count, std::size_t rows, bool muted)
+{
+    if (!count)
+    {
+        out << "<TD ROWSPAN=\"" << rows << "\"></TD>";
+        return;
+    }
+
+    out << "<TD ALIGN=\"" << (input ? "LEFT" : "RIGHT") << "\" PORT=\"" << (input ? 'i' : 'o') << index << '"';
+    if (rows > count && index == count - 1)
+        out << " ROWSPAN=\"" << rows - index << '"';
+    out << '>';
+    if (muted)
+        out << "<FONT COLOR=\"" << inactive_colors.accent << "\">in" << index << " [MUTE]</FONT>";
+    else
+        out << (input ? "in" : "out") << index;
+    out << "</TD>";
+}
+
+void write_dot_ports(std::ostream &out, NodeId id, const Node &node, MutedInputs &muted_inputs)
+{
+    const auto inputs = node.inputs().size();
+    const auto outputs = node.outputs().size();
+    const auto rows = std::max(inputs, outputs);
+    const auto *mixer = dynamic_cast<const Mixer *>(&node);
+    for (std::size_t i = 0; i < rows; ++i)
+    {
+        out << "<TR>";
+        if (i < inputs || (i == 0 && !inputs))
+        {
+            const auto muted = mixer && mixer->muted(i);
+            if (muted)
+                muted_inputs.emplace(id, i);
+            write_port_cell(out, true, i, inputs, rows, muted);
+        }
+        if (i < outputs || (i == 0 && !outputs))
+            write_port_cell(out, false, i, outputs, rows, false);
+        out << "</TR>";
+    }
+}
+
+void write_convert(std::ostream &out, PortSpec input, PortSpec output)
+{
+    const auto rate_changed = input.sample_rate != output.sample_rate;
+    const auto format_changed = input.format != output.format;
+    if (!rate_changed && !format_changed)
+    {
+        out << "passthrough";
+        return;
+    }
+
+    const auto write_changed_fields = [&](PortSpec spec) {
+        if (rate_changed)
+            write_short_rate(out, spec.sample_rate);
+        if (rate_changed && format_changed)
+            out << ' ';
+        if (format_changed)
+            out << format_name(spec.format);
+    };
+    write_changed_fields(input);
+    out << " -&gt; ";
+    write_changed_fields(output);
+}
+
+void write_single_port_node(std::ostream &out, const Node &node)
+{
+    const auto inputs = node.inputs();
+    const auto outputs = node.outputs();
+    if (const auto *matrix = dynamic_cast<const Matrix *>(&node))
+    {
+        if (inputs[0].channels != outputs[0].channels)
+            out << inputs[0].channels << "ch -&gt; " << outputs[0].channels << "ch | ";
+        const auto gain = matrix->gain();
+        if (gain == 0.0f)
+            out << "<FONT COLOR=\"" << inactive_colors.accent << "\">Gain 0.00 [MUTE]</FONT>";
+        else
+            out << "Gain " << std::fixed << std::setprecision(2) << gain;
+    }
+    else if (dynamic_cast<const Convert *>(&node))
+        write_convert(out, inputs[0], outputs[0]);
+    else
+    {
+        write_short_spec(out, inputs.empty() ? outputs[0] : inputs[0]);
+        if (!inputs.empty() && !outputs.empty() && inputs[0] != outputs[0])
+        {
+            out << " -&gt; ";
+            write_short_spec(out, outputs[0]);
+        }
+    }
+}
+
+void write_dot_node(std::ostream &out, NodeId id, const Node &node, MutedInputs &muted_inputs)
+{
+    out << "  n" << id.value;
+    if (const auto *capture = dynamic_cast<const Capture *>(&node))
+        write_dot_endpoint(out, id, *capture, capture->underrun_frames(), "Underrun");
+    else if (const auto *playback = dynamic_cast<const Playback *>(&node))
+        write_dot_endpoint(out, id, *playback, playback->overflow_frames(), "Overflow");
+    else
+    {
+        const auto ports = is_multiport_node(node);
+        begin_card(out, dsp_colors, node.type_name(), id, ports);
+        out << "</TD></TR><HR/>";
+        if (ports)
+            write_dot_ports(out, id, node, muted_inputs);
+        else
+        {
+            out << "<TR><TD ALIGN=\"LEFT\">";
+            write_single_port_node(out, node);
+            out << "</TD></TR>";
+        }
+    }
+
+    std::ostringstream details;
+    details.imbue(std::locale::classic());
+    details << '[' << id.value << "] " << node.type_name();
+    write_ports(details, "in", node.inputs());
+    write_ports(details, "out", node.outputs());
+    write_node_details(details, node);
+    end_card(out, details.str());
+}
+
+const char *write_dot_backend(std::ostream &out, const Backend &backend, RetCode error, bool detached)
+{
+    const auto *active = dynamic_cast<const ActiveBackend *>(&backend);
+    const auto async = active && active->is_async();
+    const auto fir = backend.uses_resampler();
+    const auto state = active ? active->state() : (backend.running() ? ActiveBackend::State::Running
+                                                                    : ActiveBackend::State::Stopped);
+    const char *status = "STOP";
+    auto colors = &inactive_colors;
+    switch (state)
+    {
+    case ActiveBackend::State::Running:
+        status = "RUN";
+        colors = &backend_colors;
+        break;
+    case ActiveBackend::State::Draining:
+        status = "DRAIN";
+        colors = &warning_colors;
+        break;
+    case ActiveBackend::State::Stopping:
+        status = "STOPPING";
+        colors = &warning_colors;
+        break;
+    case ActiveBackend::State::Stopped:
+        break;
+    }
+    if (!error)
+        colors = &error_colors;
+    begin_card(out, detached && error ? inactive_colors : *colors, backend.type_name());
+    const auto badge = error ? std::string(status) : std::string("ERR: ") + error_code_name(error.code());
+    write_badge(out, badge.c_str(), *colors);
+    out << "</TD></TR><HR/><TR><TD ALIGN=\"LEFT\">";
+    const auto device = backend.device_spec();
+    if (device.channels)
+    {
+        write_short_spec(out, device);
+        out << " (max " << backend.device_max_frames() << "f)";
+    }
+    else
+        out << "unbound";
+    out << "<BR ALIGN=\"LEFT\"/>" << (active ? (async ? "async" : "sync") : "passive");
+    if (fir)
+        out << " | FIR";
+    if (async)
+        out << " | drift " << std::fixed << std::setprecision(1) << std::showpos << active->drift_ppm()
+            << std::noshowpos << " ppm";
+    out << "</TD></TR>";
+
+    std::ostringstream details;
+    details.imbue(std::locale::classic());
+    write_backend(details, backend, error);
+    end_card(out, details.str());
+    return async ? "ASRC" : (fir ? "FIR" : "PCM");
+}
+
+void write_dot_engine(std::ostream &out, const Engine &engine)
+{
+    const auto state = engine.state();
+    const auto running = state == Engine::State::Running;
+    const auto ready = state == Engine::State::Ready;
+    const auto &colors = running ? endpoint_colors : (ready ? dsp_colors : inactive_colors);
+    out << "<TABLE BORDER=\"0\" CELLBORDER=\"0\" CELLSPACING=\"4\" CELLPADDING=\"5\"><TR>"
+           "<TD><FONT POINT-SIZE=\"15\"><B>AEReborn</B></FONT></TD><TD BGCOLOR=\"" << colors.fill << "\">";
+    write_badge(out, running ? "RUNNING" : (ready ? "READY" : "UNPREPARED"), colors);
+    out << "</TD><TD>" << static_cast<std::uint32_t>(engine.block_period()) << " ms | Plan #"
+        << engine.plan_generation() << " | tick " << engine.tick_position() << " | " << engine.last_tick_us()
+        << " us</TD>";
+    if (engine.dirty())
+    {
+        out << "<TD BGCOLOR=\"" << warning_colors.fill << "\">";
+        write_badge(out, "DIRTY", warning_colors);
+        out << "</TD>";
+    }
+    const auto missed = engine.missed_periods();
+    if (missed)
+        out << "<TD BGCOLOR=\"" << warning_colors.fill << "\"><FONT POINT-SIZE=\"9\" COLOR=\""
+            << warning_colors.accent << "\"><B>LATE " << missed << "</B></FONT></TD>";
+    out << "</TR></TABLE>";
+}
+
+PortSpec connection_spec(const Engine &engine, const Connection &connection)
+{
+    return engine.plan_node(connection.from.node)->outputs()[connection.from.index];
+}
+} // namespace
+
+std::string dump_text(const Engine &engine, View<const Backend *const> backends)
+{
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    write_engine(out, engine);
+    const auto nodes = engine.plan_nodes();
+    out << "\nPlan Order:";
+    for (std::size_t i = 0; i < nodes.size(); ++i)
+        out << (i ? " -> [" : " [") << nodes[i].value << ']';
+
+    BackendLinks links(backends);
+    out << "\n\nNodes:\n";
+    for (const auto id : nodes)
+    {
+        const auto &node = *engine.plan_node(id);
+        out << "  [" << id.value << "] " << std::left << std::setw(9) << node.type_name() << std::right;
+        write_ports(out, "in", node.inputs());
+        write_ports(out, "out", node.outputs());
+        write_node_details(out, node);
+        out << '\n';
+        if (const auto *backend = links.take(node))
+        {
+            out << "      \xE2\x94\x94\xE2\x94\x80 ";
+            write_backend(out, *backend, backend->last_error());
+            out << '\n';
+        }
+    }
+
+    out << "\nConnections:\n";
+    for (const auto &connection : engine.plan_connections())
+    {
+        out << "  #" << connection.id.value << ": [" << connection.from.node.value << "]:" << connection.from.index
+            << " -> [" << connection.to.node.value << "]:" << connection.to.index << " (";
+        write_spec(out, connection_spec(engine, connection));
+        out << ")\n";
+    }
+
+    bool heading_written = false;
+    for (const auto *backend : backends)
+        if (backend && links.detached(*backend))
+        {
+            if (!heading_written)
+            {
+                out << "\nDetached Backends:\n";
+                heading_written = true;
+            }
+            out << "  ";
+            write_backend(out, *backend, backend->last_error());
+            out << '\n';
+        }
+    return out.str();
+}
+
+void dump_text(std::ostream &out, const Engine &engine, View<const Backend *const> backends)
+{
+    const auto report = dump_text(engine, backends);
+    out.write(report.data(), static_cast<std::streamsize>(report.size()));
+}
+
+std::string dump_dot(const Engine &engine, View<const Backend *const> backends)
+{
+    std::ostringstream out, details;
+    out.imbue(std::locale::classic());
+    details.imbue(std::locale::classic());
+    write_engine(details, engine);
+    out << "digraph AEReborn {\n"
+           "  graph [rankdir=LR, bgcolor=white, pad=0.32, nodesep=0.42, ranksep=0.64, labelloc=t, "
+           "fontname=Arial, fontsize=11, fontcolor=\"#0F172A\", label=<";
+    write_dot_engine(out, engine);
+    out << ">, tooltip=\"";
+    write_dot_escaped(out, details.str());
+    out << "\"];\n"
+           "  node [shape=plain, fontname=Arial, fontsize=10, fontcolor=\"#0F172A\"];\n"
+           "  edge [fontname=Arial, fontsize=9, fontcolor=\"#64748B\", color=\"#475569\", arrowsize=0.7, penwidth=1.4];\n";
+
+    BackendLinks links(backends);
+    MutedInputs muted_inputs;
+    std::map<NodeId, const Node *> nodes;
+    for (const auto id : engine.plan_nodes())
+    {
+        const auto &node = *engine.plan_node(id);
+        nodes.emplace(id, &node);
+        write_dot_node(out, id, node, muted_inputs);
+
+        if (const auto *backend = links.take(node))
+        {
+            const auto error = backend->last_error();
+            out << "  b" << id.value;
+            const auto *mode = write_dot_backend(out, *backend, error, false);
+            // A backend binds to a Capture source or a Playback sink.
+            if (node.inputs().empty())
+                out << "  b" << id.value << ":e -> n" << id.value << ":w";
+            else
+                out << "  n" << id.value << ":e -> b" << id.value << ":w";
+            out << " [style=dashed, color=\"" << (error ? backend_colors.border : error_colors.border)
+                << "\", label=\"" << mode << "\", tooltip=\"";
+            write_dot_escaped(out, backend->type_name());
+            out << " | graph ";
+            write_spec(out, backend->logical_spec());
+            out << " | device ";
+            write_spec(out, backend->device_spec());
+            out << "\"];\n";
+        }
+    }
+
+    for (const auto &connection : engine.plan_connections())
+    {
+        const auto &from = *nodes.find(connection.from.node)->second;
+        const auto &to = *nodes.find(connection.to.node)->second;
+        const auto spec = from.outputs()[connection.from.index];
+        const auto muted = muted_inputs.count({connection.to.node, connection.to.index});
+        out << "  n" << connection.from.node.value;
+        if (is_multiport_node(from))
+            out << ":o" << connection.from.index;
+        out << ":e -> n" << connection.to.node.value;
+        if (is_multiport_node(to))
+            out << ":i" << connection.to.index;
+        out << ":w [label=\"";
+        write_short_spec(out, spec);
+        out << (muted ? " (muted)\"" : "\"");
+        if (muted)
+            out << ", style=dashed, color=\"" << inactive_colors.border
+                << "\", fontcolor=\"" << inactive_colors.accent << '"';
+        out << ", tooltip=\"#" << connection.id.value << ": [" << connection.from.node.value << "]:" << connection.from.index
+            << " -> [" << connection.to.node.value << "]:" << connection.to.index << " (";
+        write_spec(out, spec);
+        if (muted)
+            out << ", muted";
+        out << ")\"];\n";
+    }
+
+    bool cluster_open = false;
+    for (std::size_t i = 0; i < backends.size(); ++i)
+    {
+        const auto *backend = backends[i];
+        if (backend && links.detached(*backend))
+        {
+            if (!cluster_open)
+            {
+                out << "  subgraph cluster_detached {\n    label=\"Detached Backends\";\n    style=\"rounded,dashed\";\n"
+                       "    fontname=Arial;\n    fontsize=10;\n    fontcolor=\"#64748B\";\n"
+                       "    color=\"#9CA3AF\";\n    margin=12;\n";
+                cluster_open = true;
+            }
+            out << "    detached" << i;
+            write_dot_backend(out, *backend, backend->last_error(), true);
+        }
+    }
+    if (cluster_open)
+        out << "  }\n";
+    out << "}\n";
+    return out.str();
+}
+
+void dump_dot(std::ostream &out, const Engine &engine, View<const Backend *const> backends)
+{
+    const auto graph = dump_dot(engine, backends);
+    out.write(graph.data(), static_cast<std::streamsize>(graph.size()));
+}
+
+} // namespace aereborn
+
+===== diag/inspect.h =====
+#ifndef AEREBORN_DIAG_INSPECT_H
+#define AEREBORN_DIAG_INSPECT_H
+
+#include "core/engine.h"
+#include "backend/backend.h"
+#include <iosfwd>
+#include <string>
+
+namespace aereborn
+{
+
+/// @brief Write a text report of the committed render plan and supplied backends.
+/// @pre Call on the serialized control side with live backends and endpoints.
+/// @note Live figures are approximate and can represent different points in time.
+void dump_text(std::ostream &out, const Engine &engine, View<const Backend *const> backends = {});
+
+/// @brief Return the text report as a string. Follows the same contract as the stream overload.
+std::string dump_text(const Engine &engine, View<const Backend *const> backends = {});
+
+/// @brief Write a Graphviz DOT graph of the committed plan and supplied backends.
+/// @copydetails dump_text(std::ostream &, const Engine &, View<const Backend *const>)
+void dump_dot(std::ostream &out, const Engine &engine, View<const Backend *const> backends = {});
+
+/// @brief Return the DOT graph as a string. Follows the same contract as the stream overload.
+std::string dump_dot(const Engine &engine, View<const Backend *const> backends = {});
 
 } // namespace aereborn
 

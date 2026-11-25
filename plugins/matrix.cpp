@@ -102,9 +102,12 @@ void Matrix::process(const ProcessContext &context) noexcept
         return;
     const auto target = target_.load(std::memory_order_acquire);
     const bool steady = gain_ == target;
-    if (steady && target == 0)
+    const bool active = context.has_input(0) && !(steady && target == 0.0f);
+    context.set_output_active(0, active);
+    if (!active)
     {
         output.clear();
+        gain_ = target;
         return;
     }
     const auto &input_block = context.inputs[0];

@@ -119,6 +119,131 @@ void matrix_and_mix_contracts()
         check(result[frame] == 1.0f + expected[frame], "Unmuting restores the sum");
 }
 
+void matrix_and_mix_activity()
+{
+    const PortSpec mono(rate, 1, SampleFormat::F32P);
+    const float signal[]{1.0f, 1.0f, 1.0f, 1.0f};
+    const float silence[4]{};
+    float scaled[4]{1.0f, 1.0f, 1.0f, 1.0f}, mixed[4]{};
+    const IBBlock source(reinterpret_cast<const std::uint8_t *>(signal), mono, 4);
+    const IBBlock gap(reinterpret_cast<const std::uint8_t *>(silence), mono, 4);
+    const OBBlock output(reinterpret_cast<std::uint8_t *>(scaled), mono, 4);
+    const OBBlock sum(reinterpret_cast<std::uint8_t *>(mixed), mono, 4);
+    std::uint8_t active = 1, inactive = 0, scale_active = 1, mix_active = 1;
+    Matrix matrix(rate, 1);
+    matrix.prepare(period);
+    Mixer mixer(rate, 1, 2);
+
+    matrix.set_gain(0.25f);
+    matrix.process({period, 0, {&gap, 1}, {&output, 1}, {&inactive, 1}, {&scale_active, 1}});
+    check(!scale_active && std::memcmp(scaled, silence, sizeof(scaled)) == 0,
+          "Matrix clears the old output when its input goes inactive");
+    matrix.process({period, 1, {&source, 1}, {&output, 1}, {&active, 1}, {&scale_active, 1}});
+    check(scale_active && scaled[0] == 0.25f && scaled[3] == 0.25f,
+          "A gain changed during an inactive block is in effect when input resumes");
+    const IBBlock inputs[]{output, gap};
+    const std::uint8_t input_flags[]{1, 0};
+    mixer.process({period, 1, {inputs, 2}, {&sum, 1}, {input_flags, 2}, {&mix_active, 1}});
+    check(mix_active && std::memcmp(mixed, scaled, sizeof(mixed)) == 0,
+          "Mixer emits its active, unmuted route");
+    mixer.set_muted(0, true);
+    mixer.process({period, 2, {inputs, 2}, {&sum, 1}, {input_flags, 2}, {&mix_active, 1}});
+    check(!mix_active && std::memcmp(mixed, silence, sizeof(mixed)) == 0,
+          "Muting the only active input clears the previous mix");
+    mixer.set_muted(0, false);
+    mixer.process({period, 3, {inputs, 2}, {&sum, 1}, {input_flags, 2}, {&mix_active, 1}});
+    check(mix_active && std::memcmp(mixed, scaled, sizeof(mixed)) == 0,
+          "Unmuting restores the mix and its activity flag");
+
+    matrix.set_gain(0.0f);
+    matrix.process({period, 4, {&source, 1}, {&output, 1}, {&active, 1}, {&scale_active, 1}});
+    check(scale_active && scaled[0] == 0.1875f && scaled[3] == 0.0f, "The fade-out block stays active");
+    matrix.process({period, 5, {&source, 1}, {&output, 1}, {&active, 1}, {&scale_active, 1}});
+    check(!scale_active && std::memcmp(scaled, silence, sizeof(scaled)) == 0,
+          "Steady zero gain emits inactive, zero-filled output");
+}
+
+void check_convert_tail(SampleRate from, SampleRate to, std::uint64_t flush_blocks)
+{
+    constexpr auto tick_period = BlockPeriod::Ms02;
+    const PortSpec input_spec(from, 2, SampleFormat::F32P), output_spec(to, 2, SampleFormat::F32P);
+    Convert convert(input_spec, output_spec);
+    SincResampler reference;
+    convert.prepare(tick_period);
+    reference.prepare(2, from, to);
+    std::vector<float> input(2 * input_spec.max_frames(tick_period));
+    std::vector<float> output(2 * output_spec.max_frames(tick_period)), expected(output.size());
+    const auto run_block = [&](std::uint64_t tick, bool active, bool expected_active) {
+        const auto frames = input_spec.frames(tick_period, tick);
+        const auto output_frames = output_spec.frames(tick_period, tick);
+        const OBBlock writable(reinterpret_cast<std::uint8_t *>(input.data()), input_spec, frames);
+        const IBBlock in = writable;
+        const OBBlock out(reinterpret_cast<std::uint8_t *>(output.data()), output_spec, output_frames);
+        const auto source = writable.f32p_view();
+        const OFBlock ref(expected.data(), 2, output_frames, output_frames);
+        source.clear();
+        if (active)
+        {
+            source.channel(0)[frames - 1] = 1.0f;
+            source.channel(1)[0] = -0.5f;
+        }
+        const auto bytes = out.byte_view();
+        std::memset(bytes.data(), 0xcd, bytes.size());
+        const std::uint8_t input_flag = active ? 1 : 0;
+        std::uint8_t output_flag = 1;
+        convert.process({tick_period, tick, {&in, 1}, {&out, 1}, {&input_flag, 1}, {&output_flag, 1}});
+        reference.process_tick(source, ref, tick_period, tick);
+        check(output_flag == expected_active, "Convert stays active through the last flush block");
+        check(std::memcmp(bytes.data(), expected.data(), bytes.size()) == 0,
+              "Convert matches uninterrupted resampling across the gap and on return");
+    };
+
+    constexpr std::uint64_t resume_tick = 12;
+    run_block(0, true, true);
+    expect_error(ErrorCode::InvalidArg, [&] { convert.prepare(static_cast<BlockPeriod>(0)); });
+    for (std::uint64_t tick = 1; tick < resume_tick; ++tick)
+        run_block(tick, false, tick <= flush_blocks);
+    run_block(resume_tick, true, true);
+    convert.reset();
+    reference.reset();
+    run_block(resume_tick + 1, false, false);
+    run_block(resume_tick + 2, true, true);
+    convert.prepare(tick_period);
+    reference.reset();
+    run_block(resume_tick + 3, false, false);
+}
+
+void convert_activity_and_tail()
+{
+    check_convert_tail(SampleRate::Hz48000, SampleRate::Hz16000, 1);
+    check_convert_tail(SampleRate::Hz16000, SampleRate::Hz48000, 3);
+    check_convert_tail(SampleRate::Hz11025, SampleRate::Hz44100, 5);
+
+    const PortSpec input_spec(rate, 1, SampleFormat::F32P);
+    const float zero[2]{};
+    const IBBlock input(reinterpret_cast<const std::uint8_t *>(zero), input_spec, 2);
+    for (const auto format : {SampleFormat::F32P, SampleFormat::S16LE, SampleFormat::S24_3LE,
+                              SampleFormat::S24LE, SampleFormat::S32LE, SampleFormat::F32LE})
+    {
+        const PortSpec output_spec(rate, 1, format);
+        Convert convert(input_spec, output_spec);
+        convert.prepare(period);
+        float planar[2]{};
+        std::uint8_t pcm[8]{};
+        const OBBlock output(format == SampleFormat::F32P ? reinterpret_cast<std::uint8_t *>(planar) : pcm,
+                             output_spec, 2);
+        const auto bytes = output.byte_view();
+        std::uint8_t input_flag = 1, output_flag = 0;
+        convert.process({period, 0, {&input, 1}, {&output, 1}, {&input_flag, 1}, {&output_flag, 1}});
+        check(output_flag == 1, "A real zero block stays active through same-rate conversion");
+        input_flag = 0;
+        std::memset(bytes.data(), 0xcd, bytes.size());
+        convert.process({period, 1, {&input, 1}, {&output, 1}, {&input_flag, 1}, {&output_flag, 1}});
+        check(!output_flag && std::all_of(bytes.begin(), bytes.end(), [](std::uint8_t byte) { return byte == 0; }),
+              "An inactive same-rate input clears the output bytes in every PCM format");
+    }
+}
+
 void fractional_rate_and_antialias()
 {
     for (const auto target : {SampleRate::Hz44100, SampleRate::Hz16000})
@@ -169,5 +294,7 @@ int main(int argc, char **argv)
     return aereborn::test::run_tests(argc, argv, {{"pcm_byte_values", pcm_byte_values},
                                                 {"float_channel_bits", float_channel_bits},
                                                 {"matrix_and_mix_contracts", matrix_and_mix_contracts},
-                                                {"fractional_rate_and_antialias", fractional_rate_and_antialias}});
+                                                {"matrix_and_mix_activity", matrix_and_mix_activity},
+                                                {"fractional_rate_and_antialias", fractional_rate_and_antialias},
+                                                {"convert_activity_and_tail", convert_activity_and_tail}});
 }

@@ -52,6 +52,7 @@ class PacketSink final : public NodeT<1, 0>
     void process(const ProcessContext &context) noexcept override
     {
         const auto input = context.inputs[0];
+        active = context.has_input(0);
         frames = input.frames();
         const auto bytes = input.byte_view();
         if (!bytes.empty())
@@ -63,6 +64,7 @@ class PacketSink final : public NodeT<1, 0>
         return samples_[ch * frames + frame];
     }
     std::size_t frames = 0;
+    bool active = false;
 
   private:
     std::vector<float> samples_;

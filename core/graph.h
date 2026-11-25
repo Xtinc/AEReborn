@@ -38,8 +38,9 @@ class Node
     virtual void prepare(BlockPeriod /*period*/) {}
 
     /// @brief Process one block and write every output sample in its declared format.
-    /// @param context Current period, tick position, and input and output block views.
+    /// @param context Current period, tick position, port blocks, and per-port activity flags.
     /// @pre Preparation has succeeded.
+    /// @note Outputs default to active. Mark an output inactive only when its block is filled with zero bytes.
     /// @note The context and its views are valid only during this call. Keep processing
     /// free of heap allocation and deallocation, blocking I/O, and logging.
     /// Avoid lock waits where possible.
