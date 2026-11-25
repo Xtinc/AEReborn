@@ -287,7 +287,7 @@ struct ProcessContext
     View<const IBBlock> inputs;              ///< Read-only input blocks in port index order.
     View<const OBBlock> outputs;             ///< Output blocks with writable samples in port index order.
     View<const std::uint8_t> input_active{}; ///< Per-input flags. Zero guarantees a zero-filled block.
-    View<std::uint8_t> output_active{};      ///< Per-output flags, initially active in the graph.
+    View<std::uint8_t> output_active{};      ///< Per-output flags initialized by the engine.
 
     /// @brief Check whether the input block should be processed as active.
     /// @pre index is a valid input port index.

@@ -18,17 +18,19 @@ aereborn_test_group(bus wave_tests.cpp "${bus_libraries}"
 aereborn_test_group(bus routing_tests.cpp "${bus_libraries}"
     subgroup_and_monitor parallel_pcm_algorithm live_input_switch)
 aereborn_test_group(bus stream_tests.cpp "${bus_libraries}"
-    slow_callback_parallel_archive irregular_push_and_pull capture_gaps_keep_playback_timeline
+    slow_callback_parallel_archive irregular_push_and_pull capture_gaps_keep_playback_timeline priority_mixer_silent_packets
     device_loss_and_rebind restart_shared_outputs)
 
 aereborn_test_group(core engine_tests.cpp "aereborn::plugins;aereborn_test_plugins"
     graph_constraints port_activity commit_failure_and_retry clock_boundary_barriers fractional_frames_and_ring_wrap)
 aereborn_test_group(dsp plugin_tests.cpp "aereborn::plugins"
     pcm_byte_values float_channel_bits matrix_and_mix_contracts matrix_and_mix_activity
+    mixer_priority_limits mixer_priority_transitions mixer_priority_single_frame_and_reset
     fractional_rate_and_antialias convert_activity_and_tail)
 aereborn_test_group(io backend_tests.cpp aereborn::backend
     endpoint_ownership_and_restart device_worker_errors wav_seek_and_padding sample_clock_drift)
-aereborn_test_group(io diagnostics_tests.cpp aereborn::diag diagnostic_reports endpoint_diagnostics)
+aereborn_test_group(io diagnostics_tests.cpp aereborn::diag
+    diagnostic_reports mixer_priority_diagnostics endpoint_diagnostics)
 get_target_property(backend_definitions aereborn_backend INTERFACE_COMPILE_DEFINITIONS)
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     aereborn_test_group(io platform_tests.cpp "aereborn::backend;ole32;uuid"

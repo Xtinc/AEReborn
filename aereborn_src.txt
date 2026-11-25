@@ -1,379 +1,368 @@
 
-===== aereborn_dot.md =====
-# AEReborn 诊断实现核对与 DOT 可视化重构计划
+===== aereborn.md =====
+# AEReborn 静音标识与空块早退优化计划
 
-本文档分两部分：一是核对当前已落地的诊断实现与原设计方案的一致性并收口 2 处边界隐患；二是对 `diag/inspect.cpp` 的 Graphviz DOT 输出进行彻底重构，淘汰晦涩的几何符号与扁平文本框，改为面向排障的 **Patchbay 卡片式可视化方案**。
-
----
-
-## 1. 已落地实现核对与边界收口
-
-对照原计划 `AudioEngine_Diagnostics_Plan.md`，当前 `core/`、`plugins/`、`backend/` 与 `diag/` 的整体架构完全符合“无冗余 Snapshot 结构体、仅查生效计划、后端方向由 `type_name()` 表达、零热路径开销”的原则，且多处落地细节更为严谨：
-
-| 模块 | 超出原计划的优秀落地细节 |
-| --- | --- |
-| `core/fring.h`、`plugins/endpoint.h` | 引入 `FrameRing::estimate(std::size_t&)` 与 `estimate_queued_frames()`，自动过滤并发采样双游标时偶发的越界撕裂值。 |
-| `core/engine.h/.cpp` | 更名为语义更精确的 `missed_periods()` 与 `uint64_t last_tick_us()`；`state()`、`plan_generation()` 统一补充 `require_control_thread()` 守卫。 |
-| `Graph::resolve()` | 保持 `DraftNode::inputs` 结构不变，直接按 `node_index` 过滤生效连接，改动面更小。 |
-| `backend/backend.h/.cpp` | `ASRC::correction` 直接原子化保持单一事实来源；`Backend::type_name()` 提供默认实现，降低测试桩负担。 |
-| `diag/inspect.cpp` | 全部 `std::ostringstream` 显式设置 `std::locale::classic()`，避免受系统 locale 影响小数格式。 |
-
-### 需收口的 2 处边界隐患
-
-#### 隐患 1：`Capture::close()` / `Playback::close()` 下线后未复位 `primed_`
-
-* **现状**：`Capture::close()` 和 `Playback::close()` 仅关闭了 `graph_open` 并清空 `ring_`，未将 `primed_` 重置为 `false`。后端 `stop()` 后，`online()` 返回 `false`，但直接查询 `endpoint.steady()` 仍返回 `true`（`diag/inspect.cpp` 目前被迫写为 `online && endpoint.steady()` 兜底）。
-* **修复方案**：在 `Capture::close()` 和 `Playback::close()` 清空 `ring_` 时同步复位 `primed_.store(false, std::memory_order_release);`。
-* **关键约束**：**严禁在 `close_graph_gate()` 或 `Playback::close_graph()` 中复位 `primed_`**。同步播放停机排空（`ActiveBackend::stop()` $\to$ `close_playback_graph()` $\to$ `drain_playback()`）期间，I/O 线程仍需调用 `Playback::read()` 排空剩余帧；若提前清零 `primed_`，队列低于 50% 水位时会被预填充门控重新拦截导致排空失败。
-
-#### 隐患 2：`diag/inspect.cpp` 中 `Convert` 标签遗漏格式转换
-
-* **现状**：当前 DOT 生成使用 `if (input.sample_rate != output.sample_rate) ... else if (input.format != output.format) ...`，当 `Convert` 同时改变采样率和样本格式时（如 `48k F32P` 转 `16k S16LE`），`else if` 会静默丢弃格式转换信息。
-* **修复方案**：并入本轮 DOT 重构，同时比对 `sample_rate` 与 `format` 并按实际变化完整展示。
+本方案参考 PipeWire（`SPA_CHUNK_FLAG_EMPTY`）与 GStreamer（`GST_BUFFER_FLAG_GAP`）的成熟设计，在不污染 `ByteBlock` 图外 I/O 视图、不引入业务逻辑到 `core/` 的前提下，为 AEReborn 音频图增加 **1 字节数据存在位（Active Flag）自动传播机制**，并基于该标识在内置插件上落地 **空块早退优化（Empty-Block Early Exit）**。
 
 ---
 
-## 2. 当前 DOT 图的核心痛点
+## 1. 背景与优化目标
 
-1. **符号表意不明且易乱码**：使用 `●`、`◐`、`○` 表示在线/预填充/离线，`▰▱` 拼装进度条，`Σ`、`↔`、`×` 修饰插件，`!` 混用表示 XRUN 与后端故障。既需要对照图例猜测含义，又容易在常规无衬线字体下出现字宽错位或回退乱码。
-2. **关键排障信息隐藏在 `tooltip`**：静态导出（PNG/PDF）或快速浏览时无法直接看到连线的音频规格、端口号、`Mixer` 静音通道、`Backend` 的具体错误码以及 `Engine` 的 `dirty` / `late` 告警。
-3. **信息主次倒置**：正常节点堆砌装饰符号，而真正影响“为何无声/卡顿”的核心状态（`Mixer` 静音路、`Matrix` 声道映射与零增益、`Backend` 的 `Draining`/`Stopped` 与错误码）在主图缺失。
-4. **扁平文本框缺结构层次**：普通 `shape=box` 靠换行堆叠文本，多总线、多分支场景下难以分辨端口映射与硬件边界。
+在固定周期软件时钟引擎中，`Engine::Clock` 会按 2--40 ms 的固定节拍持续驱动整张生效渲染计划（`Plan`），导致当前存在两类问题：
 
----
+1. **语义混淆（阻塞自动优先级闪避）**：当上游 `Capture` 处于离线、预填充、队列读空（如 `PushSource` 停推、WAV 播完）或端口未连接/暂停时，引擎与端点会向缓冲填零静音。下游节点面对全 `0.0f` 样本，无法区分“**通话中对方静音但仍在推全零包**”与“**通话已挂断/文件已播完**”。
+2. **空闲算力浪费与次正规数隐患**：待机中的多路网络接收槽位、静音支路或未推流的 `PushSource` 若串联了跨采样率 `Convert`（96 抽头多相 Sinc 卷积）或多路 `Mixer`，每拍仍会对全零数据执行完整编解码、卷积与浮点乘加；对于未来的 IIR / 混响节点，持续处理全零输入还容易触发 IEEE 754 次正规浮点数（Denormal）性能退化。
 
-## 3. 新版 DOT 可视化设计：Patchbay 卡片式架构
+### 业界参考与 AEReborn 取舍
 
-保持 `diag/inspect.h` 公开 API 与 Graphviz 工具链完全不变，在 `diag/inspect.cpp` 内部改用 Graphviz 原生 **HTML-Like Table 卡片（`shape=plain`）**，通过以下四项规则实现“一眼定位拓扑与故障”：
-
-### 3.1 核心表达规则
-
-1. **零神秘符号，统一使用短英文状态词 + 语义色板**
-   * 不再需要顶部符号图例，文字自解释：
-     * 引擎状态：`UNPREPARED`、`READY`、`RUNNING`
-     * 端点状态：`ONLINE`、`PREFILL`、`OFFLINE`
-     * 后端状态：`RUN`、`DRAIN`、`STOPPING`、`STOP`、`ERR: <ErrorCode>`（使用短枚举名，如 `ERR: DeviceLost`、`ERR: Timeout`、`ERR: EndOfStream`）
-2. **正常静默、异常高亮**
-   * `dirty == false`、`missed_periods == 0`、`underrun == 0`、`overflow == 0` 时不占用卡片版面。
-   * 一旦出现异常（未提交草稿、时钟逾期、队列 XRUN、后端报错），立即弹出高对比度琥珀/红色徽章或告警行。
-3. **显式端口插槽与静音连线可视化**
-   * `Mixer` 及任意多端口节点（`inputs.size() > 1 || outputs.size() > 1`）在卡片内逐行绘制左入右出端口插槽（`PORT="i0"`、`PORT="o0"`），连线经 `:e` / `:w` 锚点精确对接。
-   * `Mixer` 已静音的输入槽标注 `[MUTE]` 并置灰；连向该输入槽的边自动渲染为**灰色虚线**并附 `(muted)`，阻断点一目了然。
-4. **主图信息凝练，完整细节保留在 `tooltip`**
-   * 节点卡片与边标签直接展示最关键的拓扑与运行事实；完整的端口明细、未截断的 `RetCode::message()` 及 Windows WASAPI 原生 `HRESULT` 仍保留在 SVG `tooltip` 中供悬停深查。
-
-### 3.2 语义色板规范
-
-| 角色 / 状态 | 标题栏底色 | 边框色 | 标题 / 徽章文字色 | 适用场景 |
-| --- | --- | --- | --- | --- |
-| **端点（正常）** | `#DFF4F0` | `#2E8B7D` | `#0F172A` / `#15803D` | `Capture`、`Playback` 稳态在线 |
-| **图内 DSP 节点** | `#E8EEF7` | `#4A6FA5` | `#0F172A` | `Mixer`、`Matrix`、`Convert` 及自定义节点 |
-| **外部后端（正常）** | `#F1F5F9` | `#64748B` | `#0F172A` / `#15803D` | `Alsa*`、`Wasapi*`、`Wav*`、`Null*`、`PushSource`、`PullSink`、`UsrPlayback` |
-| **告警 / 过渡态** | `#FEF3C7` | `#D97706` | `#92400E` / `#B45309` | `PREFILL`、`DRAIN`、`STOPPING`、`DIRTY`、`LATE`、存在 XRUN |
-| **错误态** | `#FEE2E2` | `#DC2626` | `#991B1B` / `#DC2626` | `!backend.last_error()` |
-| **静默 / 离线态** | `#F3F4F6` | `#9CA3AF` | `#64748B` / `#9CA3AF` | `OFFLINE`、`STOP`、`[MUTE]` 槽位、静音入边、`Detached` 后端 |
-
-### 3.3 各类元素的卡片与连线规范
-
-#### (1) 顶部引擎状态横幅（Graph Label）
-
-单行无边框表格，紧凑呈现核心遥测：
-
-* 固定项：`AEReborn` + 引擎状态徽章（`RUNNING` 绿 / `READY` 蓝 / `UNPREPARED` 灰）+ `period | Plan #gen | tick N | M us`
-* 按需告警徽章：
-  * `engine.dirty() == true` 时追加琥珀徽章 `DIRTY`
-  * `engine.missed_periods() > 0` 时追加红/琥珀徽章 `LATE <count>`
-
-#### (2) `Capture` / `Playback` 端点卡片
-
-* 边框采用 `<TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED">` + `<HR/>` 分隔标题栏与正文（兼顾圆角轮廓与清晰分隔线）。
-* 标题栏：`Capture #id`（或 `Playback #id`）+ 状态徽章：
-  * `online() && steady()` $\to$ `ONLINE`（绿）
-  * `online() && !steady()` $\to$ `PREFILL`（琥珀）
-  * `!online()` $\to$ `OFFLINE`（灰）
-* 正文行：
-  * 队列水位：`Queue 960/1920 (50%)`（当 `estimate_queued_frames()` 不可用时显示 `Queue -/1920`）。
-  * 异常行（仅在 `lost > 0` 时显示）：`Underrun: <N>f` 或 `Overflow: <N>f`（琥珀加粗，同时卡片边框与标题栏切至告警色）。
-
-#### (3) `Mixer` 与多端口节点卡片
-
-* 只要节点满足 `inputs.size() > 1 || outputs.size() > 1`，使用两列端口表（标题栏 `COLSPAN="2"`，下方用 `<HR/>` 分隔，左右列用 `<VR/>` 分隔）：
-  * 左列逐行渲染 `in0`、`in1`…（`PORT="i0"`、`PORT="i1"`…）；若为 `Mixer` 且 `muted(i) == true`，该单元格底色 `#F3F4F6`、字色 `#9CA3AF`，文本为 `in<i> [MUTE]`。
-  * 右列逐行渲染 `out0`…（`PORT="o0"`…）；当左右端口数不等（如 `Mixer` 为 $N$ 入 1 出）时，较少一侧最后一行用 `ROWSPAN` 纵向合并对齐。
-
-#### (4) `Matrix`、`Convert` 与单端口节点卡片
-
-* **`Matrix`**：
-  * 声道数变化时显示 `<in_ch>ch -> <out_ch>ch | `，否则省略声道映射前缀。
-  * 增益显示 `Gain 0.50`；当 `gain() == 0.0f` 时显示 `Gain 0.00 [MUTE]`（标题与边框可保持 DSP 色，文字标灰提示零输出）。
-* **`Convert`**：
-  * 同时检查 `sample_rate` 与 `format`：
-    * 两者均变化：`48k F32P -> 16k S16LE`
-    * 仅采样率变化：`48k -> 44.1k`
-    * 仅格式变化：`F32P -> S16LE`
-    * 规格相同：`passthrough`
-* **其他单端口自定义节点（如 `Tone`、`Meter` 或算法节点）**：
-  * 标题栏显示 `type_name() #id`，正文按端口规格显示紧凑概要（如 `48k 1ch F32P`）。
-
-#### (5) `Backend` 外部驱动卡片与 `Detached` 分组
-
-* 标题栏：`backend.type_name()` + 状态徽章：
-  * `!error` $\to$ `ERR: <ShortErrorCode>`（红，卡片整体切换错误色）
-  * `ActiveBackend`: `Running` $\to$ `RUN`、`Draining` $\to$ `DRAIN`（琥珀）、`Stopping` $\to$ `STOPPING`（琥珀）、`Stopped` $\to$ `STOP`（灰）
-  * `PassiveBackend`: `running()` $\to$ `RUN` / `STOP`
-* 正文两行：
-  * 第 1 行（已绑定时）：设备原生规格 + 批次上限，例如 `48k 2ch S32LE (max 240f)`；未绑定时显示 `unbound`。
-  * 第 2 行：时钟与处理摘要：
-    * `ActiveBackend` 异步：`async · FIR · drift +12.4 ppm`（仅在 `uses_resampler()` 时含 `FIR`，异步始终含 `drift`）
-    * `ActiveBackend` 同步：`sync`（若 `uses_resampler()` 则 `sync · FIR`）
-    * `PassiveBackend`：`passive`（若 `uses_resampler()` 则 `passive · FIR`）
-* **Detached Backends**：未关联到任何生效 Plan 节点的后端归入 `subgraph cluster_detached`，虚线灰框标注 `Detached Backends`。
-
-#### (6) 连线（Edge）规范
-
-* **图内连接（`plan_connections()`）**：
-  * 锚点：若源/目标节点为多端口卡片，分别使用 `n<from>:o<idx>:e` 和 `n<to>:i<idx>:w`；单端口卡片使用 `n<from>:e` 和 `n<to>:w`。
-  * 标签：直接显示紧凑格式（如 `48k 2ch F32P`），字体 9pt 浅灰 `#64748B`。
-  * 静音检测：若目标节点为 `Mixer` 且 `mixer->muted(conn.to.index)`，边样式设为 `style=dashed, color="#9CA3AF", fontcolor="#9CA3AF"`，标签追加 `(muted)`。
-* **后端与端点边界连线**：
-  * 方向：`Capture` 为 `b<id>:e -> n<id>:w`，`Playback` 为 `n<id>:e -> b<id>:w`。
-  * 样式：虚线 `style=dashed`；若 `!backend.last_error()` 线条标红 `#DC2626`，否则 `#64748B`。
-  * 标签：按边界处理模式简洁标注——异步标 `ASRC`，同步/被动带重采样标 `FIR`，无重采样标 `PCM`。
+| 维度 | GStreamer (`GST_BUFFER_FLAG_GAP`) | PipeWire (`SPA_CHUNK_FLAG_EMPTY`) | AEReborn 本方案设计 |
+| --- | --- | --- | --- |
+| **标志载体** | `GstBuffer::flags` | `spa_chunk::flags` | `ProcessContext` 中的 `input_active` / `output_active` 视图 |
+| **为何不放进 `ByteBlock`** | — | 块头与图强绑定 | `ByteBlock` 被 `WavFile`、`PushSource`、ALSA/WASAPI 等图外模块广泛复用，放入 `ProcessContext` 可保证图外接口零污染，且不破坏 `View<const OBBlock>` 的只读容器契约 |
+| **默认透传方式** | 框架基类自动复制 metadata | 端口共享 `spa_chunk` + `audioadapter` 转发 | `Engine::Runner::Plan::render()` 在每步 `process()` 前集中接力并写入默认值，**用户自定义节点一行不改即自动透传** |
+| **多输入汇聚规则** | 全 GAP 才输出 GAP | 全 EMPTY 才输出 EMPTY | 任意未静音输入为活跃，则输出活跃（逻辑或） |
 
 ---
 
-## 4. 完整 DOT 输出示例
+## 2. 五条核心不变式（设计红线）
 
-以下为典型多路总线场景（1 路 ALSA 正常采集 + 1 路 WAV 采集 EOF 欠载且在 Mixer 被静音 + Matrix 声道缩混 + Convert 采样率与格式双转 + WASAPI 异步播放）的目标 DOT 输出，可直接通过 `dot -Tsvg` 渲染验证：
+落地过程中必须严格守住以下五条契约，避免引入隐蔽的音频瑕疵或回归：
 
-~~~dot
-digraph AEReborn {
-  graph [
-    rankdir=LR, splines=true, bgcolor="#FFFFFF",
-    pad=0.32, nodesep=0.42, ranksep=0.72, labelloc=t,
-    fontname="Helvetica,Arial,sans-serif",
-    label=<
-      <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="4">
-        <TR>
-          <TD><B><FONT POINT-SIZE="15" COLOR="#0F172A">AEReborn</FONT></B></TD>
-          <TD BGCOLOR="#DCFCE7"><B><FONT POINT-SIZE="10" COLOR="#166534"> RUNNING </FONT></B></TD>
-          <TD><FONT POINT-SIZE="10" COLOR="#475569">5ms | Plan #3 | tick 12480 | 138 us</FONT></TD>
-          <TD BGCOLOR="#FEF3C7"><B><FONT POINT-SIZE="10" COLOR="#B45309"> DIRTY </FONT></B></TD>
-        </TR>
-      </TABLE>
-    >
-  ];
-  node [shape=plain, fontname="Helvetica,Arial,sans-serif"];
-  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9, fontcolor="#64748B", color="#475569", arrowsize=0.7, penwidth=1.4];
+1. **存在位语义与样本值彻底解耦**
+   * `active == 1`：上游本拍交付了真实音频流（**即使所有样本恰好都是 `0.0f`**，例如通话对方静音或 WAV 文件内的静音段）。
+   * `active == 0`：本拍无真实数据流（端口未连接、上游被 `set_paused(true)` 排除、`Capture` 离线/预填充/读空、`Matrix` 稳态零增益关断、或 `Mixer` 全部未静音输入均为空）。
+2. **静音内存安全兜底（Silence Memory Invariant）**
+   * 即使某节点将 `output_active` 置为 `0` 并走早退路径，**仍必须将输出块清零（`clear()` 或 `std::memset(0)`）**。
+   * 原因：`float_pool` 与 `byte_pool` 在每个 tick 间复用；不关心存在位的用户自定义节点或 `Playback` 会直接读取样本区，若跳过清零会导致上一拍残余样本循环泄漏。对单拍数 KB 的 L1 缓存块执行一次 `memset` 耗时仅纳秒级，换来绝对安全的内存不变式。
+3. **热路径零堆分配、零锁、`noexcept`**
+   * `input_active`、`output_active` 与 `input_sources` 全部在 `commit()` 阶段随 `Plan` 一次性分配完毕；`Plan::render()` 仅做顺序数组下标访问。
+4. **对既有代码与直接单测 100% 向后兼容**
+   * `ProcessContext` 保持 C++14 聚合类型（Aggregate），不引入用户自定义构造函数。既有单测直接构造 4 字段 `ProcessContext{period, tick, inputs, outputs}` 时，末尾两个 `View` 自动值初始化为空视图；`has_input()` 对空视图默认返回 `true`，`set_output_active()` 对空视图安全空操作。
+5. **汇端 `Playback` 必须照常消费静音块**
+   * `Playback::process()` **禁止**因 `has_input(0) == false` 而跳过写入 `FrameRing`。
+   * 原因：录音文件（`WavPlayback`）与周期回调（`UsrPlayback`）需要连续时间线，异步声卡（ALSA / WASAPI）的 ASRC PI 闭环依赖稳定入队维持 $50\%$ 队列水位。
 
-  b1 [label=<
-    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED" COLOR="#64748B" BGCOLOR="#FFFFFF">
-      <TR><TD BGCOLOR="#F1F5F9" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#0F172A">AlsaCapture</FONT></B>  <FONT POINT-SIZE="9" COLOR="#15803D"><B>RUN</B></FONT></TD></TR>
-      <HR/>
-      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#334155">48k 2ch S32LE (max 240f)<BR ALIGN="LEFT"/>async | FIR | drift +12.4 ppm</FONT></TD></TR>
-    </TABLE>
-  >];
+---
 
-  n1 [label=<
-    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED" COLOR="#2E8B7D" BGCOLOR="#FFFFFF">
-      <TR><TD BGCOLOR="#DFF4F0" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#0F172A">Capture</FONT></B> <FONT POINT-SIZE="9" COLOR="#64748B">#1</FONT>  <FONT POINT-SIZE="9" COLOR="#15803D"><B>ONLINE</B></FONT></TD></TR>
-      <HR/>
-      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#334155">Queue 960/1920 (50%)</FONT></TD></TR>
-    </TABLE>
-  >];
+## 3. 内核改造设计（`core/`）
 
-  b2 [label=<
-    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED" COLOR="#DC2626" BGCOLOR="#FFFFFF">
-      <TR><TD BGCOLOR="#FEE2E2" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#991B1B">WavCapture</FONT></B>  <FONT POINT-SIZE="9" COLOR="#DC2626"><B>ERR: EndOfStream</B></FONT></TD></TR>
-      <HR/>
-      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#7F1D1D">44.1k 2ch S16LE (max 220f)<BR ALIGN="LEFT"/>sync | FIR</FONT></TD></TR>
-    </TABLE>
-  >];
+### 3.1 `core/types.h`：扩展 `ProcessContext`
 
-  n2 [label=<
-    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED" COLOR="#D97706" BGCOLOR="#FFFFFF">
-      <TR><TD BGCOLOR="#FEF3C7" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#0F172A">Capture</FONT></B> <FONT POINT-SIZE="9" COLOR="#64748B">#2</FONT>  <FONT POINT-SIZE="9" COLOR="#64748B"><B>OFFLINE</B></FONT></TD></TR>
-      <HR/>
-      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#334155">Queue 0/1920 (0%)<BR ALIGN="LEFT"/></FONT><FONT POINT-SIZE="9" COLOR="#B45309"><B>Underrun: 480f</B></FONT></TD></TR>
-    </TABLE>
-  >];
+在 `ProcessContext` 末尾追加两个轻量只读/可写字节视图，并提供语义清晰的访问方法：
 
-  n3 [label=<
-    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="4" STYLE="ROUNDED" COLOR="#4A6FA5" BGCOLOR="#FFFFFF">
-      <TR><TD COLSPAN="2" BGCOLOR="#E8EEF7" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#0F172A">Mixer</FONT></B> <FONT POINT-SIZE="9" COLOR="#64748B">#3</FONT></TD></TR>
-      <HR/>
-      <TR>
-        <TD PORT="i0" ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#334155">in0</FONT></TD>
-        <VR/>
-        <TD PORT="o0" ROWSPAN="2" ALIGN="RIGHT"><FONT POINT-SIZE="9" COLOR="#334155">out0</FONT></TD>
-      </TR>
-      <TR>
-        <TD PORT="i1" BGCOLOR="#F3F4F6" ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#9CA3AF">in1 [MUTE]</FONT></TD>
-      </TR>
-    </TABLE>
-  >];
+```cpp
+/// @brief Timing, port blocks, and per-port active flags passed to a node for one process call.
+/// @note All views and backing buffers are borrowed for the duration of that call.
+struct ProcessContext
+{
+    BlockPeriod block_period;             ///< Duration of the current engine tick.
+    std::uint64_t tick_position;          ///< Zero-based position of the current tick.
+    View<const IBBlock> inputs;           ///< Read-only input blocks in port index order.
+    View<const OBBlock> outputs;          ///< Output blocks with writable samples in port index order.
+    View<const std::uint8_t> input_active;  ///< Nonzero when an input carries real stream data.
+    View<std::uint8_t> output_active;       ///< Output active flags initialized to engine defaults.
 
-  n4 [label=<
-    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED" COLOR="#4A6FA5" BGCOLOR="#FFFFFF">
-      <TR><TD BGCOLOR="#E8EEF7" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#0F172A">Matrix</FONT></B> <FONT POINT-SIZE="9" COLOR="#64748B">#4</FONT></TD></TR>
-      <HR/>
-      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#334155">2ch -&gt; 1ch | Gain 0.50</FONT></TD></TR>
-    </TABLE>
-  >];
+    /// @brief Check whether an input port carries real stream data on this tick.
+    /// @note Returns true when input_active is omitted (for direct standalone node calls).
+    bool has_input(std::size_t index) const noexcept
+    {
+        return index < input_active.size() ? input_active[index] != 0 : true;
+    }
 
-  n5 [label=<
-    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED" COLOR="#4A6FA5" BGCOLOR="#FFFFFF">
-      <TR><TD BGCOLOR="#E8EEF7" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#0F172A">Convert</FONT></B> <FONT POINT-SIZE="9" COLOR="#64748B">#5</FONT></TD></TR>
-      <HR/>
-      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#334155">48k F32P -&gt; 16k S16LE</FONT></TD></TR>
-    </TABLE>
-  >];
+    /// @brief Override whether an output port carries real stream data on this tick.
+    /// @note Even when set to false, the node must still write silence to the output block.
+    void set_output_active(std::size_t index, bool active) const noexcept
+    {
+        if (index < output_active.size())
+            output_active[index] = active ? 1 : 0;
+    }
+};
+```
 
-  n6 [label=<
-    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED" COLOR="#2E8B7D" BGCOLOR="#FFFFFF">
-      <TR><TD BGCOLOR="#DFF4F0" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#0F172A">Playback</FONT></B> <FONT POINT-SIZE="9" COLOR="#64748B">#6</FONT>  <FONT POINT-SIZE="9" COLOR="#15803D"><B>ONLINE</B></FONT></TD></TR>
-      <HR/>
-      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#334155">Queue 952/1920 (50%)</FONT></TD></TR>
-    </TABLE>
-  >];
+### 3.2 `core/engine.cpp`：编译期索引与每拍自动传播
 
-  b6 [label=<
-    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="5" STYLE="ROUNDED" COLOR="#64748B" BGCOLOR="#FFFFFF">
-      <TR><TD BGCOLOR="#F1F5F9" ALIGN="LEFT"><B><FONT POINT-SIZE="11" COLOR="#0F172A">WasapiPlayback</FONT></B>  <FONT POINT-SIZE="9" COLOR="#15803D"><B>RUN</B></FONT></TD></TR>
-      <HR/>
-      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="9" COLOR="#334155">48k 2ch F32LE (max 480f)<BR ALIGN="LEFT"/>async | FIR | drift -8.1 ppm</FONT></TD></TR>
-    </TABLE>
-  >];
+#### (1) `port_range()` 支持可写视图重载
 
-  b1:e -> n1:w [style=dashed, color="#64748B", label=" ASRC "];
-  b2:e -> n2:w [style=dashed, color="#DC2626", label=" FIR "];
-  n1:e -> n3:i0:w [label=" 48k 2ch F32P "];
-  n2:e -> n3:i1:w [style=dashed, color="#9CA3AF", fontcolor="#9CA3AF", label=" 48k 2ch F32P (muted) "];
-  n3:o0:e -> n4:w [label=" 48k 2ch F32P "];
-  n4:e -> n5:w [label=" 48k 1ch F32P "];
-  n3:o0:e -> n6:w [label=" 48k 2ch F32P "];
-  n6:e -> b6:w [style=dashed, color="#64748B", label=" ASRC "];
+在 `core/engine.cpp` 匿名命名空间补充非常量版本，供 `output_active` 构造可写 `View<std::uint8_t>`：
+
+```cpp
+template <class T>
+View<T> mutable_port_range(std::vector<T> &items, std::size_t first, std::size_t count) noexcept
+{
+    if (count == 0)
+        return {};
+    return {items.data() + first, count};
 }
-~~~
+```
+
+#### (2) `Engine::Runner::Plan` 新增三个扁平数组
+
+与现有 `inputs`、`outputs` 一一对齐，全部由 `commit()` 一次性构建：
+
+```cpp
+struct Plan
+{
+    // 原有成员保持不变 ...
+    std::vector<IBBlock> inputs;
+    std::vector<OBBlock> outputs;
+
+    // 新增成员：每端口 1 字节存在位及上游输出下标映射
+    std::vector<std::uint8_t> input_active;
+    std::vector<std::uint8_t> output_active;
+    std::vector<std::size_t> input_sources; // Link::unconnected 表示未连接或上游已暂停
+};
+```
+
+#### (3) `bind_blocks()` 绑定阶段记录上游下标
+
+在 `Engine::Runner::bind_blocks()` 中同步分配数组并填充 `input_sources`：
+
+```cpp
+plan.input_active.assign(layout.input_count, 0);
+plan.output_active.assign(layout.output_count, 0);
+plan.input_sources.assign(layout.input_count, Link::unconnected);
+```
+
+在输入端口绑定循环内补充：
+
+```cpp
+if (link.node_index != Link::unconnected)
+{
+    const auto source_output = plan.steps[link.node_index].first_output + link.port_index;
+    plan.inputs[input_index] = plan.outputs[source_output];
+    plan.input_sources[input_index] = source_output;
+}
+else
+{
+    const auto spec = entry.inputs[port];
+    plan.inputs[input_index] = plan.block(spec, spec.max_frames(period), 0);
+}
+```
+
+> 容量边界安全性：`layout.input_count` 与 `layout.output_count` 已在 `measure_layout()` 中分别受 `plan.inputs.max_size()` 与 `plan.outputs.max_size()` 约束；由于 $\text{sizeof}(\text{IBBlock}) \ge \text{sizeof}(\text{size\_t}) > \text{sizeof}(\text{uint8\_t})$，新增三个数组不会发生容量溢出。
+
+#### (4) `Plan::render()` 自动接力与默认传播
+
+由于 `steps` 已按拓扑顺序排列（上游节点必先于下游节点执行），每拍循环如下：
+
+```cpp
+for (const auto &step : steps)
+{
+    std::uint8_t any_input_active = 0;
+    for (std::size_t p = 0; p < step.input_count; ++p)
+    {
+        const auto input_index = step.first_input + p;
+        const auto source = input_sources[input_index];
+        const std::uint8_t active = source != Link::unconnected ? output_active[source] : 0;
+        input_active[input_index] = active;
+        any_input_active |= active;
+    }
+
+    // 源节点（无输入端口）默认输出活跃；处理节点默认按全部输入的逻辑或透传。
+    const std::uint8_t default_output = step.input_count == 0 ? 1 : any_input_active;
+    for (std::size_t p = 0; p < step.output_count; ++p)
+        output_active[step.first_output + p] = default_output;
+
+    step.node->process({period, tick,
+                        port_range(inputs, step.first_input, step.input_count),
+                        port_range(outputs, step.first_output, step.output_count),
+                        port_range(input_active, step.first_input, step.input_count),
+                        mutable_port_range(output_active, step.first_output, step.output_count)});
+}
+```
 
 ---
 
-## 5. 逐文件改造清单与实现细节
+## 4. 内置插件的静音标识与早退优化（`plugins/`）
 
-### 5.1 `plugins/endpoint.cpp`（2 行修复）
+### 4.1 全节点行为总览
 
-* 在 `Capture::close()` 和 `Playback::close()` 中，于 `ring_.clear()` 旁补充 `primed_.store(false, std::memory_order_release);`。
-* 保持 `close_graph_gate()` 与 `Playback::close_graph()` 不变，确保同步播放排空流程不受影响。
+| 插件节点 | 存在位产生 / 改写规则 | 空块早退优化动作 | 算力收益 |
+| --- | --- | --- | --- |
+| **`Capture`** | `set_output_active(0, frames != 0)` | 离线或读空时原有逻辑已跳过队列读并清零 | 作为全图真实流源头，精确区分停推与全零包 |
+| **`Playback`** | 无输出端口 | **不早退**，照常写入静音帧保时间线与 ASRC 水位 | 保障设备/录盘连续性 |
+| **`Convert`** | 正常流 `1`；拖尾冲刷期强制 `1`；冲刷完毕走默认 `0` | `tail_remaining_ == 0` 且无输入时，跳过编解码与 96 抽头卷积，直接 `memset(0)` | **收益最高**（砍掉空闲分支全部重采样与编解码开销） |
+| **`Matrix`** | 无输入走默认 `0`；稳态零增益显式写 `0` | 无输入时跳过矩阵乘加与斜坡计算，清零并同步 `gain_ = target` | 跳过多声道矩阵乘加与斜坡循环 |
+| **`Mixer`** | 写未静音且活跃输入的逻辑或 | 跳过 `muted_[i] \|\| !has_input(i)` 的输入支路 | 空闲/静音路零样本读写开销 |
+| **`Tone` / 自定义节点** | 无需改代码（引擎默认：`Tone` 为 `1`，处理节点自动透传） | 保持原逻辑；未来有状态插件可按需接入三态早退 | 零侵入兼容 |
 
-### 5.2 `diag/inspect.cpp`（集中重构 `dump_dot()`）
+---
 
-`diag/inspect.h` 与 `dump_text()` 均无需改动。`diag/inspect.cpp` 内部调整如下：
+### 4.2 `Capture`（`plugins/endpoint.cpp`）
 
-1. **移除旧 Unicode 常量**：删除 `online_symbol`、`prefill_symbol`、`offline_symbol`、`▰`/`▱`、`Σ`/`↔`/`×` 等符号拼接逻辑。
-2. **新增 3 个纯辅助函数（匿名命名空间）**：
-   * `write_html_escaped(std::ostream &, const std::string &)`：将 `&`、`<`、`>`、`"` 分别转义为 `&amp;`、`&lt;`、`&gt;`、`&quot;`，确保自定义节点名或平台错误串不会破坏 HTML-Like Label 语法。
-   * `error_code_name(ErrorCode)`：覆盖 `core/retcode.h` 全部 18 个枚举值，返回紧凑短名（如 `"DeviceLost"`、`"EndOfStream"`、`"Timeout"`），用于后端卡片红标；`tooltip` 继续输出完整 `RetCode::message()` 与 WASAPI `HRESULT`。
-   * `write_short_rate(std::ostream &, SampleRate)`：纯整数格式化采样率（`48000` $\to$ `48k`，`44100` $\to$ `44.1k`，`11025` $\to$ `11.025k`），不修改 `std::ostream` 的浮点格式标志位。
-3. **重写卡片与边生成函数**：
-   * `is_multiport_node(const Node &)`：判断 `inputs().size() > 1 || outputs().size() > 1`，统一驱动多端口插槽渲染与连线端口锚点（`:o<idx>:e` / `:i<idx>:w`）。
-   * `write_dot_endpoint(...)`：渲染 `Capture`/`Playback` 卡片，含 `ONLINE`/`PREFILL`/`OFFLINE` 徽章、`Queue frames/cap (pct%)` 与按需 XRUN 告警行。
-   * `write_dot_node(...)`：分发端点卡片、多端口插槽卡片（`Mixer` 标记 `[MUTE]`）、以及 `Matrix`（声道变化 + `Gain` / `[MUTE]`）、`Convert`（同时比较 `sample_rate` 与 `format`）、其他单端口节点卡片。
-   * `write_dot_backend(...)`：渲染外部驱动卡片，区分 `RUN` / `DRAIN` / `STOPPING` / `STOP` / `ERR: <ShortCode>`，展示设备规格、批次上限、`async`/`sync`/`passive`、`FIR` 与 `drift`。
-   * 边循环：为图内连线标注紧凑规格、识别 `Mixer` 静音输入并灰虚化连线；为后端↔端点虚线标注 `ASRC` / `FIR` / `PCM`。
-   * 全部节点、后端、连线及根图仍保留 `tooltip` 输出完整诊断信息。
+在 `Capture::process()` 末尾补 1 行即可成为整张图的精确活跃源头：
 
-### 5.3 文档与测试同步
+```cpp
+void Capture::process(const ProcessContext &context) noexcept
+{
+    const auto output = context.outputs[0].f32p_view();
+    std::size_t frames = 0;
+    if (enter_graph(graph_state_))
+    {
+        if (prefill_ready(ring_, primed_, target_frames()))
+        {
+            frames = ring_.read(output);
+            if (frames < output.frames())
+                underrun_frames_.fetch_add(output.frames() - frames, std::memory_order_relaxed);
+        }
+        graph_state_.fetch_and(~graph_active, std::memory_order_release);
+    }
+    output.subblock(frames, output.frames() - frames).clear();
+    context.set_output_active(0, frames != 0);
+}
+```
 
-| 文件 | 同步内容 |
+* 离线、预填充未就绪、队列读空（WAV EOF、停推、硬件断流）时 `frames == 0` $\to$ 输出 `0`。
+* 只要从 `FrameRing` 读到了真实帧（含部分短读、或调用方刻意推送的全零静音包），`frames != 0` $\to$ 输出 `1`。
+
+---
+
+### 4.3 `Convert` 三态早退优化（`plugins/convert.h` & `plugins/convert.cpp`）
+
+`Convert` 内部可能包含有状态的 96 抽头 `SincResampler`（历史缓冲 `history_` 保存最近 $96$ 帧输入样本）。为避免硬截断尾音与脏历史残留，采用**三态早退**策略：
+
+1. **成员变量（`plugins/convert.h`）**：新增 `std::size_t tail_remaining_ = 0;`（单位：输入帧数）。
+2. **生命周期清零**：
+   * `Convert::prepare(BlockPeriod)`：仅在全部缓冲与 `resampler_.prepare()` 成功后，将 `tail_remaining_ = 0;` 与新缓冲一同提交（维持准备失败保留旧状态的强异常安全）。
+   * `Convert::reset()`：在 `resampler_.reset();` 后同步执行 `tail_remaining_ = 0;`。
+3. **`Convert::process()` 实现**：
+
+```cpp
+void Convert::process(const ProcessContext &context) noexcept
+{
+    const auto input = context.inputs[0];
+    const auto output = context.outputs[0];
+
+    if (context.has_input(0))
+    {
+        tail_remaining_ = resampler_.tail_frames(); // 同采样率为 0，跨采样率为 96
+    }
+    else if (tail_remaining_ > 0)
+    {
+        // 冲刷 FIR 拖尾：继续消费上游保证为零的输入块，并维持输出活跃位为 1
+        tail_remaining_ -= std::min(tail_remaining_, input.frames());
+        context.set_output_active(0, true);
+    }
+    else
+    {
+        // 空块早退：history_ 已完全归零，直接按字节清零输出并跳过编解码与卷积
+        const auto bytes = output.byte_view();
+        if (!bytes.empty())
+            std::memset(bytes.data(), 0, bytes.size());
+        return;
+    }
+
+    // 原有 same_spec_ 直通 / decode_pcm / process_tick / encode_pcm 逻辑保持不变
+    ...
+}
+```
+
+#### 数值等价性与零相位漂移证明
+
+* **比特级等价**：`SincResampler` 的滤波窗口长度 `taps` $= 96$ 帧，且 `resampler_.tail_frames()` 返回的正是 `taps`（同采样率时返回 $0$）。在输入变为 `0` 后，冲刷阶段累计喂入并经 `remember()` 移入 `history_` 的零输入帧数 $\ge 96$，故进入早退态时 `history_` 内每个浮点样本严格等于 `0.0f`。后续全零历史与全零输入的卷积结果与 `std::memset(0)` **比特级完全一致**（AEReborn 支持的全部 6 种样本格式均以全零字节表示静音）。
+* **零相位漂移**：`SincResampler::process_tick()` 每拍的分数相位完全由 `(context.block_period, context.tick_position)` 无状态直接算出，不依赖跨拍相位累加器。因此空闲期间跳过 `process_tick()` 不会产生任何相位偏移，数据恢复时首拍即无缝衔接。
+
+---
+
+### 4.4 `Matrix` 空块与零增益早退（`plugins/matrix.cpp`）
+
+在 `Matrix::process()` 中补齐两处极简逻辑：
+
+```cpp
+void Matrix::process(const ProcessContext &context) noexcept
+{
+    const auto &output_block = context.outputs[0];
+    const auto output = output_block.f32p_view();
+    const auto frames = output.frames();
+    if (frames == 0)
+        return;
+
+    const auto target = target_.load(std::memory_order_acquire);
+    if (!context.has_input(0))
+    {
+        output.clear();
+        gain_ = target;
+        return;
+    }
+
+    const bool steady = gain_ == target;
+    if (steady && target == 0)
+    {
+        output.clear();
+        context.set_output_active(0, false);
+        return;
+    }
+    ...
+```
+
+* **无输入早退**：跳过全部声道矩阵乘加和斜坡计算，同时将 `gain_` 同步到 `target`。这样在静音期间修改目标增益，待音频恢复时直接按新增益生效，不会出现意外的瞬态斜坡。
+* **稳态零增益关断**：增益已平滑淡出并稳定在 `0.0f` 时，主动将 `output_active` 设为 `0`（淡出过渡拍仍保持 `1`，确保淡出尾音完整传播），下游混音器或未来的 `PriorityMixer` 可立即感知支路已关断。
+
+---
+
+### 4.5 `Mixer` 跳过空闲支路与汇聚传播（`plugins/mixer.cpp`）
+
+```cpp
+void Mixer::process(const ProcessContext &context) noexcept
+{
+    const auto output = context.outputs[0].f32p_view();
+    const auto frames = output.frames();
+    if (frames == 0)
+        return;
+
+    output.clear();
+    bool active = false;
+    for (std::size_t i = 0; i < inputs_.size(); ++i)
+    {
+        if (muted_[i].load(std::memory_order_acquire) || !context.has_input(i))
+            continue;
+        active = true;
+        const auto input = context.inputs[i].f32p_view();
+        for (std::size_t ch = 0; ch < output.channels(); ++ch)
+        {
+            auto *dst = output.channel(ch);
+            const auto *src = input.channel(ch);
+            for (std::size_t frame = 0; frame < frames; ++frame)
+                dst[frame] += src[frame];
+        }
+    }
+    context.set_output_active(0, active);
+}
+```
+
+* 当混音器挂接了 8--16 路待机槽位（例如路线 A 动态网络/剪辑总线）而仅 1--2 路活跃时，其余空槽在外层循环直接跳过，彻底消除无效内存读取与浮点加法。
+
+---
+
+### 4.6 对未来插件的承接与规范
+
+1. **`PriorityMixer`（优先级自动闪避）**：
+   * 默认直接消费 `context.has_input(i)` + `hold_ms` 判定各路输入是否活跃：用户推流/播文件期间自动压低低优先级（含全零静音段，绝不误恢复），停推或 WAV EOF 排空过 `hold_ms` 后自动平滑恢复，彻底免除手动状态切换。
+2. **未来有状态 DSP 插件（IIR 滤波、混响、LMS 滤波等）**：
+   * 遵循与 `Convert` 相同的三态早退模式：在输入变空后等待尾音能量衰减至噪声底以下（或固定冲刷拍数）时，将内部递归状态清零并放行 `output_active = 0`，既节省空闲 CPU，又彻底杜绝次正规浮点数（如 $10^{-39}$ 级状态）引发的 CPU 飙升。
+
+---
+
+## 5. 逐文件改动清单与分阶段实施顺序
+
+| 阶段 | 涉及文件 | 具体改动 |
+| --- | --- | --- |
+| **阶段 1：核心传播骨架** | `core/types.h`、`core/engine.cpp` | 1. `ProcessContext` 增加 `input_active`、`output_active`、`has_input()`、`set_output_active()`；<br>2. `Plan` 增加 3 个预分配扁平数组，`bind_blocks()` 绑定 `input_sources`，`Plan::render()` 实现自动接力与默认传播 |
+| **阶段 2：插件标识与早退** | `plugins/endpoint.cpp`、`plugins/convert.h/.cpp`、`plugins/matrix.cpp`、`plugins/mixer.cpp` | 1. `Capture::process()` 按 `frames != 0` 写入活跃位；<br>2. `Convert` 实现 `tail_remaining_` 三态早退并在 `prepare()`/`reset()` 复位；<br>3. `Matrix` 补无输入早退与稳态零增益置 `0`；<br>4. `Mixer` 跳过空闲输入并汇聚写输出活跃位 |
+| **阶段 3：测试与文档同步** | `tests/`（核心、DSP、路由、回归用例）、`AudioEngine_Outline.md` | 1. 新增活跃位传播、拖尾冲刷、比特级等价与 `Playback` 连续性专项测试；<br>2. 确认 Debug & Release 全量 CTest（含 `regression` 零堆分配检查）全绿；<br>3. 在 `AudioEngine_Outline.md` 第 3 节补充 `ProcessContext` 活跃位契约说明 |
+
+---
+
+## 6. 验收测试矩阵
+
+| 测试项 | 场景与断言要点 |
 | --- | --- |
-| `AudioEngine_Outline.md` | 更新第 7 节“运行态诊断”：删去 `●、◐、○`、条形刻度和 `!` 的旧描述，改为文字状态徽章、端口插槽与静音连线说明。 |
-| `tests/`（`io.endpoint_diagnostics`） | 补充验证：后端 `stop()` 后 `Capture::steady()` 与 `Playback::steady()` 归回 `false`；同时确认同步播放停机排空（`WavPlayback` / `UsrPlayback`）回归无破坏。 |
-| `tests/`（`io.diagnostic_reports`） | 更新 DOT 断言：校验 HTML 卡片与文字状态（`RUNNING`/`ONLINE`/`OFFLINE`/`ERR: ...`）、`Mixer` 端口插槽与静音虚线、`Convert` 同变采样率与格式输出、`Matrix` 声道映射与增益、`DIRTY` 徽章以及 `Detached` 分组。 |
-
----
-
-## 6. 验收清单
-
-1. **视觉与语法正确性**：将测试生成的 DOT 输出经 `dot -Tsvg` 渲染，零语法告警；图内无豆腐块/错位 Unicode 符号，节点层次、端口对接、静音支路、错误高亮与孤立后端一眼可辨。
-2. **信息完备性**：
-   * `Convert(48k F32P -> 16k S16LE)` 同时完整展示采样率与格式变化。
-   * `Mixer` 静音输入在卡片槽位与对应入边上均有清晰灰显标记。
-   * 后端报错卡片直接显示具体短错误码（如 `ERR: DeviceLost` / `ERR: EndOfStream`），而非单个 `!`。
-3. **转义安全性**：自定义节点 `type_name()` 返回含 `<`、`>`、`&`、`"` 的字符串时，生成的 DOT 仍为合法语法。
-4. **生命周期与并发回归**：`Capture::close()` / `Playback::close()` 复位 `primed_` 后，`steady()` 语义自洽，且同步播放排空（含队列剩余帧小于 50% 水位时）全部通过；Debug 与 Release 全量 CTest（含 `regression` 零堆分配检查）全绿。
-===== AudioEngine_Backend_Plan.md =====
-# 设备后端实施说明
-
-## 层次与设备类型
-
-`core/` 提供块视图、PCM 编解码、重采样器和 SPSC 帧环。`plugins/` 的 Capture 与 Playback 负责图侧 F32P 队列。`Backend` 统一管理端点占用、PCM 转换和平面工作区，并提供多态启停与状态查询。`PassiveBackend` 由调用方驱动，`ActiveBackend` 管理工作线程、设备字节缓冲和异步漂移控制。`aereborn::backend` 依赖 `aereborn::plugins` 和 `aereborn::core`。
-
-`AlsaBackend`、`WasapiBackend` 和 `NullBackend` 根据 `bind(Capture&)` 或 `bind(Playback&)` 选择运行方向。`WavCapture` 和 `WavPlayback` 只接受各自方向。Null 与 WAV 跟随引擎时钟，ALSA 与 WASAPI 服务有独立时钟的设备。测试后端通过真实的绑定和启停流程运行，在测试桩内控制设备批次的就绪时机。
-
-`PushSource` 和 `PullSink` 继承 `PassiveBackend`，分别绑定 `Capture` 和 `Playback`。`UsrPlayback` 继承 `ActiveBackend`，在工作线程交付图侧输出。设备的绑定入口位于 `ActiveBackend`，调用方可用 `Backend&` 统一启停和查询状态。
-
-## 绑定和启停
-
-- 先准备图端点，再在控制侧调用 `bind()`。同一端点只接受一个外部驱动。`Backend` 预占端点，准备完毕后才发布绑定。`bind()` 通过 `aereborn::Error` 报告预期失败。工作线程驱动打开或准备失败时先清空已协商状态，再由 `on_close()` 清理设备资源，最后释放端点占用。标准库分配异常直接传播。
-- `ActiveBackend::start()` 先回收已退出的工作线程，再启动新线程并等待 `on_start()` 的结果。初始化成功后上线端点。初始化失败时回收线程，再以 `Error` 报告设备错误。线程创建异常直接传播，绑定可用于重试。
-- `on_open()` 在控制线程接收逻辑端口的 `PortSpec` 和 I/O 周期，通过 `Result<PortSpec>` 返回协商后的 PCM 规格或设备错误。驱动通过 `set_device_max_frames()` 将批次上限写入工作区，应用可用 `device_max_frames()` 查询。资源准备异常可以传播。工作线程的启动、读取、等待可写和写入钩子使用 `noexcept`，通过 `RetCode` 或 `Result<std::size_t>` 报告故障。应用通过 `last_error()` 读取运行期终止原因。
-- `ActiveBackend::stop()` 取消 I/O 或排空同步播放队列，再等待线程退出。`on_cancel()` 由控制侧触发。`on_start()` 成功后，`on_stop()` 在同一 I/O 线程执行。正常退出、设备故障和主动取消共用线程收尾流程。
-- `stop()` 保留绑定和工作区以便重启。`unbind()` 停机后关闭资源并释放端点。后端必须在端点销毁前解绑，具体驱动的析构函数先调用 `unbind()`。
-
-异步播放、同步播放和同步排空分别控制读取时机，共用重采样、PCM 编码和写入逻辑。异步播放不足一个设备批次时补静音，升采样有时可仅凭 FIR 历史输出。ASRC 根据队列水位调整采样速率，在后端离线时复位。
-
-同步播放停止时关闭图侧写入，写完队列和 FIR 尾部。同步采集遇到 EOF 后冲刷 FIR，让图消费剩余帧，主动停止可取消排空。
-
-## PushSource
-
-构造时指定固定的交错 PCM `PortSpec`，声道数须与 `Capture` 一致。绑定失败时释放端点占用及准备中的工作区。内部切片时长取端点 I/O 周期与 10 ms 的较小值。推入的数据直接解码为 F32P，采样率不同时经过固定比率的 FIR 重采样，再写入图侧队列。推流路径使用绑定时准备的缓冲，输入 PCM 直接从调用方缓冲读取。
-
-`start()` 在调用线程开放图侧读取，无需启动预填充。`stop()` 等待在途队列读取结束，丢弃未消费的帧并复位重采样器。FIR 尾音随复位丢弃。绑定和工作区保留到 `unbind()`，可以直接重启。
-
-`push(IBBlock)` 返回实际接收的输入帧数，短写后从该帧偏移继续推送。有效输入在后端未运行或帧数为零时返回 `0`。启用 FIR 时，每个切片按输出帧数上界预留空间，因此队列尚有空位时也可能返回 `0`。图侧缺帧时补静音，输入间隔不触发 I/O 超时。
-
-同一实例的操作、状态查询和析构由调用方串行执行，例如使用单消费者指令队列。调用方按顺序投递同一流的分片，切换流时先停止接收旧流数据。`IBBlock` 借用的 PCM 缓冲至少保留到对应的 `push()` 返回。
-
-多路输入各自绑定独立 `Capture`，然后连接到 `Mixer` 的不同输入。单声道 `Capture` 接入立体声混音时，可用 `engine.emplace_node<Matrix>(rate, 1, 2, std::initializer_list<float>{1.0f, 1.0f})` 将同一声道送到左右两侧。
-
-## PullSink
-
-`PullSink` 绑定 `Playback`。调用方提供固定规格的交错 PCM 可写缓冲，`pull(OBBlock)` 返回实际写入的输出帧数，未写入的区间保留原样。拉取立即返回可用帧，无需等待图补数据或由后端填静音。跨采样率时按当前 FIR 相位从队列取数据，后续拉取接着上次相位处理。调用方串行执行拉取、查询和生命周期操作。停机时丢弃未拉取的帧并复位重采样器，绑定保留到 `unbind()`。
-
-## UsrPlayback
-
-`UsrPlayback` 绑定 `Playback`，在独立工作线程按固定批次交付交错 PCM。正常批次向下取整为 `采样率 × io_period` 的整帧数。若应用用分数秒配置周期，在创建 `Playback` 时一次性向上取整为微秒，例如 `1/30 s` 转为 `33334 µs`，对应 44.1 kHz 每批 1470 帧、48 kHz 每批 1600 帧。回调由队列就绪驱动，与图 tick 独立。44.1 kHz 下图每 5 ms 交替写入 221、220 帧；端点周期为 5 ms 时回调每批取 220 帧，其余帧留在队列。
-
-回调借用的 `IBBlock` 只在当次调用内有效。回调需返回且不得抛异常，启停和解绑由控制侧串行执行。`stop()` 关闭图侧写入，排空已入队的音频和 FIR 尾部后回收工作线程，排空期间可能交付短包。慢回调可能填满自己的队列并丢弃无法入队的新帧，也会延长停机。其他分支各自消费独立队列。
-
-## Null 和 WAV
-
-`NullBackend` 在构造时校验交错 PCM 格式，非法格式报 `InvalidArg`。`WavPlayback` 同样在构造时校验，只接受 S16LE、S24_3LE、S32LE 和 F32LE，非法格式报 `FormatMismatch`。
-
-WAV 文件读写集中在 `WavFile`。读写和定位以帧为单位，读取兼容 RIFF 的附加块及奇数字节填充。16 位、24 位、32 位整数 PCM 和 32 位浮点保留样本字节，8 位无符号 PCM 和 64 位浮点以 F32LE 交付。
-
-WAV 写入使用标准 I/O 缓冲。播放停止时在排空后将缓冲提交给操作系统，可通过 `last_error()` 查询刷新失败。分卷和解绑时关闭当前文件，回填 RIFF、数据和帧数信息，并保留已经发生的写入错误。
-
-WAV 采集可读一遍、无限循环，或通过 `WavCapture::Repeat` 指定额外读取次数。重启从文件游标续读，重新绑定从头开始。WAV 播放写入单个文件，或按显式指定的分卷时长切分录音。分卷采用从 1 开始的编号，如 `recording-0000000001.wav`，并跳过已有编号。
-
-## 异步超时
-
-异步设备从最近一次非空设备批次算起，使用 `max(500 ms, 10 × io_period())` 的无进展期限。毫秒等待向上取整并限制在平台等待参数可表达的范围。ALSA `poll()` 和 WASAPI `WaitForMultipleObjects()` 使用剩余期限，播放的就绪等待与分段写入共享同一截止时间。主动停止通过独立信号唤醒等待。只有实际的 I/O 进展才刷新期限。
-
-## ALSA
-
-- 空名称和 `default` 使用系统默认 PCM。裸声卡名和设备号构成 `hw:CARD=<card>,DEV=<device>`。完整 ALSA PCM 名称可直接传入，例如 `hw:0,0`、`hw:0` 或 `plug:null`。
-- 构造参数 `use_mmap` 为 `true` 时优先协商交错 MMAP，规格不匹配时重新协商普通交错读写。设为 `false` 时直接使用普通交错读写。
-- 优先协商两周期硬件缓冲，必要时按两倍周期帧数协商缓冲大小。报告给上层的设备批次受端点预算限制。播放起播和就绪使用实际批次帧数。
-- 播放启用 ALSA 的静音预填，停止阈值沿用默认值以保留 XRUN 检测。XRUN 重新准备 PCM。系统挂起时尝试恢复，重试间隔由取消事件和同一 I/O 截止时间约束。
-- 设备断开返回 `DeviceLost`，无进展返回 `Timeout`，主动取消返回 `Cancelled`。虚拟设备可用于验证 I/O 和故障注入，物理时延和拔插表现需实机验证。
-
-## WASAPI
-
-WASAPI 在绑定时校验显式 Endpoint ID 的方向，并使用设备原生混音格式。COM 流和服务在同一个 I/O 线程上创建和释放。采集取得零帧时直接等待下一次就绪事件，按 API 约定，零长度包可以省略 `ReleaseBuffer(0)`。播放在启动前填满一包静音，运行时整包静音沿用 WASAPI 静音标志，部分欠载时补齐尾部。控制侧可在工作线程停下后用 `last_failure()` 查询失败操作和原始 HRESULT。 [采集缓冲契约](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudiocaptureclient-getbuffer) · [播放启动契约](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-start)
-
-Windows 构建包含 WASAPI，SDK 目标要求 `_WIN32_WINNT >= 0x0600`。Linux 在找到 ALSA 开发库时包含 ALSA。
-
+| **1. 核心传播与默认透传** | ① 未连接端口、被 `set_paused(true)` 排除的上游端口到达下游时 `has_input() == false`；<br>② 源节点（`Tone`）默认输出 `1`，不改代码的自定义透传 `NodeT<1, 1>` 自动把上游 `0`/`1` 传给下游；<br>③ 既有直接构造 4 字段 `ProcessContext` 的单测编译与行为完全无回归 |
+| **2. `Capture` 真静音 vs. 无数据区分** | ① `Capture` 离线、预填充中、队列读空时 `output_active == 0`；<br>② 经 `PushSource` 推入全 `0.0f` PCM 包时，消费该包的 tick `output_active == 1`，队列播空后的下一拍立刻变为 `0`；<br>③ `WavCapture` 播放期间持续为 `1`，EOF 排空下线后自动变为 `0` |
+| **3. `Convert` 拖尾冲刷与比特级等价** | ① 48 kHz $\to$ 16 kHz（与 16 kHz $\to$ 48 kHz）链路，喂入脉冲/正弦信号后令输入变 `0`：验证拖尾冲刷期间（累计输入零帧达到 96 前）`output_active` 保持 `1` 且输出非零尾音；冲刷结束后立刻切为 `0` 且输出全零；<br>② 对比“开启早退”与“持续喂零强制全算”的输出序列，逐样本比特级一致；<br>③ 早退若干拍后恢复信号输入，验证输出相位与连续参考信号严丝合缝，无跳变或历史残留 |
+| **4. `Matrix` 与 `Mixer` 早退传播** | ① `Matrix` 输入为空时跳过处理并同步 `gain_ = target`；`set_gain(0.0f)` 淡出拍保持 `1`，下一稳态零增益拍输出 `0`；<br>② `Mixer` 两路输入（一路活跃一路空）：静音活跃路后输出立刻变 `0`，取消静音变回 `1` |
+| **5. `Playback` 连续性回归** | 上游全为空块（`active == 0`）时，绑定 `WavPlayback` 持续录制若干 tick，验证落盘帧数与时间线完全连续、未少写帧 |
+| **6. 零堆分配与回归验收** | Debug & Release 全量 CTest 通过，特别是 `regression.render_and_passive_io_without_heap` 确认新增 3 个扁平数组与早退路径在运行期零堆分配 |
 ===== AudioEngine_Outline.md =====
 # AEReborn：音频引擎框架草案
 
@@ -443,7 +432,11 @@ Engine 持有编辑图和渲染计划。`commit()` 按依赖排序，从无输�
 
 `ProcessContext` 提供 `block_period`、`tick_position`、`inputs` 和 `outputs`。`IBBlock` 和 `OBBlock` 分别是只读和可写的 `ByteBlock`，携带缓冲地址、端口规格和本周期实际帧数。`byte_view()` 按原格式借用字节，适用于所有格式。`f32p_view()` 用于 F32P 端口，返回 `FloatBlock` 的只读或可写形式 `IFBlock` / `OFBlock`，声道步长为本周期的实际帧数。`FloatBlock` 也可借用插件工作区的分声道浮点样本，此时声道步长可以大于实际帧数。端口提供的视图只在 `process()` 调用内有效，节点必须写满自己的输出。
 
-渲染计划用两个连续数组保存已绑定的输入、输出视图，每个节点按端口范围访问。包含分数帧端口的计划在每个 tick 更新实际帧数，全整数帧计划使用预先绑定的帧数。缓冲和节点引用由计划统一持有。
+`ProcessContext::has_input(port)` 返回该输入在本周期是否需要作为活跃块处理。非活跃块保证以零字节填满，未连接输入和来自暂停节点的输入均为非活跃。源交付的全零样本和 DSP 尾音可以是活跃块。每个周期开始时，引擎将所有输出预设为活跃，因为节点可能在输入为空时继续产生音频。能保证某个输出已填满零字节的节点，可调用 `set_output_active(port, false)` 让下游跳过样本计算。标志视图同样只在本次调用内有效。直接用四个字段构造 `ProcessContext` 时，`has_input()` 返回 true，设置输出标志无效果。
+
+Capture 读到至少一帧即标为活跃，短读补零。队列读空表示当前周期缺数据，网络欠载和正常结束都可能出现这一情况。Convert 在 FIR 历史冲刷完毕后才将空输入标为非活跃。Matrix 在淡出之后的稳态零增益块上标记非活跃。Mixer 只累加活跃且未静音的输入。Playback 继续逐拍入队，包括非活跃的静音块，以保持录音和设备输出的时间线。
+
+渲染计划用连续数组保存端口视图、活动标志和各输入对应的上游输出下标。引擎按拓扑顺序读取上游输出标志，每个节点只访问自身端口范围。包含分数帧端口的计划在每个 tick 更新实际帧数，全整数帧计划使用预先绑定的帧数。缓冲和节点引用由计划统一持有。
 
 控制侧 `commit()` 完成分配和节点准备。运行时，时钟线程在块边界从原子槽接管计划，控制侧等待接管后同步释放旧计划及仅由旧计划持有的节点。沿用的节点实例保留 DSP 状态。
 
@@ -1042,12 +1035,12 @@ struct PoolLayout
     }
 };
 
-template <class Block>
-View<const Block> port_range(const std::vector<Block> &blocks, std::size_t first, std::size_t count) noexcept
+template <class T>
+View<T> port_range(T *data, std::size_t first, std::size_t count) noexcept
 {
     if (count == 0)
         return {};
-    return {blocks.data() + first, count};
+    return {data + first, count};
 }
 struct NodeEntry
 {
@@ -1485,9 +1478,18 @@ class Engine::Runner
                     refresh_frames(output);
             }
 
+            // Leave slot zero inactive for all inputs without a source.
+            std::fill(output_active.begin() + 1, output_active.end(), std::uint8_t{1});
             for (const auto &step : steps)
-                step.node->process({period, tick, port_range(inputs, step.first_input, step.input_count),
-                                    port_range(outputs, step.first_output, step.output_count)});
+            {
+                for (std::size_t i = step.first_input; i < step.first_input + step.input_count; ++i)
+                    input_active[i] = output_active[input_sources[i]];
+
+                step.node->process({period, tick, port_range(inputs.data(), step.first_input, step.input_count),
+                                    port_range(outputs.data(), step.first_output, step.output_count),
+                                    port_range(input_active.data(), step.first_input, step.input_count),
+                                    port_range(output_active.data() + 1, step.first_output, step.output_count)});
+            }
         }
 
         bool has_fractional_ports = false;
@@ -1496,6 +1498,9 @@ class Engine::Runner
         std::vector<std::uint8_t> byte_pool;
         std::vector<IBBlock> inputs;
         std::vector<OBBlock> outputs;
+        std::vector<std::uint8_t> input_active;
+        std::vector<std::uint8_t> output_active; // Slot zero is shared by inputs without a source.
+        std::vector<std::size_t> input_sources;
         std::vector<Step> steps;
         std::vector<std::shared_ptr<NodeEntry>> owners;
         std::vector<NodeId> node_ids;
@@ -1516,13 +1521,15 @@ class Engine::Runner
         };
         if (topology.nodes.size() > plan.steps.max_size())
             throw Error(ErrorCode::TooLarge);
+        const auto max_inputs = std::min({plan.inputs.max_size(), plan.input_active.max_size(),
+                                          plan.input_sources.max_size()});
+        const auto max_outputs = std::min(plan.outputs.max_size(), plan.output_active.max_size() - 1);
         plan.steps.reserve(topology.nodes.size());
         for (const auto &entry : topology.nodes)
         {
             const auto inputs = entry->inputs;
             const auto outputs = entry->outputs;
-            if (inputs.size() > plan.inputs.max_size() - layout.input_count ||
-                outputs.size() > plan.outputs.max_size() - layout.output_count)
+            if (inputs.size() > max_inputs - layout.input_count || outputs.size() > max_outputs - layout.output_count)
                 throw Error(ErrorCode::TooLarge);
             plan.steps.push_back(
                 {entry->node.get(), layout.input_count, inputs.size(), layout.output_count, outputs.size()});
@@ -1555,6 +1562,9 @@ class Engine::Runner
     {
         plan.inputs.resize(layout.input_count);
         plan.outputs.resize(layout.output_count);
+        plan.input_active.resize(layout.input_count);
+        plan.output_active.resize(layout.output_count + 1);
+        plan.input_sources.resize(layout.input_count);
         plan.float_pool.resize(layout.floats.silence + layout.floats.outputs);
         plan.byte_pool.resize(layout.bytes.silence + layout.bytes.outputs);
         layout.floats.offset = layout.floats.silence;
@@ -1577,7 +1587,11 @@ class Engine::Runner
                 const auto input_index = step.first_input + port;
                 const auto link = topology.links[input_index];
                 if (link.node_index != Link::unconnected)
-                    plan.inputs[input_index] = plan.outputs[plan.steps[link.node_index].first_output + link.port_index];
+                {
+                    const auto source = plan.steps[link.node_index].first_output + link.port_index;
+                    plan.inputs[input_index] = plan.outputs[source];
+                    plan.input_sources[input_index] = source + 1;
+                }
                 else
                 {
                     const auto spec = entry.inputs[port];
@@ -2107,8 +2121,9 @@ class Node
     virtual void prepare(BlockPeriod /*period*/) {}
 
     /// @brief Process one block and write every output sample in its declared format.
-    /// @param context Current period, tick position, and input and output block views.
+    /// @param context Current period, tick position, port blocks, and per-port activity flags.
     /// @pre Preparation has succeeded.
+    /// @note Outputs default to active. Mark an output inactive only when its block is filled with zero bytes.
     /// @note The context and its views are valid only during this call. Keep processing
     /// free of heap allocation and deallocation, blocking I/O, and logging.
     /// Avoid lock waits where possible.
@@ -2397,16 +2412,31 @@ void calc_coffs(const float *kernel, std::size_t phase_index, float phase_frac, 
 float interpolate(const float *history, const float *input, std::size_t history_taps,
                   const Coefficients &coffs) noexcept
 {
-    double sum = 0;
-    for (std::size_t i = 0; i < history_taps; ++i)
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    std::size_t i = 0;
+    for (; i + 4 <= history_taps; i += 4)
     {
-        sum += history[i] * coffs[i];
+        sum0 += history[i] * coffs[i];
+        sum1 += history[i + 1] * coffs[i + 1];
+        sum2 += history[i + 2] * coffs[i + 2];
+        sum3 += history[i + 3] * coffs[i + 3];
     }
-    for (std::size_t i = history_taps; i < taps; ++i)
+    for (; i < history_taps; ++i)
+        sum0 += history[i] * coffs[i];
+
+    const auto input_taps = taps - history_taps;
+    const auto *input_coffs = coffs.data() + history_taps;
+    i = 0;
+    for (; i + 4 <= input_taps; i += 4)
     {
-        sum += input[i - history_taps] * coffs[i];
+        sum0 += input[i] * input_coffs[i];
+        sum1 += input[i + 1] * input_coffs[i + 1];
+        sum2 += input[i + 2] * input_coffs[i + 2];
+        sum3 += input[i + 3] * input_coffs[i + 3];
     }
-    return static_cast<float>(sum);
+    for (; i < input_taps; ++i)
+        sum0 += input[i] * input_coffs[i];
+    return (sum0 + sum1) + (sum2 + sum3);
 }
 
 void prepare_filter(Buffer &history, std::vector<float> &kernel, std::size_t channels, double cutoff)
@@ -2431,15 +2461,15 @@ void prepare_filter(Buffer &history, std::vector<float> &kernel, std::size_t cha
 void filter_frame(OFBlock past, const std::vector<float> &kernel, IFBlock input, OFBlock output, std::size_t out_frame,
                   std::size_t through, std::size_t phase_index, float phase_fraction) noexcept
 {
-    const auto history_offset = std::min(through, taps);
-    const auto input_offset = through - history_offset;
+    const auto input_taps = std::min(through, taps);
+    const auto input_offset = through - input_taps;
     Coefficients coffs;
     calc_coffs(kernel.data(), phase_index, phase_fraction, coffs);
     for (std::size_t ch = 0; ch < output.channels(); ++ch)
     {
+        const auto *history = past.channel(ch) + input_taps;
         const auto *samples = through ? input.channel(ch) + input_offset : nullptr;
-        output.channel(ch)[out_frame] =
-            interpolate(past.channel(ch) + history_offset, samples, taps - history_offset, coffs);
+        output.channel(ch)[out_frame] = interpolate(history, samples, taps - input_taps, coffs);
     }
 }
 
@@ -2498,8 +2528,7 @@ double nominal_step(SampleRate src_fs, SampleRate dst_fs) noexcept
     return static_cast<double>(static_cast<std::uint32_t>(src_fs)) / static_cast<std::uint32_t>(dst_fs);
 }
 
-std::size_t workspace_bound(SampleRate src_fs, SampleRate dst_fs, std::size_t frames, double offset,
-                            bool bound_input)
+std::size_t workspace_bound(SampleRate src_fs, SampleRate dst_fs, std::size_t frames, double offset, bool bound_input)
 {
     if (!is_sample_rate(src_fs) || !is_sample_rate(dst_fs) || !valid_offset(offset))
         throw Error(ErrorCode::InvalidArg);
@@ -2674,14 +2703,12 @@ SincResampler::Transfer SincResampler::run(IFBlock input, OFBlock output, Positi
     return result;
 }
 
-std::size_t SincResampler::max_output_frames(SampleRate src_fs, SampleRate dst_fs, std::size_t frames,
-                                             double offset)
+std::size_t SincResampler::max_output_frames(SampleRate src_fs, SampleRate dst_fs, std::size_t frames, double offset)
 {
     return workspace_bound(src_fs, dst_fs, frames, offset, false);
 }
 
-std::size_t SincResampler::max_input_frames(SampleRate src_fs, SampleRate dst_fs, std::size_t frames,
-                                            double offset)
+std::size_t SincResampler::max_input_frames(SampleRate src_fs, SampleRate dst_fs, std::size_t frames, double offset)
 {
     return workspace_bound(src_fs, dst_fs, frames, offset, true);
 }
@@ -3341,14 +3368,34 @@ struct Connection
     IPort to;
 };
 
-/// @brief Timing and port blocks passed to a node for one process call.
-/// @note The port block views and their buffers are borrowed for the duration of that call.
+/// @brief Timing, port blocks, and activity flags passed to a node for one process call.
+/// @note All views and their backing storage are borrowed for the duration of that call.
+/// @note Each supplied activity view has one flag per corresponding port.
 struct ProcessContext
 {
-    BlockPeriod block_period;       ///< Duration of the current engine tick.
-    std::uint64_t tick_position;    ///< Zero-based position of the current tick.
-    View<const IBBlock> inputs;  ///< Read-only input blocks in port index order.
-    View<const OBBlock> outputs; ///< Output blocks with writable samples in port index order.
+    BlockPeriod block_period;                ///< Duration of the current engine tick.
+    std::uint64_t tick_position;             ///< Zero-based position of the current tick.
+    View<const IBBlock> inputs;              ///< Read-only input blocks in port index order.
+    View<const OBBlock> outputs;             ///< Output blocks with writable samples in port index order.
+    View<const std::uint8_t> input_active{}; ///< Per-input flags. Zero guarantees a zero-filled block.
+    View<std::uint8_t> output_active{};      ///< Per-output flags, initially active in the graph.
+
+    /// @brief Check whether the input block should be processed as active.
+    /// @pre index is a valid input port index.
+    /// @note Returns true when a standalone caller omits the activity view.
+    bool has_input(std::size_t index) const noexcept
+    {
+        return input_active.empty() || input_active[index] != 0;
+    }
+
+    /// @brief Set the output block's activity flag.
+    /// @pre index is a valid output port index.
+    /// @note An inactive output must be filled with zero bytes. With no activity view, this is a no-op.
+    void set_output_active(std::size_t index, bool active) const noexcept
+    {
+        if (!output_active.empty())
+            output_active[index] = active ? 1 : 0;
+    }
 };
 
 } // namespace aereborn
@@ -3363,6 +3410,7 @@ struct ProcessContext
 ===== plugins/convert.cpp =====
 #include "convert.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace aereborn
@@ -3395,12 +3443,24 @@ void Convert::prepare(BlockPeriod period)
     }
     decoded_ = std::move(decoded);
     resampled_ = std::move(resampled);
+    tail_remaining_ = 0;
 }
 
 void Convert::process(const ProcessContext &context) noexcept
 {
     const auto input = context.inputs[0];
     const auto output = context.outputs[0];
+    const bool active = context.has_input(0);
+    if (!active && tail_remaining_ == 0)
+    {
+        context.set_output_active(0, false);
+        const auto bytes = output.byte_view();
+        if (!bytes.empty())
+            std::memset(bytes.data(), 0, bytes.size());
+        return;
+    }
+    context.set_output_active(0, true);
+
     if (same_spec_)
     {
         // The byte copy preserves float bit patterns and PCM padding.
@@ -3425,6 +3485,9 @@ void Convert::process(const ProcessContext &context) noexcept
 
     if (fir)
     {
+        // The block that finishes the flush may still contain tail samples.
+        tail_remaining_ =
+            active ? resampler_.tail_frames() : tail_remaining_ - std::min(tail_remaining_, input.frames());
         const auto dest = out_pcm ? resampled_.block(output.frames()) : output.f32p_view();
         resampler_.process_tick(source, dest, context.block_period, context.tick_position);
         source = dest;
@@ -3436,6 +3499,7 @@ void Convert::process(const ProcessContext &context) noexcept
 void Convert::reset() noexcept
 {
     resampler_.reset();
+    tail_remaining_ = 0;
 }
 
 } // namespace aereborn
@@ -3480,6 +3544,7 @@ class Convert final : public NodeT<1, 1>
 
   private:
     bool same_spec_ = false;
+    std::size_t tail_remaining_ = 0; ///< Zero input frames still needed to clear FIR history.
     SincResampler resampler_;
     Buffer decoded_;   ///< Allocated only when input is PCM and (resampler_.needs_fir() || output is different PCM).
     Buffer resampled_; ///< Allocated only when resampler_.needs_fir() && output is PCM.
@@ -3594,6 +3659,7 @@ void Capture::process(const ProcessContext &context) noexcept
         graph_state_.fetch_and(~graph_active, std::memory_order_release);
     }
     output.subblock(frames, output.frames() - frames).clear();
+    context.set_output_active(0, frames != 0);
 }
 
 bool Capture::online() const noexcept
@@ -3970,9 +4036,12 @@ void Matrix::process(const ProcessContext &context) noexcept
         return;
     const auto target = target_.load(std::memory_order_acquire);
     const bool steady = gain_ == target;
-    if (steady && target == 0)
+    const bool active = context.has_input(0) && !(steady && target == 0.0f);
+    context.set_output_active(0, active);
+    if (!active)
     {
         output.clear();
+        gain_ = target;
         return;
     }
     const auto &input_block = context.inputs[0];
@@ -4143,10 +4212,12 @@ void Mixer::process(const ProcessContext &context) noexcept
     if (frames == 0)
         return;
     output.clear();
+    bool active = false;
     for (std::size_t i = 0; i < inputs_.size(); ++i)
     {
-        if (muted_[i].load(std::memory_order_acquire))
+        if (muted_[i].load(std::memory_order_acquire) || !context.has_input(i))
             continue;
+        active = true;
         const auto input = context.inputs[i].f32p_view();
         for (std::size_t ch = 0; ch < output.channels(); ++ch)
         {
@@ -4156,6 +4227,7 @@ void Mixer::process(const ProcessContext &context) noexcept
                 dst[frame] += src[frame];
         }
     }
+    context.set_output_active(0, active);
 }
 } // namespace aereborn
 
@@ -7269,750 +7341,6 @@ class WavFile
     std::size_t position_ = 0;
     std::size_t write_limit_ = 0;
 };
-
-} // namespace aereborn
-
-#endif
-
-===== diag/inspect.cpp =====
-#include "inspect.h"
-
-#include "backend/wasapi_backend.h"
-#include "plugins/convert.h"
-#include "plugins/matrix.h"
-#include "plugins/mixer.h"
-#include <algorithm>
-#include <iomanip>
-#include <locale>
-#include <map>
-#include <set>
-#include <sstream>
-
-namespace aereborn
-{
-namespace
-{
-const char *state_name(Engine::State state)
-{
-    switch (state)
-    {
-    case Engine::State::Unprepared: return "Unprepared";
-    case Engine::State::Ready: return "Ready";
-    case Engine::State::Running: return "Running";
-    }
-    return "?";
-}
-
-const char *state_name(ActiveBackend::State state)
-{
-    switch (state)
-    {
-    case ActiveBackend::State::Stopped: return "Stopped";
-    case ActiveBackend::State::Running: return "Running";
-    case ActiveBackend::State::Draining: return "Draining";
-    case ActiveBackend::State::Stopping: return "Stopping";
-    }
-    return "?";
-}
-
-const char *format_name(SampleFormat format)
-{
-    switch (format)
-    {
-    case SampleFormat::F32P: return "F32P";
-    case SampleFormat::S16LE: return "S16LE";
-    case SampleFormat::S24_3LE: return "S24_3LE";
-    case SampleFormat::S24LE: return "S24LE";
-    case SampleFormat::S32LE: return "S32LE";
-    case SampleFormat::F32LE: return "F32LE";
-    }
-    return "?";
-}
-
-void write_spec(std::ostream &out, PortSpec spec)
-{
-    if (spec.channels)
-        out << static_cast<std::uint32_t>(spec.sample_rate) << '/' << spec.channels << "ch/" << format_name(spec.format);
-    else
-        out << '-';
-}
-
-void write_ports(std::ostream &out, const char *name, View<const PortSpec> ports)
-{
-    for (std::size_t first = 0; first < ports.size();)
-    {
-        auto last = first;
-        while (last + 1 < ports.size() && ports[last + 1] == ports[first])
-            ++last;
-        out << ' ' << name << first;
-        if (last != first)
-            out << ".." << last;
-        out << '=';
-        write_spec(out, ports[first]);
-        first = last + 1;
-    }
-}
-
-template <class Endpoint> void write_queue(std::ostream &out, const Endpoint &endpoint)
-{
-    const auto online = endpoint.online();
-    out << "bound=" << endpoint.bound() << " online=" << online << " steady=" << (online && endpoint.steady())
-        << " fill=";
-    std::size_t frames = 0;
-    if (endpoint.estimate_queued_frames(frames))
-        out << frames;
-    else
-        out << "\xE2\x80\x94"; // Em dash.
-    out << '/' << endpoint.capacity();
-}
-
-void write_node_details(std::ostream &out, const Node &node)
-{
-    if (const auto *capture = dynamic_cast<const Capture *>(&node))
-    {
-        out << " | ";
-        write_queue(out, *capture);
-        out << " underrun=" << capture->underrun_frames();
-    }
-    else if (const auto *playback = dynamic_cast<const Playback *>(&node))
-    {
-        out << " | ";
-        write_queue(out, *playback);
-        out << " overflow=" << playback->overflow_frames();
-    }
-    else if (const auto *matrix = dynamic_cast<const Matrix *>(&node))
-    {
-        out << " | gain=" << std::fixed << std::setprecision(2) << matrix->gain();
-    }
-    else if (const auto *mixer = dynamic_cast<const Mixer *>(&node))
-    {
-        out << " | muted=[";
-        for (std::size_t i = 0; i < mixer->inputs().size(); ++i)
-        {
-            if (i)
-                out << ", ";
-            out << mixer->muted(i);
-        }
-        out << ']';
-    }
-}
-
-void write_backend(std::ostream &out, const Backend &backend, RetCode error)
-{
-    out << backend.type_name();
-    const auto *active = dynamic_cast<const ActiveBackend *>(&backend);
-    const auto async = active && active->is_async();
-    out << " (" << (async ? "async" : "sync") << ") state=";
-    out << (active ? state_name(active->state()) : (backend.running() ? "Running" : "Stopped"));
-    out << " dev=";
-    write_spec(out, backend.device_spec());
-    out << " max=" << backend.device_max_frames() << " fir=" << backend.uses_resampler();
-    if (async)
-        out << " drift=" << std::fixed << std::setprecision(1) << std::showpos << active->drift_ppm()
-            << std::noshowpos << "ppm";
-    out << " err=" << (error ? "Ok" : error.message());
-#if WINDOWS_OS_ENVIRONMENT
-    if (const auto *wasapi = dynamic_cast<const WasapiBackend *>(&backend))
-    {
-        const auto failure = wasapi->last_failure();
-        if (failure.operation)
-            out << " (" << failure.operation << " HRESULT=0x" << std::hex
-                << static_cast<std::uint32_t>(failure.hresult) << std::dec << ')';
-    }
-#endif
-}
-
-class BackendLinks
-{
-  public:
-    explicit BackendLinks(View<const Backend *const> backends)
-    {
-        for (const auto *backend : backends)
-            if (backend)
-                if (const auto *endpoint = backend->endpoint_node())
-                    unvisited_.emplace(endpoint, backend);
-    }
-
-    const Backend *take(const Node &node)
-    {
-        const auto found = unvisited_.find(&node);
-        if (found == unvisited_.end())
-            return nullptr;
-        const auto *backend = found->second;
-        unvisited_.erase(found);
-        return backend;
-    }
-
-    bool detached(const Backend &backend) const
-    {
-        const auto *endpoint = backend.endpoint_node();
-        return !endpoint || unvisited_.count(endpoint);
-    }
-
-  private:
-    std::map<const Node *, const Backend *> unvisited_;
-};
-
-void write_engine(std::ostream &out, const Engine &engine)
-{
-    out << "Engine: " << state_name(engine.state()) << " | period=" << static_cast<std::uint32_t>(engine.block_period())
-        << "ms | tick=" << engine.tick_position() << " | plan_gen=" << engine.plan_generation()
-        << " | dirty=" << (engine.dirty() ? "true" : "false") << " | late=" << engine.missed_periods()
-        << " | tick_us=" << engine.last_tick_us();
-}
-
-struct CardColors
-{
-    const char *fill;
-    const char *border;
-    const char *accent;
-};
-
-constexpr CardColors endpoint_colors{"#DFF4F0", "#2E8B7D", "#15803D"};
-constexpr CardColors dsp_colors{"#E8EEF7", "#4A6FA5", "#1E4D83"};
-constexpr CardColors backend_colors{"#F1F5F9", "#64748B", "#15803D"};
-constexpr CardColors warning_colors{"#FEF3C7", "#D97706", "#92400E"};
-constexpr CardColors error_colors{"#FEE2E2", "#DC2626", "#991B1B"};
-constexpr CardColors inactive_colors{"#F3F4F6", "#9CA3AF", "#64748B"};
-
-void write_dot_escaped(std::ostream &out, const std::string &text)
-{
-    for (const auto ch : text)
-    {
-        if (ch == '\r')
-            continue;
-        if (ch == '\n')
-        {
-            out << "\\n";
-            continue;
-        }
-        if (ch == '"' || ch == '\\')
-            out << '\\';
-        out << ch;
-    }
-}
-
-void write_html_escaped(std::ostream &out, const std::string &text)
-{
-    for (const auto ch : text)
-    {
-        switch (ch)
-        {
-        case '&': out << "&amp;"; break;
-        case '<': out << "&lt;"; break;
-        case '>': out << "&gt;"; break;
-        case '"': out << "&quot;"; break;
-        default: out << ch; break;
-        }
-    }
-}
-
-const char *error_code_name(ErrorCode code)
-{
-    switch (code)
-    {
-    case ErrorCode::Ok: return "Ok";
-    case ErrorCode::InvalidArg: return "InvalidArg";
-    case ErrorCode::InvalidPort: return "InvalidPort";
-    case ErrorCode::InvalidType: return "InvalidType";
-    case ErrorCode::TooLarge: return "TooLarge";
-    case ErrorCode::NotReady: return "NotReady";
-    case ErrorCode::Busy: return "Busy";
-    case ErrorCode::UnknownNode: return "UnknownNode";
-    case ErrorCode::UnknownConn: return "UnknownConn";
-    case ErrorCode::DuplicateConn: return "DuplicateConn";
-    case ErrorCode::InputBusy: return "InputBusy";
-    case ErrorCode::Cycle: return "Cycle";
-    case ErrorCode::FormatMismatch: return "FormatMismatch";
-    case ErrorCode::IoFailed: return "IoFailed";
-    case ErrorCode::DeviceLost: return "DeviceLost";
-    case ErrorCode::EndOfStream: return "EndOfStream";
-    case ErrorCode::Cancelled: return "Cancelled";
-    case ErrorCode::Timeout: return "Timeout";
-    }
-    return "Unknown";
-}
-
-void write_short_rate(std::ostream &out, SampleRate rate)
-{
-    const auto hz = static_cast<std::uint32_t>(rate);
-    out << hz / 1000;
-    auto remainder = hz % 1000;
-    if (remainder)
-    {
-        out << '.';
-        for (auto place = 100u; remainder; place /= 10)
-        {
-            out << remainder / place;
-            remainder %= place;
-        }
-    }
-    out << 'k';
-}
-
-void write_short_spec(std::ostream &out, PortSpec spec)
-{
-    write_short_rate(out, spec.sample_rate);
-    out << ' ' << spec.channels << "ch " << format_name(spec.format);
-}
-
-void begin_card(std::ostream &out, const CardColors &colors, const char *title, NodeId id = {}, bool ports = false)
-{
-    // Graphviz draws cell fills as rectangles. Keep the fill on the rounded table.
-    out << " [label=<<TABLE BORDER=\"1\" CELLBORDER=\"0\" CELLSPACING=\"0\" CELLPADDING=\"5\""
-           " STYLE=\"ROUNDED\" BGCOLOR=\"" << colors.fill << "\" COLOR=\"" << colors.border << '"';
-    if (ports)
-        out << " COLUMNS=\"*\"";
-    out << "><TR><TD ALIGN=\"LEFT\"";
-    if (ports)
-        out << " COLSPAN=\"2\"";
-    out << "><FONT POINT-SIZE=\"11\"><B>";
-    write_html_escaped(out, title);
-    out << "</B></FONT>";
-    if (id)
-        out << " <FONT POINT-SIZE=\"9\" COLOR=\"#475569\">#" << id.value << "</FONT>";
-}
-
-void write_badge(std::ostream &out, const char *text, const CardColors &colors)
-{
-    out << " <FONT POINT-SIZE=\"9\" COLOR=\"" << colors.accent << "\"><B>" << text << "</B></FONT>";
-}
-
-void end_card(std::ostream &out, const std::string &details)
-{
-    out << "</TABLE>>, tooltip=\"";
-    write_dot_escaped(out, details);
-    out << "\"];\n";
-}
-
-template <class Endpoint>
-void write_dot_endpoint(std::ostream &out, NodeId id, const Endpoint &endpoint, std::size_t lost, const char *loss_name)
-{
-    const auto online = endpoint.online();
-    const auto steady = online && endpoint.steady();
-    const auto &status_color = online ? (steady ? endpoint_colors : warning_colors) : inactive_colors;
-    begin_card(out, lost ? warning_colors : status_color, endpoint.type_name(), id);
-    write_badge(out, steady ? "ONLINE" : (online ? "PREFILL" : "OFFLINE"), status_color);
-    out << "</TD></TR><HR/><TR><TD ALIGN=\"LEFT\">Queue ";
-
-    std::size_t frames = 0;
-    const auto capacity = endpoint.capacity();
-    if (capacity && endpoint.estimate_queued_frames(frames))
-    {
-        const auto percent = static_cast<unsigned>(static_cast<double>(frames) * 100 / capacity + 0.5);
-        out << frames << '/' << capacity << " (" << percent << "%)";
-    }
-    else
-        out << "-/" << capacity;
-    if (lost)
-        out << "<BR ALIGN=\"LEFT\"/><FONT COLOR=\"" << warning_colors.accent << "\"><B>"
-            << loss_name << ": " << lost << "f</B></FONT>";
-    out << "</TD></TR>";
-}
-
-bool is_multiport_node(const Node &node)
-{
-    return node.inputs().size() > 1 || node.outputs().size() > 1;
-}
-
-using MutedInputs = std::set<std::pair<NodeId, std::size_t>>;
-
-void write_port_cell(std::ostream &out, bool input, std::size_t index, std::size_t count, std::size_t rows, bool muted)
-{
-    if (!count)
-    {
-        out << "<TD ROWSPAN=\"" << rows << "\"></TD>";
-        return;
-    }
-
-    out << "<TD ALIGN=\"" << (input ? "LEFT" : "RIGHT") << "\" PORT=\"" << (input ? 'i' : 'o') << index << '"';
-    if (rows > count && index == count - 1)
-        out << " ROWSPAN=\"" << rows - index << '"';
-    out << '>';
-    if (muted)
-        out << "<FONT COLOR=\"" << inactive_colors.accent << "\">in" << index << " [MUTE]</FONT>";
-    else
-        out << (input ? "in" : "out") << index;
-    out << "</TD>";
-}
-
-void write_dot_ports(std::ostream &out, NodeId id, const Node &node, MutedInputs &muted_inputs)
-{
-    const auto inputs = node.inputs().size();
-    const auto outputs = node.outputs().size();
-    const auto rows = std::max(inputs, outputs);
-    const auto *mixer = dynamic_cast<const Mixer *>(&node);
-    for (std::size_t i = 0; i < rows; ++i)
-    {
-        out << "<TR>";
-        if (i < inputs || (i == 0 && !inputs))
-        {
-            const auto muted = mixer && mixer->muted(i);
-            if (muted)
-                muted_inputs.emplace(id, i);
-            write_port_cell(out, true, i, inputs, rows, muted);
-        }
-        if (i < outputs || (i == 0 && !outputs))
-            write_port_cell(out, false, i, outputs, rows, false);
-        out << "</TR>";
-    }
-}
-
-void write_convert(std::ostream &out, PortSpec input, PortSpec output)
-{
-    const auto rate_changed = input.sample_rate != output.sample_rate;
-    const auto format_changed = input.format != output.format;
-    if (!rate_changed && !format_changed)
-    {
-        out << "passthrough";
-        return;
-    }
-
-    const auto write_changed_fields = [&](PortSpec spec) {
-        if (rate_changed)
-            write_short_rate(out, spec.sample_rate);
-        if (rate_changed && format_changed)
-            out << ' ';
-        if (format_changed)
-            out << format_name(spec.format);
-    };
-    write_changed_fields(input);
-    out << " -&gt; ";
-    write_changed_fields(output);
-}
-
-void write_single_port_node(std::ostream &out, const Node &node)
-{
-    const auto inputs = node.inputs();
-    const auto outputs = node.outputs();
-    if (const auto *matrix = dynamic_cast<const Matrix *>(&node))
-    {
-        if (inputs[0].channels != outputs[0].channels)
-            out << inputs[0].channels << "ch -&gt; " << outputs[0].channels << "ch | ";
-        const auto gain = matrix->gain();
-        if (gain == 0.0f)
-            out << "<FONT COLOR=\"" << inactive_colors.accent << "\">Gain 0.00 [MUTE]</FONT>";
-        else
-            out << "Gain " << std::fixed << std::setprecision(2) << gain;
-    }
-    else if (dynamic_cast<const Convert *>(&node))
-        write_convert(out, inputs[0], outputs[0]);
-    else
-    {
-        write_short_spec(out, inputs.empty() ? outputs[0] : inputs[0]);
-        if (!inputs.empty() && !outputs.empty() && inputs[0] != outputs[0])
-        {
-            out << " -&gt; ";
-            write_short_spec(out, outputs[0]);
-        }
-    }
-}
-
-void write_dot_node(std::ostream &out, NodeId id, const Node &node, MutedInputs &muted_inputs)
-{
-    out << "  n" << id.value;
-    if (const auto *capture = dynamic_cast<const Capture *>(&node))
-        write_dot_endpoint(out, id, *capture, capture->underrun_frames(), "Underrun");
-    else if (const auto *playback = dynamic_cast<const Playback *>(&node))
-        write_dot_endpoint(out, id, *playback, playback->overflow_frames(), "Overflow");
-    else
-    {
-        const auto ports = is_multiport_node(node);
-        begin_card(out, dsp_colors, node.type_name(), id, ports);
-        out << "</TD></TR><HR/>";
-        if (ports)
-            write_dot_ports(out, id, node, muted_inputs);
-        else
-        {
-            out << "<TR><TD ALIGN=\"LEFT\">";
-            write_single_port_node(out, node);
-            out << "</TD></TR>";
-        }
-    }
-
-    std::ostringstream details;
-    details.imbue(std::locale::classic());
-    details << '[' << id.value << "] " << node.type_name();
-    write_ports(details, "in", node.inputs());
-    write_ports(details, "out", node.outputs());
-    write_node_details(details, node);
-    end_card(out, details.str());
-}
-
-const char *write_dot_backend(std::ostream &out, const Backend &backend, RetCode error, bool detached)
-{
-    const auto *active = dynamic_cast<const ActiveBackend *>(&backend);
-    const auto async = active && active->is_async();
-    const auto fir = backend.uses_resampler();
-    const auto state = active ? active->state() : (backend.running() ? ActiveBackend::State::Running
-                                                                    : ActiveBackend::State::Stopped);
-    const char *status = "STOP";
-    auto colors = &inactive_colors;
-    switch (state)
-    {
-    case ActiveBackend::State::Running:
-        status = "RUN";
-        colors = &backend_colors;
-        break;
-    case ActiveBackend::State::Draining:
-        status = "DRAIN";
-        colors = &warning_colors;
-        break;
-    case ActiveBackend::State::Stopping:
-        status = "STOPPING";
-        colors = &warning_colors;
-        break;
-    case ActiveBackend::State::Stopped:
-        break;
-    }
-    if (!error)
-        colors = &error_colors;
-    begin_card(out, detached && error ? inactive_colors : *colors, backend.type_name());
-    const auto badge = error ? std::string(status) : std::string("ERR: ") + error_code_name(error.code());
-    write_badge(out, badge.c_str(), *colors);
-    out << "</TD></TR><HR/><TR><TD ALIGN=\"LEFT\">";
-    const auto device = backend.device_spec();
-    if (device.channels)
-    {
-        write_short_spec(out, device);
-        out << " (max " << backend.device_max_frames() << "f)";
-    }
-    else
-        out << "unbound";
-    out << "<BR ALIGN=\"LEFT\"/>" << (active ? (async ? "async" : "sync") : "passive");
-    if (fir)
-        out << " | FIR";
-    if (async)
-        out << " | drift " << std::fixed << std::setprecision(1) << std::showpos << active->drift_ppm()
-            << std::noshowpos << " ppm";
-    out << "</TD></TR>";
-
-    std::ostringstream details;
-    details.imbue(std::locale::classic());
-    write_backend(details, backend, error);
-    end_card(out, details.str());
-    return async ? "ASRC" : (fir ? "FIR" : "PCM");
-}
-
-void write_dot_engine(std::ostream &out, const Engine &engine)
-{
-    const auto state = engine.state();
-    const auto running = state == Engine::State::Running;
-    const auto ready = state == Engine::State::Ready;
-    const auto &colors = running ? endpoint_colors : (ready ? dsp_colors : inactive_colors);
-    out << "<TABLE BORDER=\"0\" CELLBORDER=\"0\" CELLSPACING=\"4\" CELLPADDING=\"5\"><TR>"
-           "<TD><FONT POINT-SIZE=\"15\"><B>AEReborn</B></FONT></TD><TD BGCOLOR=\"" << colors.fill << "\">";
-    write_badge(out, running ? "RUNNING" : (ready ? "READY" : "UNPREPARED"), colors);
-    out << "</TD><TD>" << static_cast<std::uint32_t>(engine.block_period()) << " ms | Plan #"
-        << engine.plan_generation() << " | tick " << engine.tick_position() << " | " << engine.last_tick_us()
-        << " us</TD>";
-    if (engine.dirty())
-    {
-        out << "<TD BGCOLOR=\"" << warning_colors.fill << "\">";
-        write_badge(out, "DIRTY", warning_colors);
-        out << "</TD>";
-    }
-    const auto missed = engine.missed_periods();
-    if (missed)
-        out << "<TD BGCOLOR=\"" << warning_colors.fill << "\"><FONT POINT-SIZE=\"9\" COLOR=\""
-            << warning_colors.accent << "\"><B>LATE " << missed << "</B></FONT></TD>";
-    out << "</TR></TABLE>";
-}
-
-PortSpec connection_spec(const Engine &engine, const Connection &connection)
-{
-    return engine.plan_node(connection.from.node)->outputs()[connection.from.index];
-}
-} // namespace
-
-std::string dump_text(const Engine &engine, View<const Backend *const> backends)
-{
-    std::ostringstream out;
-    out.imbue(std::locale::classic());
-    write_engine(out, engine);
-    const auto nodes = engine.plan_nodes();
-    out << "\nPlan Order:";
-    for (std::size_t i = 0; i < nodes.size(); ++i)
-        out << (i ? " -> [" : " [") << nodes[i].value << ']';
-
-    BackendLinks links(backends);
-    out << "\n\nNodes:\n";
-    for (const auto id : nodes)
-    {
-        const auto &node = *engine.plan_node(id);
-        out << "  [" << id.value << "] " << std::left << std::setw(9) << node.type_name() << std::right;
-        write_ports(out, "in", node.inputs());
-        write_ports(out, "out", node.outputs());
-        write_node_details(out, node);
-        out << '\n';
-        if (const auto *backend = links.take(node))
-        {
-            out << "      \xE2\x94\x94\xE2\x94\x80 ";
-            write_backend(out, *backend, backend->last_error());
-            out << '\n';
-        }
-    }
-
-    out << "\nConnections:\n";
-    for (const auto &connection : engine.plan_connections())
-    {
-        out << "  #" << connection.id.value << ": [" << connection.from.node.value << "]:" << connection.from.index
-            << " -> [" << connection.to.node.value << "]:" << connection.to.index << " (";
-        write_spec(out, connection_spec(engine, connection));
-        out << ")\n";
-    }
-
-    bool heading_written = false;
-    for (const auto *backend : backends)
-        if (backend && links.detached(*backend))
-        {
-            if (!heading_written)
-            {
-                out << "\nDetached Backends:\n";
-                heading_written = true;
-            }
-            out << "  ";
-            write_backend(out, *backend, backend->last_error());
-            out << '\n';
-        }
-    return out.str();
-}
-
-void dump_text(std::ostream &out, const Engine &engine, View<const Backend *const> backends)
-{
-    const auto report = dump_text(engine, backends);
-    out.write(report.data(), static_cast<std::streamsize>(report.size()));
-}
-
-std::string dump_dot(const Engine &engine, View<const Backend *const> backends)
-{
-    std::ostringstream out, details;
-    out.imbue(std::locale::classic());
-    details.imbue(std::locale::classic());
-    write_engine(details, engine);
-    out << "digraph AEReborn {\n"
-           "  graph [rankdir=LR, bgcolor=white, pad=0.32, nodesep=0.42, ranksep=0.64, labelloc=t, "
-           "fontname=Arial, fontsize=11, fontcolor=\"#0F172A\", label=<";
-    write_dot_engine(out, engine);
-    out << ">, tooltip=\"";
-    write_dot_escaped(out, details.str());
-    out << "\"];\n"
-           "  node [shape=plain, fontname=Arial, fontsize=10, fontcolor=\"#0F172A\"];\n"
-           "  edge [fontname=Arial, fontsize=9, fontcolor=\"#64748B\", color=\"#475569\", arrowsize=0.7, penwidth=1.4];\n";
-
-    BackendLinks links(backends);
-    MutedInputs muted_inputs;
-    std::map<NodeId, const Node *> nodes;
-    for (const auto id : engine.plan_nodes())
-    {
-        const auto &node = *engine.plan_node(id);
-        nodes.emplace(id, &node);
-        write_dot_node(out, id, node, muted_inputs);
-
-        if (const auto *backend = links.take(node))
-        {
-            const auto error = backend->last_error();
-            out << "  b" << id.value;
-            const auto *mode = write_dot_backend(out, *backend, error, false);
-            // A backend binds to a Capture source or a Playback sink.
-            if (node.inputs().empty())
-                out << "  b" << id.value << ":e -> n" << id.value << ":w";
-            else
-                out << "  n" << id.value << ":e -> b" << id.value << ":w";
-            out << " [style=dashed, color=\"" << (error ? backend_colors.border : error_colors.border)
-                << "\", label=\"" << mode << "\", tooltip=\"";
-            write_dot_escaped(out, backend->type_name());
-            out << " | graph ";
-            write_spec(out, backend->logical_spec());
-            out << " | device ";
-            write_spec(out, backend->device_spec());
-            out << "\"];\n";
-        }
-    }
-
-    for (const auto &connection : engine.plan_connections())
-    {
-        const auto &from = *nodes.find(connection.from.node)->second;
-        const auto &to = *nodes.find(connection.to.node)->second;
-        const auto spec = from.outputs()[connection.from.index];
-        const auto muted = muted_inputs.count({connection.to.node, connection.to.index});
-        out << "  n" << connection.from.node.value;
-        if (is_multiport_node(from))
-            out << ":o" << connection.from.index;
-        out << ":e -> n" << connection.to.node.value;
-        if (is_multiport_node(to))
-            out << ":i" << connection.to.index;
-        out << ":w [label=\"";
-        write_short_spec(out, spec);
-        out << (muted ? " (muted)\"" : "\"");
-        if (muted)
-            out << ", style=dashed, color=\"" << inactive_colors.border
-                << "\", fontcolor=\"" << inactive_colors.accent << '"';
-        out << ", tooltip=\"#" << connection.id.value << ": [" << connection.from.node.value << "]:" << connection.from.index
-            << " -> [" << connection.to.node.value << "]:" << connection.to.index << " (";
-        write_spec(out, spec);
-        if (muted)
-            out << ", muted";
-        out << ")\"];\n";
-    }
-
-    bool cluster_open = false;
-    for (std::size_t i = 0; i < backends.size(); ++i)
-    {
-        const auto *backend = backends[i];
-        if (backend && links.detached(*backend))
-        {
-            if (!cluster_open)
-            {
-                out << "  subgraph cluster_detached {\n    label=\"Detached Backends\";\n    style=\"rounded,dashed\";\n"
-                       "    fontname=Arial;\n    fontsize=10;\n    fontcolor=\"#64748B\";\n"
-                       "    color=\"#9CA3AF\";\n    margin=12;\n";
-                cluster_open = true;
-            }
-            out << "    detached" << i;
-            write_dot_backend(out, *backend, backend->last_error(), true);
-        }
-    }
-    if (cluster_open)
-        out << "  }\n";
-    out << "}\n";
-    return out.str();
-}
-
-void dump_dot(std::ostream &out, const Engine &engine, View<const Backend *const> backends)
-{
-    const auto graph = dump_dot(engine, backends);
-    out.write(graph.data(), static_cast<std::streamsize>(graph.size()));
-}
-
-} // namespace aereborn
-
-===== diag/inspect.h =====
-#ifndef AEREBORN_DIAG_INSPECT_H
-#define AEREBORN_DIAG_INSPECT_H
-
-#include "core/engine.h"
-#include "backend/backend.h"
-#include <iosfwd>
-#include <string>
-
-namespace aereborn
-{
-
-/// @brief Write a text report of the committed render plan and supplied backends.
-/// @pre Call on the serialized control side with live backends and endpoints.
-/// @note Live figures are approximate and can represent different points in time.
-void dump_text(std::ostream &out, const Engine &engine, View<const Backend *const> backends = {});
-
-/// @brief Return the text report as a string. Follows the same contract as the stream overload.
-std::string dump_text(const Engine &engine, View<const Backend *const> backends = {});
-
-/// @brief Write a Graphviz DOT graph of the committed plan and supplied backends.
-/// @copydetails dump_text(std::ostream &, const Engine &, View<const Backend *const>)
-void dump_dot(std::ostream &out, const Engine &engine, View<const Backend *const> backends = {});
-
-/// @brief Return the DOT graph as a string. Follows the same contract as the stream overload.
-std::string dump_dot(const Engine &engine, View<const Backend *const> backends = {});
 
 } // namespace aereborn
 

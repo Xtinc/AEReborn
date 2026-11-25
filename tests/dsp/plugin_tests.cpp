@@ -163,6 +163,138 @@ void matrix_and_mix_activity()
           "Steady zero gain emits inactive, zero-filled output");
 }
 
+void mixer_priority_limits()
+{
+    Mixer mixer(rate, 1, Mixer::max_inputs);
+    check(mixer.inputs().size() == 64, "Mixer accepts 64 inputs");
+    expect_error(ErrorCode::TooLarge, [] { Mixer invalid(rate, 1, 65); });
+    const auto end = mixer.inputs().size();
+    expect_error(ErrorCode::InvalidPort, [&] { mixer.set_muted(end, true); });
+    expect_error(ErrorCode::InvalidPort, [&] { mixer.muted(end); });
+    expect_error(ErrorCode::InvalidPort, [&] { mixer.set_high_priority(end, true); });
+    expect_error(ErrorCode::InvalidPort, [&] { mixer.high_priority(end); });
+    expect_error(ErrorCode::InvalidPort, [&] { mixer.suppressed(end); });
+
+    const auto high = end - 1;
+    mixer.set_muted(high, true);
+    mixer.set_high_priority(high, true);
+    check(mixer.muted(high) && mixer.high_priority(high) && !mixer.muted(0) && !mixer.high_priority(0),
+          "The highest bit can be set independently");
+    mixer.set_muted(high, false);
+
+    const PortSpec mono(rate, 1, SampleFormat::F32P);
+    const float silence = 0.0f, low_sample = 0.5f, high_sample = 0.25f;
+    float mixed = 0.0f;
+    std::array<IBBlock, Mixer::max_inputs> inputs;
+    inputs.fill({reinterpret_cast<const std::uint8_t *>(&silence), mono, 1});
+    inputs.front() = {reinterpret_cast<const std::uint8_t *>(&low_sample), mono, 1};
+    inputs.back() = {reinterpret_cast<const std::uint8_t *>(&high_sample), mono, 1};
+    std::array<std::uint8_t, Mixer::max_inputs> flags{};
+    flags.front() = flags.back() = 1;
+    const OBBlock output(reinterpret_cast<std::uint8_t *>(&mixed), mono, 1);
+    mixer.process({period, 0, {inputs.data(), inputs.size()}, {&output, 1}, {flags.data(), flags.size()}});
+    check(mixed == high_sample && mixer.suppressed(0) && !mixer.suppressed(high),
+          "The highest input bit participates in the priority decision");
+}
+
+void mixer_priority_transitions()
+{
+    const PortSpec stereo(rate, 2, SampleFormat::F32P);
+    Mixer mixer(rate, 2, 3);
+    mixer.set_high_priority(1, true);
+    mixer.set_high_priority(2, true);
+    const float low[]{4, 4, 4, 4, 8, 8, 8, 8};
+    const float high1[]{1, 1, 1, 1, 2, 2, 2, 2};
+    const float high2[]{2, 2, 2, 2, 4, 4, 4, 4};
+    const float silence[8]{};
+    float mixed[8]{};
+    const IBBlock sources[]{{reinterpret_cast<const std::uint8_t *>(low), stereo, 4},
+                            {reinterpret_cast<const std::uint8_t *>(high1), stereo, 4},
+                            {reinterpret_cast<const std::uint8_t *>(high2), stereo, 4}};
+    const IBBlock gap(reinterpret_cast<const std::uint8_t *>(silence), stereo, 4);
+    const OBBlock output(reinterpret_cast<std::uint8_t *>(mixed), stereo, 4);
+    const auto check_mix = [&](std::array<std::uint8_t, 3> flags, std::array<float, 4> expected) {
+        const IBBlock inputs[]{flags[0] ? sources[0] : gap, flags[1] ? sources[1] : gap, flags[2] ? sources[2] : gap};
+        std::uint8_t active = 0;
+        mixer.process({period, 0, {inputs, 3}, {&output, 1}, {flags.data(), flags.size()}, {&active, 1}});
+        check(active != 0, "Each priority transition emits an active block");
+        for (std::size_t frame = 0; frame < expected.size(); ++frame)
+            check(mixed[frame] == expected[frame] && mixed[frame + expected.size()] == 2 * expected[frame],
+                  "Both channels follow the expected frame-by-frame ramp");
+    };
+
+    check_mix({{1, 0, 0}}, {{4, 4, 4, 4}});
+    check_mix({{1, 1, 1}}, {{6, 5, 4, 3}});
+    check_mix({{1, 1, 1}}, {{3, 3, 3, 3}});
+    check(mixer.suppressed(0) && !mixer.suppressed(1) && !mixer.suppressed(2), "High-priority inputs coexist");
+    check_mix({{1, 1, 0}}, {{1, 1, 1, 1}});
+    check(mixer.suppressed(0), "One active high-priority input keeps the low input suppressed");
+
+    mixer.set_muted(1, true);
+    check_mix({{1, 1, 0}}, {{1, 2, 3, 4}});
+    check(!mixer.suppressed(0), "Muting the final high-priority input releases suppression");
+    check_mix({{1, 1, 0}}, {{4, 4, 4, 4}});
+    mixer.set_muted(1, false);
+    check_mix({{0, 1, 0}}, {{1, 1, 1, 1}});
+    check(!mixer.suppressed(0), "An inactive input is absent from the suppression report");
+    check_mix({{1, 1, 0}}, {{1, 1, 1, 1}});
+    check(mixer.suppressed(0), "The returning normal input is already suppressed");
+
+    mixer.set_high_priority(0, true);
+    check_mix({{1, 1, 0}}, {{2, 3, 4, 5}});
+    check_mix({{1, 1, 0}}, {{5, 5, 5, 5}});
+    mixer.set_high_priority(0, false);
+    check_mix({{1, 1, 0}}, {{4, 3, 2, 1}});
+    check_mix({{1, 0, 0}}, {{1, 2, 3, 4}});
+    check_mix({{1, 0, 0}}, {{4, 4, 4, 4}});
+}
+
+void mixer_priority_single_frame_and_reset()
+{
+    const PortSpec mono(rate, 1, SampleFormat::F32P);
+    Mixer mixer(rate, 1, 2);
+    mixer.set_high_priority(1, true);
+    const auto nan = std::numeric_limits<float>::quiet_NaN();
+    float low[]{0.5f, nan}, high[]{0.25f, 0.25f}, mixed[2]{};
+    std::uint8_t input_flags[]{1, 1}, active = 0;
+    const auto render = [&](std::size_t frames) {
+        const IBBlock inputs[]{{reinterpret_cast<const std::uint8_t *>(low), mono, frames},
+                               {reinterpret_cast<const std::uint8_t *>(high), mono, frames}};
+        const OBBlock output(reinterpret_cast<std::uint8_t *>(mixed), mono, frames);
+        mixer.process({period, 0, {inputs, 2}, {&output, 1}, {input_flags, 2}, {&active, 1}});
+    };
+    render(2);
+    check(mixed[0] == 0.5f && mixed[1] == 0.25f, "The zero-gain fade-out endpoint skips its NaN source");
+    low[0] = std::numeric_limits<float>::infinity();
+    render(2);
+    check(mixed[0] == 0.25f && mixed[1] == 0.25f, "Steady suppression isolates NaN and infinity");
+
+    mixer.set_muted(0, true);
+    render(0);
+    check(mixer.suppressed(0), "A zero-frame call preserves the previous suppression report");
+    mixer.reset();
+    check(!mixer.suppressed(0) && mixer.muted(0) && mixer.high_priority(1),
+          "Reset clears suppression and retains requested settings");
+    mixer.set_muted(0, false);
+    low[0] = 0.5f;
+    render(2);
+    check(mixed[0] == 0.5f, "Reset discards the previous gain so a new fade-out begins");
+
+    mixer.reset();
+    low[0] = nan;
+    render(1);
+    check(active && mixed[0] == 0.25f, "A one-frame fade-out immediately reaches zero gain");
+    low[0] = 0.5f;
+    high[0] = 0.0f;
+    input_flags[1] = 0;
+    render(1);
+    check(active && mixed[0] == 0.5f && !mixer.suppressed(0), "A one-frame fade-in immediately reaches unity");
+    low[0] = 0.0f;
+    input_flags[0] = 0;
+    render(1);
+    check(!active && mixed[0] == 0.0f, "The mix keeps a whole inactive block zero-filled");
+}
+
 void check_convert_tail(SampleRate from, SampleRate to, std::uint64_t flush_blocks)
 {
     constexpr auto tick_period = BlockPeriod::Ms02;
@@ -190,7 +322,7 @@ void check_convert_tail(SampleRate from, SampleRate to, std::uint64_t flush_bloc
         const auto bytes = out.byte_view();
         std::memset(bytes.data(), 0xcd, bytes.size());
         const std::uint8_t input_flag = active ? 1 : 0;
-        std::uint8_t output_flag = 1;
+        std::uint8_t output_flag = input_flag;
         convert.process({tick_period, tick, {&in, 1}, {&out, 1}, {&input_flag, 1}, {&output_flag, 1}});
         reference.process_tick(source, ref, tick_period, tick);
         check(output_flag == expected_active, "Convert stays active through the last flush block");
@@ -295,6 +427,9 @@ int main(int argc, char **argv)
                                                 {"float_channel_bits", float_channel_bits},
                                                 {"matrix_and_mix_contracts", matrix_and_mix_contracts},
                                                 {"matrix_and_mix_activity", matrix_and_mix_activity},
+                                                {"mixer_priority_limits", mixer_priority_limits},
+                                                {"mixer_priority_transitions", mixer_priority_transitions},
+                                                {"mixer_priority_single_frame_and_reset", mixer_priority_single_frame_and_reset},
                                                 {"fractional_rate_and_antialias", fractional_rate_and_antialias},
                                                 {"convert_activity_and_tail", convert_activity_and_tail}});
 }

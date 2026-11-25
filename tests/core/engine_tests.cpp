@@ -48,22 +48,25 @@ void graph_constraints()
     expect_error(ErrorCode::UnknownConn, [&] { engine.disconnect(input); });
 }
 
-class SplitSignal final : public NodeT<1, 2>
+class SplitSignal final : public NodeT<2, 2>
 {
   public:
-    SplitSignal() : NodeT({mono}, {mono, mono}) {}
+    SplitSignal() : NodeT({mono, mono}, {mono, mono}) {}
 
     void process(const ProcessContext &context) noexcept override
     {
-        const auto input = context.inputs[0].f32p_view();
+        const auto first = context.inputs[0].f32p_view();
+        const auto second = context.inputs[1].f32p_view();
         const auto generated = context.outputs[0].f32p_view();
         const auto copied = context.outputs[1].f32p_view();
-        const bool copy = context.has_input(0) && copy_enabled.load(std::memory_order_relaxed);
-        for (std::size_t frame = 0; frame < input.frames(); ++frame)
+        const bool copy = copy_enabled.load(std::memory_order_relaxed);
+        for (std::size_t frame = 0; frame < copied.frames(); ++frame)
         {
-            generated.channel(0)[frame] = input.channel(0)[frame] + 0.25f;
-            copied.channel(0)[frame] = copy ? input.channel(0)[frame] : 0.0f;
+            const auto sample = first.channel(0)[frame] + second.channel(0)[frame];
+            generated.channel(0)[frame] = sample + 0.25f;
+            copied.channel(0)[frame] = copy ? sample : 0.0f;
         }
+        context.set_output_active(0, true);
         if (!copy)
             context.set_output_active(1, false);
     }
@@ -76,6 +79,7 @@ void port_activity()
     Engine engine(period);
     ClockedGraph clock(engine);
     const auto tone = engine.emplace_node<Tone>(rate, 1, 1000, 0.125f);
+    const auto silence = engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 0.0f; });
     const auto split = engine.emplace_node<SplitSignal>();
     const auto mixer = engine.emplace_node<Mixer>(rate, 1, 1);
     const auto mixed = engine.emplace_node<PacketSink>(mono);
@@ -98,10 +102,10 @@ void port_activity()
     const auto check_gap = [&] {
         check(mixed_result->active && direct_result->active && mixed_result->sample(1) == 0.25f &&
                   direct_result->sample(1) == 0.25f,
-              "A generated signal stays active on both routes even with an inactive input");
+              "An explicit active flag keeps the generated signal on both routes");
         check(!copied_result->active && !fanout_result->active && copied_result->sample(1) == 0.0f &&
                   fanout_result->sample(1) == 0.0f,
-              "Both readers of the second output see its independent inactive flag and zero samples");
+              "With all inputs inactive, both readers see the inactive default and zero samples");
     };
     const auto check_signal = [&] {
         check(source_result->active && source_result->sample(1) > 0.0f,
@@ -109,13 +113,13 @@ void port_activity()
         check(copied_result->active && fanout_result->active &&
                   copied_result->sample(1) == source_result->sample(1) &&
                   fanout_result->sample(1) == source_result->sample(1),
-              "Output defaults are restored before each process call");
+              "An active second input restores the output default on both readers");
     };
 
     clock.start();
     clock.advance();
     check_gap();
-    connect(engine, tone, split);
+    connect(engine, tone, split, 1);
     clock.commit();
     clock.advance();
     check_signal();
@@ -132,6 +136,11 @@ void port_activity()
     clock.advance();
     check_gap();
     check(!source_result->active, "A paused source leaves its directly connected sink inactive");
+    connect(engine, silence, split);
+    clock.commit();
+    clock.advance();
+    check(copied_result->active && fanout_result->active && copied_result->sample(1) == 0.0f,
+          "An active first input propagates even when its samples are all zero");
     engine.set_paused(tone, false);
     clock.commit();
     clock.advance();

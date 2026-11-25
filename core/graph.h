@@ -40,7 +40,8 @@ class Node
     /// @brief Process one block and write every output sample in its declared format.
     /// @param context Current period, tick position, port blocks, and per-port activity flags.
     /// @pre Preparation has succeeded.
-    /// @note Outputs default to active. Mark an output inactive only when its block is filled with zero bytes.
+    /// @note Sources default to active. Other nodes' outputs default to the logical OR of their inputs.
+    /// Mark an output active if it produces audio with all inputs inactive. Inactive outputs must be filled with zero bytes.
     /// @note The context and its views are valid only during this call. Keep processing
     /// free of heap allocation and deallocation, blocking I/O, and logging.
     /// Avoid lock waits where possible.

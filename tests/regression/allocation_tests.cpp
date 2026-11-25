@@ -184,10 +184,13 @@ void render_and_passive_io_without_heap()
     const auto convert = engine.emplace_node<Convert>(PortSpec(source_rate, 1, SampleFormat::F32P), planar);
     const auto matrix = engine.emplace_node<Matrix>(rate, 1, 0.5f);
     const auto mixer = engine.emplace_node<Mixer>(rate, 1, 2);
+    const auto background = engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 0.25f; });
     const auto playback = engine.emplace_node<Playback>(rate, 1, 5ms);
     connect(engine, capture, convert);
     connect(engine, convert, matrix);
     connect(engine, matrix, mixer);
+    connect(engine, background, mixer, 1);
+    engine.node<Mixer>(mixer)->set_high_priority(0, true);
     connect(engine, mixer, playback);
     const auto probe = engine.emplace_node<MeasureRender>(false);
     engine.commit();

@@ -8,7 +8,6 @@
 #include <iomanip>
 #include <locale>
 #include <map>
-#include <set>
 #include <sstream>
 
 namespace aereborn
@@ -89,7 +88,46 @@ template <class Endpoint> void write_queue(std::ostream &out, const Endpoint &en
     out << '/' << endpoint.capacity();
 }
 
-void write_node_details(std::ostream &out, const Node &node)
+struct MixerFlags
+{
+    std::size_t count = 0;
+    std::uint64_t muted = 0, high = 0, suppressed = 0;
+
+    std::uint64_t bit(std::size_t input) const noexcept
+    {
+        return count ? std::uint64_t{1} << input : 0;
+    }
+};
+
+MixerFlags read_mixer_flags(const Node &node)
+{
+    MixerFlags flags;
+    if (const auto *mixer = dynamic_cast<const Mixer *>(&node))
+    {
+        flags.count = mixer->inputs().size();
+        for (std::size_t i = 0; i < flags.count; ++i)
+        {
+            flags.muted |= std::uint64_t{mixer->muted(i)} << i;
+            flags.high |= std::uint64_t{mixer->high_priority(i)} << i;
+            flags.suppressed |= std::uint64_t{mixer->suppressed(i)} << i;
+        }
+    }
+    return flags;
+}
+
+void write_input_flags(std::ostream &out, const char *name, std::uint64_t flags, std::size_t count)
+{
+    out << ' ' << name << "=[";
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        if (i)
+            out << ", ";
+        out << ((flags >> i) & 1);
+    }
+    out << ']';
+}
+
+void write_node_details(std::ostream &out, const Node &node, const MixerFlags &mixer)
 {
     if (const auto *capture = dynamic_cast<const Capture *>(&node))
     {
@@ -107,16 +145,15 @@ void write_node_details(std::ostream &out, const Node &node)
     {
         out << " | gain=" << std::fixed << std::setprecision(2) << matrix->gain();
     }
-    else if (const auto *mixer = dynamic_cast<const Mixer *>(&node))
+    else if (mixer.count)
     {
-        out << " | muted=[";
-        for (std::size_t i = 0; i < mixer->inputs().size(); ++i)
+        out << " |";
+        write_input_flags(out, "muted", mixer.muted, mixer.count);
+        if (mixer.high || mixer.suppressed)
         {
-            if (i)
-                out << ", ";
-            out << mixer->muted(i);
+            write_input_flags(out, "high", mixer.high, mixer.count);
+            write_input_flags(out, "suppressed", mixer.suppressed, mixer.count);
         }
-        out << ']';
     }
 }
 
@@ -333,14 +370,31 @@ void write_dot_endpoint(std::ostream &out, NodeId id, const Endpoint &endpoint, 
     out << "</TD></TR>";
 }
 
-bool is_multiport_node(const Node &node)
+enum class InputStyle
 {
-    return node.inputs().size() > 1 || node.outputs().size() > 1;
+    Normal,
+    Muted,
+    Suppressed
+};
+
+InputStyle input_style(const MixerFlags &mixer, std::uint64_t bit) noexcept
+{
+    if (mixer.muted & bit)
+        return InputStyle::Muted;
+    if (mixer.suppressed & ~mixer.high & bit)
+        return InputStyle::Suppressed;
+    return InputStyle::Normal;
 }
 
-using MutedInputs = std::set<std::pair<NodeId, std::size_t>>;
+struct DotNode
+{
+    View<const PortSpec> outputs;
+    MixerFlags mixer;
+    bool has_ports;
+};
 
-void write_port_cell(std::ostream &out, bool input, std::size_t index, std::size_t count, std::size_t rows, bool muted)
+void write_port_cell(std::ostream &out, bool input, std::size_t index, std::size_t count, std::size_t rows,
+                     InputStyle style, bool high = false)
 {
     if (!count)
     {
@@ -352,31 +406,35 @@ void write_port_cell(std::ostream &out, bool input, std::size_t index, std::size
     if (rows > count && index == count - 1)
         out << " ROWSPAN=\"" << rows - index << '"';
     out << '>';
-    if (muted)
-        out << "<FONT COLOR=\"" << inactive_colors.accent << "\">in" << index << " [MUTE]</FONT>";
-    else
-        out << (input ? "in" : "out") << index;
+    if (style != InputStyle::Normal)
+        out << "<FONT COLOR=\"" << (style == InputStyle::Muted ? inactive_colors.accent : warning_colors.accent) << "\">";
+    out << (input ? "in" : "out") << index;
+    if (style == InputStyle::Muted)
+        out << (high ? " [HIGH MUTE]" : " [MUTE]");
+    else if (style == InputStyle::Suppressed)
+        out << " [SUPP]";
+    else if (high)
+        out << " [HIGH]";
+    if (style != InputStyle::Normal)
+        out << "</FONT>";
     out << "</TD>";
 }
 
-void write_dot_ports(std::ostream &out, NodeId id, const Node &node, MutedInputs &muted_inputs)
+void write_dot_ports(std::ostream &out, const Node &node, const MixerFlags &mixer)
 {
     const auto inputs = node.inputs().size();
     const auto outputs = node.outputs().size();
     const auto rows = std::max(inputs, outputs);
-    const auto *mixer = dynamic_cast<const Mixer *>(&node);
     for (std::size_t i = 0; i < rows; ++i)
     {
         out << "<TR>";
         if (i < inputs || (i == 0 && !inputs))
         {
-            const auto muted = mixer && mixer->muted(i);
-            if (muted)
-                muted_inputs.emplace(id, i);
-            write_port_cell(out, true, i, inputs, rows, muted);
+            const auto bit = mixer.bit(i);
+            write_port_cell(out, true, i, inputs, rows, input_style(mixer, bit), (mixer.high & bit) != 0);
         }
         if (i < outputs || (i == 0 && !outputs))
-            write_port_cell(out, false, i, outputs, rows, false);
+            write_port_cell(out, false, i, outputs, rows, InputStyle::Normal);
         out << "</TR>";
     }
 }
@@ -431,7 +489,7 @@ void write_single_port_node(std::ostream &out, const Node &node)
     }
 }
 
-void write_dot_node(std::ostream &out, NodeId id, const Node &node, MutedInputs &muted_inputs)
+void write_dot_node(std::ostream &out, NodeId id, const Node &node, const DotNode &info)
 {
     out << "  n" << id.value;
     if (const auto *capture = dynamic_cast<const Capture *>(&node))
@@ -440,11 +498,10 @@ void write_dot_node(std::ostream &out, NodeId id, const Node &node, MutedInputs 
         write_dot_endpoint(out, id, *playback, playback->overflow_frames(), "Overflow");
     else
     {
-        const auto ports = is_multiport_node(node);
-        begin_card(out, dsp_colors, node.type_name(), id, ports);
+        begin_card(out, dsp_colors, node.type_name(), id, info.has_ports);
         out << "</TD></TR><HR/>";
-        if (ports)
-            write_dot_ports(out, id, node, muted_inputs);
+        if (info.has_ports)
+            write_dot_ports(out, node, info.mixer);
         else
         {
             out << "<TR><TD ALIGN=\"LEFT\">";
@@ -458,7 +515,7 @@ void write_dot_node(std::ostream &out, NodeId id, const Node &node, MutedInputs 
     details << '[' << id.value << "] " << node.type_name();
     write_ports(details, "in", node.inputs());
     write_ports(details, "out", node.outputs());
-    write_node_details(details, node);
+    write_node_details(details, node, info.mixer);
     end_card(out, details.str());
 }
 
@@ -566,7 +623,7 @@ std::string dump_text(const Engine &engine, View<const Backend *const> backends)
         out << "  [" << id.value << "] " << std::left << std::setw(9) << node.type_name() << std::right;
         write_ports(out, "in", node.inputs());
         write_ports(out, "out", node.outputs());
-        write_node_details(out, node);
+        write_node_details(out, node, read_mixer_flags(node));
         out << '\n';
         if (const auto *backend = links.take(node))
         {
@@ -624,13 +681,14 @@ std::string dump_dot(const Engine &engine, View<const Backend *const> backends)
            "  edge [fontname=Arial, fontsize=9, fontcolor=\"#64748B\", color=\"#475569\", arrowsize=0.7, penwidth=1.4];\n";
 
     BackendLinks links(backends);
-    MutedInputs muted_inputs;
-    std::map<NodeId, const Node *> nodes;
+    std::map<NodeId, DotNode> nodes;
     for (const auto id : engine.plan_nodes())
     {
         const auto &node = *engine.plan_node(id);
-        nodes.emplace(id, &node);
-        write_dot_node(out, id, node, muted_inputs);
+        const auto mixer = read_mixer_flags(node);
+        const DotNode info{node.outputs(), mixer, node.inputs().size() > 1 || node.outputs().size() > 1 || mixer.high};
+        nodes.emplace(id, info);
+        write_dot_node(out, id, node, info);
 
         if (const auto *backend = links.take(node))
         {
@@ -655,27 +713,33 @@ std::string dump_dot(const Engine &engine, View<const Backend *const> backends)
 
     for (const auto &connection : engine.plan_connections())
     {
-        const auto &from = *nodes.find(connection.from.node)->second;
-        const auto &to = *nodes.find(connection.to.node)->second;
-        const auto spec = from.outputs()[connection.from.index];
-        const auto muted = muted_inputs.count({connection.to.node, connection.to.index});
+        const auto &from = nodes.find(connection.from.node)->second;
+        const auto &to = nodes.find(connection.to.node)->second;
+        const auto spec = from.outputs[connection.from.index];
+        const auto style =
+            to.has_ports ? input_style(to.mixer, to.mixer.bit(connection.to.index)) : InputStyle::Normal;
+        const auto *status = style == InputStyle::Muted ? "muted" : "suppressed";
         out << "  n" << connection.from.node.value;
-        if (is_multiport_node(from))
+        if (from.has_ports)
             out << ":o" << connection.from.index;
         out << ":e -> n" << connection.to.node.value;
-        if (is_multiport_node(to))
+        if (to.has_ports)
             out << ":i" << connection.to.index;
         out << ":w [label=\"";
         write_short_spec(out, spec);
-        out << (muted ? " (muted)\"" : "\"");
-        if (muted)
-            out << ", style=dashed, color=\"" << inactive_colors.border
-                << "\", fontcolor=\"" << inactive_colors.accent << '"';
+        if (style != InputStyle::Normal)
+        {
+            const auto &colors = style == InputStyle::Muted ? inactive_colors : warning_colors;
+            out << " (" << status << ")\", style=dashed, color=\"" << colors.border
+                << "\", fontcolor=\"" << colors.accent << '"';
+        }
+        else
+            out << '"';
         out << ", tooltip=\"#" << connection.id.value << ": [" << connection.from.node.value << "]:" << connection.from.index
             << " -> [" << connection.to.node.value << "]:" << connection.to.index << " (";
         write_spec(out, spec);
-        if (muted)
-            out << ", muted";
+        if (style != InputStyle::Normal)
+            out << ", " << status;
         out << ")\"];\n";
     }
 

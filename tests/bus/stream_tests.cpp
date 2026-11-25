@@ -222,6 +222,54 @@ void capture_gaps_keep_playback_timeline()
           "WAV playback records every tick, including inactive blocks and partial-block padding");
 }
 
+void priority_mixer_silent_packets()
+{
+    Engine engine(period);
+    ClockedGraph clock(engine);
+    const auto background = engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 0.5f; });
+    const auto call = engine.emplace_node<Capture>(rate, 1, 5ms);
+    const auto mixed = engine.emplace_node<Mixer>(rate, 1, 2);
+    const auto monitor = engine.emplace_node<PacketSink>(planar);
+    connect(engine, background, mixed);
+    connect(engine, call, mixed, 1);
+    connect(engine, mixed, monitor);
+    auto &mixer = *engine.node<Mixer>(mixed);
+    mixer.set_high_priority(1, true);
+    engine.commit();
+    const auto *result = engine.node<PacketSink>(monitor);
+    PushSource push(pcm);
+    push.bind(*engine.node<Capture>(call));
+    push.start();
+    clock.start();
+    clock.advance();
+    check(result->active && result->sample(0) == 0.5f && !mixer.suppressed(0),
+          "Background plays at unity before the call");
+
+    Pcm packet(pcm, 2 * frames);
+    check(push.push(packet.input(0, packet.frames)) == packet.frames, "The call queues two intentional silent blocks");
+    clock.advance();
+    check(result->active && mixer.suppressed(0), "Even a silent call triggers suppression");
+    for (std::size_t frame = 0; frame < frames; ++frame)
+    {
+        const auto gain = static_cast<float>((frames - 1 - frame) / static_cast<double>(frames));
+        check(result->sample(frame) == 0.5f * gain, "The background fades out over the first silent block");
+    }
+    clock.advance();
+    check(result->active && mixer.suppressed(0), "The second intentional zero block remains active");
+    for (std::size_t frame = 0; frame < frames; ++frame)
+        check(result->sample(frame) == 0.0f, "The active call keeps the background silent");
+
+    clock.advance();
+    check(result->active && !mixer.suppressed(0), "Suppression releases on the first empty tick");
+    for (std::size_t frame = 0; frame < frames; ++frame)
+    {
+        const auto gain = static_cast<float>((frame + 1) / static_cast<double>(frames));
+        check(result->sample(frame) == 0.5f * gain, "The background fades in when the call queue drains");
+    }
+    clock.advance();
+    check(result->sample(0) == 0.5f && result->sample(frames - 1) == 0.5f, "The next block stays at unity");
+}
+
 void device_loss_and_rebind()
 {
     Engine engine(period);
@@ -336,6 +384,7 @@ int main(int argc, char **argv)
     return aereborn::test::run_tests(argc, argv, {{"slow_callback_parallel_archive", slow_callback_parallel_archive},
                                                 {"irregular_push_and_pull", irregular_push_and_pull},
                                                 {"capture_gaps_keep_playback_timeline", capture_gaps_keep_playback_timeline},
+                                                {"priority_mixer_silent_packets", priority_mixer_silent_packets},
                                                 {"device_loss_and_rebind", device_loss_and_rebind},
                                                 {"restart_shared_outputs", restart_shared_outputs}});
 }

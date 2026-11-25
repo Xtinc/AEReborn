@@ -66,7 +66,7 @@ Engine 持有编辑图和渲染计划。`commit()` 按依赖排序，从无输�
 
 `ProcessContext` 提供 `block_period`、`tick_position`、`inputs` 和 `outputs`。`IBBlock` 和 `OBBlock` 分别是只读和可写的 `ByteBlock`，携带缓冲地址、端口规格和本周期实际帧数。`byte_view()` 按原格式借用字节，适用于所有格式。`f32p_view()` 用于 F32P 端口，返回 `FloatBlock` 的只读或可写形式 `IFBlock` / `OFBlock`，声道步长为本周期的实际帧数。`FloatBlock` 也可借用插件工作区的分声道浮点样本，此时声道步长可以大于实际帧数。端口提供的视图只在 `process()` 调用内有效，节点必须写满自己的输出。
 
-`ProcessContext::has_input(port)` 返回该输入在本周期是否需要作为活跃块处理。非活跃块保证以零字节填满，未连接输入和来自暂停节点的输入均为非活跃。源交付的全零样本和 DSP 尾音可以是活跃块。每个周期开始时，引擎将所有输出预设为活跃，因为节点可能在输入为空时继续产生音频。能保证某个输出已填满零字节的节点，可调用 `set_output_active(port, false)` 让下游跳过样本计算。标志视图同样只在本次调用内有效。直接用四个字段构造 `ProcessContext` 时，`has_input()` 返回 true，设置输出标志无效果。
+`ProcessContext::has_input(port)` 返回该输入在本周期是否需要作为活跃块处理。非活跃块保证以零字节填满，未连接输入和来自暂停节点的输入均为非活跃。源交付的全零样本和 DSP 尾音可以是活跃块。引擎在调用节点之前初始化输出标志。无输入端口的源节点默认活跃，其他节点的每个输出默认取所有输入标志的逻辑或。节点在所有输入均非活跃时若仍产生音频，包括有状态 DSP 的尾音，必须调用 `set_output_active(port, true)` 标记相应输出。能保证某个输出已填满零字节的节点，可调用 `set_output_active(port, false)` 让下游跳过样本计算。标志视图只在本次调用内有效。直接用四个字段构造 `ProcessContext` 时，`has_input()` 返回 true，设置输出标志无效果。
 
 Capture 读到至少一帧即标为活跃，短读补零。队列读空表示当前周期缺数据，网络欠载和正常结束都可能出现这一情况。Convert 在 FIR 历史冲刷完毕后才将空输入标为非活跃。Matrix 在淡出之后的稳态零增益块上标记非活跃。Mixer 只累加活跃且未静音的输入。Playback 继续逐拍入队，包括非活跃的静音块，以保持录音和设备输出的时间线。
 
@@ -136,9 +136,11 @@ Engine 停止会等待图处理退出。后端停止时唤醒阻塞的异步 I/O
 
 Mixer 显式求和，Matrix 负责声道映射与增益。两者都只支持 F32P，采样率由构造参数固定，并不要求整张图使用同一采样率。Mixer 每个输入与输出的规格相同；Matrix 的输入、输出声道数可不同，采样率保持一致。
 
-Matrix 的行是目标声道，列是源声道，系数可用于选取、复制、合并和相位反转。全局增益与矩阵在同一遍采样处理中完成，增益在下一个有帧的处理块内线性过渡到目标值。Mixer 对每个输入独立静音，每个有帧的块读取一次设置并跳过已静音的输入。静音、零增益或零系数都跳过源样本，避免未使用的 NaN / Inf 污染输出。
+Matrix 的行是目标声道，列是源声道，系数可用于选取、复制、合并和相位反转。全局增益与矩阵在同一遍采样处理中完成，增益在下一个有帧的处理块内线性过渡到目标值。
 
-总线可以由 Mixer、Matrix 和效果节点组成，不增加核心基类。Voice、Music、Alert 等抑制策略由后续插件产生增益目标，Engine 不识别角色或策略。
+Mixer 支持 1 到 64 路输入，每路默认未静音、为普通优先级。任一未静音的高优先级输入活跃时，普通输入在一个块内淡出至零。全部高优先级输入失去活跃状态或被静音后，普通输入在一个块内恢复至原音量。多路活跃的高优先级输入直接求和。刻意交付的全零音频仍会触发压制。普通输入即使暂时无数据也会跟随当前压制状态，在压制期间恢复供帧时从静音开始。静音、稳态压制和斜坡精确到达零增益时跳过相应源样本。
+
+总线可以由 Mixer、Matrix 和效果节点组成。输入优先级由应用设置，Mixer 根据输入活动标志进行裁决。
 
 ## 7. 时钟运行 API
 
@@ -165,7 +167,7 @@ Tone / BUS（48k F32P）
 | 插件 | 端口 | 配置与职责 |
 | --- | --- | --- |
 | Convert(input_spec, output_spec) | (1,1) | 支持上述全部格式的转换和图内固定比例重采样，两端声道数须相同 |
-| Mixer(rate, channels, inputs) | (N,1) | 相同 F32P 规格显式求和；set_muted(index, bool) 控制单个输入 |
+| Mixer(rate, channels, inputs) | (N,1)，1 ≤ N ≤ 64 | 相同 F32P 规格求和。用 `set_muted(index, bool)` 控制静音，用 `set_high_priority(index, bool)` 设置优先级 |
 | Matrix(rate, input_channels, output_channels, coefficients, gain) | (1,1) | F32P 声道映射与增益；行对应输出、列对应输入，系数固定；set_gain() 更新增益 |
 | Matrix(rate, channels, gain) | (1,1) | 使用恒等声道映射，仅控制增益 |
 | Capture(rate, channels, io_period) | (0,1) | 接收外部写入的 F32P 帧，按 tick 向图交付并补足静音 |
@@ -183,7 +185,7 @@ Tone / BUS（48k F32P）
 - 图编辑修改草稿。`commit()` 准备并提交新计划。停机时立即生效，运行时等待时钟在块边界接管。旧计划由调用线程释放，此时首个新块的处理可能仍在进行。草稿无变动时直接返回，准备失败时保留当前计划。
 - `replace_node()` 要求输入、输出的数量及完整规格相同，布局不同时抛出 `Error(FormatMismatch)`。设备格式变化时重新准备设备侧转换。新包长超出原周期预算时，用同端口规格的新节点替换并提交，保留 NodeId 和图连接。逻辑端口规格变化时修改相应连线。
 - `set_paused()` 通过计划移除或恢复节点及相关连接，未改动实例保留状态。暂停导致某个输入失去来源时，该输入得到静音。需要平滑暂停时，先将 Matrix 增益淡出至零，再提交暂停。
-- `Matrix::set_gain()` 和 `Mixer::set_muted()` 使用原子变量，可与 `process()` 并发调用。处理块读取当前设置。控制侧从 `Engine::node()` 借用草稿节点指针，须在节点被移除或替换前结束使用，最长有效期到 Engine 析构。
+- `Matrix::set_gain()`、`Mixer::set_muted()` 和 `Mixer::set_high_priority()` 可与 `process()` 并发调用。每个有帧的块各读取一次 Mixer 的静音和优先级掩码。可用 `muted()` 和 `high_priority()` 查询设置，用 `suppressed()` 查询最近一个有帧的块中哪些活跃且未静音的输入处于淡出或稳态压制。Mixer 的 `reset()` 清除处理状态和压制报告，保留静音和优先级设置。控制侧从 `Engine::node()` 借用草稿节点指针，须在节点被移除或替换前结束使用，最长有效期到 Engine 析构。
 - 图提交并准备端点后，`ActiveBackend::bind(endpoint)` 协商 PCM 规格和单包预算 `io_period()`，`start()` 在工作线程上初始化。`ActiveBackend` 和 `PassiveBackend` 共用 `Backend` 的端点占用与 PCM 转换，并可通过 `Backend&` 统一启停与查询。端点已经被占用时抛出 `Error(Busy)`。绑定失败释放资源和占用。设备启动失败时先回收工作线程，再向控制调用方抛出设备错误。
 - `PushSource` 绑定 `Capture`，由应用串行执行 `push(IBBlock)`、控制接口、状态查询和析构。可用单消费者指令队列执行这些操作。PCM 缓冲至少保留到 `push()` 返回。同一流的分片按顺序投递，停止接收旧流数据后再执行停机或重启。`push()` 返回本次接收的输入帧数，后续从该偏移续推。队列空位不足时可能返回零，图侧缺帧时补静音。`stop()` 丢弃未消费的帧并复位重采样器。
 - `PullSink` 同样由应用串行调用，`pull(OBBlock)` 读取 `Playback` 中当前可用的 PCM。`UsrPlayback` 由同步播放工作线程消费 `Playback` 队列。分数秒预算在构造 `Playback` 时一次向上取整为微秒，回调使用固定帧数，交付由数据就绪驱动。
@@ -197,7 +199,7 @@ Tone / BUS（48k F32P）
 
 链接 `aereborn::diag` 并包含 `diag/inspect.h`，即可在串行控制侧调用 `dump_text()` 或 `dump_dot()`。两者都支持返回字符串或写入输出流。传入需要一起检查的后端，报告会按端点关联生效节点，并列出未进入生效 Plan 的后端。队列水位为近似值，`underrun` 和 `overflow` 分别累计图侧采集缺帧和播放丢帧。`late` 是时钟跳过的周期数，`tick_us` 是最近一拍含时钟收尾的估计耗时。
 
-用 `dot -Tsvg graph.dot -o graph.svg` 渲染信号流图。卡片标题显示端点状态和后端错误短码，橙色标记预填充、排空、跳拍或队列缺帧。多端口节点按插槽接线，Mixer 的静音端口置灰，对应入边用灰色虚线标识。卡片和连线直接显示关键规格，SVG 悬停可查看完整诊断详情。`io.diagnostic_reports` 检查文本和 DOT 输出，`io.endpoint_diagnostics` 检查端点计数、重启及短批次排空。
+用 `dot -Tsvg graph.dot -o graph.svg` 渲染信号流图。卡片标题显示端点状态和后端错误短码，橙色标记预填充、排空、跳拍或队列缺帧。多端口节点按插槽接线，Mixer 的静音端口和入边置灰。启用优先级时，文本报告显示 `high` 和 `suppressed`，DOT 用 `[HIGH]` 标记高优端口，用 `[SUPP]` 和琥珀色虚线标记被压制的普通端口及其入边。卡片和连线直接显示关键规格，SVG 悬停可查看完整诊断详情。`io.diagnostic_reports` 和 `io.mixer_priority_diagnostics` 检查文本和 DOT 输出，`io.endpoint_diagnostics` 检查端点计数、重启及短批次排空。
 
 ### 构建与验证
 

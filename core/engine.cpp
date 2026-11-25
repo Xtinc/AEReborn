@@ -514,17 +514,23 @@ class Engine::Runner
                     refresh_frames(output);
             }
 
-            // Leave slot zero inactive for all inputs without a source.
-            std::fill(output_active.begin() + 1, output_active.end(), std::uint8_t{1});
             for (const auto &step : steps)
             {
+                std::uint8_t active = step.input_count == 0;
                 for (std::size_t i = step.first_input; i < step.first_input + step.input_count; ++i)
-                    input_active[i] = output_active[input_sources[i]];
+                {
+                    const auto flag = output_active[input_sources[i]];
+                    input_active[i] = flag;
+                    active |= flag;
+                }
 
+                const auto output_flags = port_range(output_active.data() + 1, step.first_output, step.output_count);
+                for (auto &flag : output_flags)
+                    flag = active != 0;
                 step.node->process({period, tick, port_range(inputs.data(), step.first_input, step.input_count),
                                     port_range(outputs.data(), step.first_output, step.output_count),
                                     port_range(input_active.data(), step.first_input, step.input_count),
-                                    port_range(output_active.data() + 1, step.first_output, step.output_count)});
+                                    output_flags});
             }
         }
 

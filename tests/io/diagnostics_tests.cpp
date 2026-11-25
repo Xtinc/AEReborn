@@ -86,6 +86,9 @@ void diagnostic_reports()
     const View<const Backend *const> backends(backend_list.data(), backend_list.size());
     const auto text = dump_text(engine, backends);
     const auto graph = dump_dot(engine, backends);
+    check(text.find("high=") == std::string::npos && text.find("suppressed=") == std::string::npos &&
+              graph.find("[HIGH]") == std::string::npos && graph.find("[SUPP]") == std::string::npos,
+          "A mixer without priorities keeps the ordinary diagnostic format");
     std::ostringstream text_stream, graph_stream;
     dump_text(text_stream, engine, backends);
     dump_dot(graph_stream, engine, backends);
@@ -141,6 +144,59 @@ void diagnostic_reports()
     check(disconnected.uses_resampler(), "The bound asynchronous backend has a prepared FIR resampler");
     disconnected.unbind();
     check(!disconnected.uses_resampler(), "Unbinding clears the prepared resampler");
+}
+
+void mixer_priority_diagnostics()
+{
+    Engine engine(period);
+    ClockedGraph clock(engine);
+    const auto source = engine.emplace_node<FloatSource>(rate, 1, [](std::uint64_t, std::size_t) { return 0.5f; });
+    const auto mixed = engine.emplace_node<Mixer>(rate, 1, 3);
+    const auto single = engine.emplace_node<Mixer>(rate, 1, 1);
+    const auto monitor = engine.emplace_node<Observer>(mono);
+    const auto extra_monitor = engine.emplace_node<Observer>(mono);
+    connect(engine, source, mixed);
+    connect(engine, source, mixed, 1);
+    connect(engine, source, mixed, 2);
+    connect(engine, source, single);
+    connect(engine, mixed, monitor);
+    connect(engine, single, extra_monitor);
+    auto &mixer = *engine.node<Mixer>(mixed);
+    mixer.set_high_priority(1, true);
+    mixer.set_high_priority(2, true);
+    mixer.set_muted(2, true);
+    engine.node<Mixer>(single)->set_high_priority(0, true);
+    engine.commit();
+    clock.start();
+    clock.advance();
+
+    const auto text = dump_text(engine);
+    check(text.find("muted=[0, 0, 1] high=[0, 1, 1] suppressed=[1, 0, 0]") != std::string::npos,
+          "Text reports requested priorities and latest suppression in port order");
+    const auto graph = dump_dot(engine);
+    const auto mixer_edge =
+        "n" + std::to_string(source.value) + ":e -> n" + std::to_string(mixed.value) + ":i";
+    check(graph.find("in0 [SUPP]</FONT>") != std::string::npos &&
+              graph.find("in1 [HIGH]") != std::string::npos && graph.find("in2 [HIGH MUTE]") != std::string::npos,
+          "DOT labels suppressed, high, and muted high inputs");
+    check(graph.find(mixer_edge + "0:w [label=\"48k 1ch F32P (suppressed)\", style=dashed, "
+                                  "color=\"#D97706\", fontcolor=\"#92400E\"") != std::string::npos &&
+              graph.find("48000/1ch/F32P, suppressed)") != std::string::npos &&
+              graph.find(mixer_edge + "2:w [label=\"48k 1ch F32P (muted)\", style=dashed, color=\"#9CA3AF\"") !=
+                  std::string::npos,
+          "DOT gives suppressed and muted connections distinct edge styles and tooltips");
+    const auto single_id = std::to_string(single.value);
+    check(graph.find("in0 [HIGH]") != std::string::npos &&
+              graph.find(" -> n" + single_id + ":i0:w") != std::string::npos &&
+              graph.find("n" + single_id + ":o0:e -> n" + std::to_string(extra_monitor.value) + ":w") !=
+                  std::string::npos,
+          "A single high-priority mixer exposes matching port labels and edge anchors");
+
+    mixer.set_muted(1, true);
+    clock.advance();
+    check(dump_text(engine).find("muted=[0, 1, 1] high=[0, 1, 1] suppressed=[0, 0, 0]") != std::string::npos &&
+              dump_dot(engine).find("[SUPP]") == std::string::npos,
+          "The reports clear suppression when the high-priority inputs are muted");
 }
 
 void endpoint_diagnostics()
@@ -220,5 +276,6 @@ void endpoint_diagnostics()
 int main(int argc, char **argv)
 {
     return aereborn::test::run_tests(argc, argv, {{"diagnostic_reports", diagnostic_reports},
+                                                {"mixer_priority_diagnostics", mixer_priority_diagnostics},
                                                 {"endpoint_diagnostics", endpoint_diagnostics}});
 }
