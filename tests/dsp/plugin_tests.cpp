@@ -89,13 +89,13 @@ void float_channel_bits()
 void matrix_and_mix_contracts()
 {
     const PortSpec mono(rate, 1, SampleFormat::F32P), stereo(rate, 2, SampleFormat::F32P);
-    expect_error(ErrorCode::InvalidArg, [&] { Convert wrong(mono, stereo); });
-    expect_error(ErrorCode::InvalidArg, [] { Matrix wrong(rate, 1, 2, {1}); });
-    expect_error(ErrorCode::InvalidArg, [] { Mixer wrong(rate, 1, 0); });
+    expect_error(RetCode::EPARAM, [&] { Convert wrong(mono, stereo); });
+    expect_error(RetCode::EPARAM, [] { Matrix wrong(rate, 1, 2, {1}); });
+    expect_error(RetCode::EPARAM, [] { Mixer wrong(rate, 1, 0); });
     Matrix gain(rate, 1);
     Mixer mix(rate, 1, 2);
-    expect_error(ErrorCode::InvalidPort, [&] { mix.set_muted(2, true); });
-    expect_error(ErrorCode::InvalidArg, [&] { gain.set_gain(std::numeric_limits<float>::infinity()); });
+    expect_error(RetCode::EPORT, [&] { mix.set_muted(2, true); });
+    expect_error(RetCode::EPARAM, [&] { gain.set_gain(std::numeric_limits<float>::infinity()); });
     gain.prepare(period);
     gain.set_gain(-1);
     const float original[]{1, 1, 1, 1};
@@ -167,13 +167,13 @@ void mixer_priority_limits()
 {
     Mixer mixer(rate, 1, Mixer::max_inputs);
     check(mixer.inputs().size() == 64, "Mixer accepts 64 inputs");
-    expect_error(ErrorCode::TooLarge, [] { Mixer invalid(rate, 1, 65); });
+    expect_error(RetCode::TOOLARGE, [] { Mixer invalid(rate, 1, 65); });
     const auto end = mixer.inputs().size();
-    expect_error(ErrorCode::InvalidPort, [&] { mixer.set_muted(end, true); });
-    expect_error(ErrorCode::InvalidPort, [&] { mixer.muted(end); });
-    expect_error(ErrorCode::InvalidPort, [&] { mixer.set_high_priority(end, true); });
-    expect_error(ErrorCode::InvalidPort, [&] { mixer.high_priority(end); });
-    expect_error(ErrorCode::InvalidPort, [&] { mixer.suppressed(end); });
+    expect_error(RetCode::EPORT, [&] { mixer.set_muted(end, true); });
+    expect_error(RetCode::EPORT, [&] { mixer.muted(end); });
+    expect_error(RetCode::EPORT, [&] { mixer.set_high_priority(end, true); });
+    expect_error(RetCode::EPORT, [&] { mixer.high_priority(end); });
+    expect_error(RetCode::EPORT, [&] { mixer.suppressed(end); });
 
     const auto high = end - 1;
     mixer.set_muted(high, true);
@@ -295,9 +295,9 @@ void mixer_priority_single_frame_and_reset()
     check(!active && mixed[0] == 0.0f, "The mix keeps a whole inactive block zero-filled");
 }
 
-void check_convert_tail(SampleRate from, SampleRate to, std::uint64_t flush_blocks)
+void check_convert_tail(BandWidth from, BandWidth to, std::uint64_t flush_blocks)
 {
-    constexpr auto tick_period = BlockPeriod::Ms02;
+    constexpr auto tick_period = BlockPeriod::INR_02MS;
     const PortSpec input_spec(from, 2, SampleFormat::F32P), output_spec(to, 2, SampleFormat::F32P);
     Convert convert(input_spec, output_spec);
     SincResampler reference;
@@ -332,7 +332,7 @@ void check_convert_tail(SampleRate from, SampleRate to, std::uint64_t flush_bloc
 
     constexpr std::uint64_t resume_tick = 12;
     run_block(0, true, true);
-    expect_error(ErrorCode::InvalidArg, [&] { convert.prepare(static_cast<BlockPeriod>(0)); });
+    expect_error(RetCode::EPARAM, [&] { convert.prepare(static_cast<BlockPeriod>(0)); });
     for (std::uint64_t tick = 1; tick < resume_tick; ++tick)
         run_block(tick, false, tick <= flush_blocks);
     run_block(resume_tick, true, true);
@@ -347,9 +347,9 @@ void check_convert_tail(SampleRate from, SampleRate to, std::uint64_t flush_bloc
 
 void convert_activity_and_tail()
 {
-    check_convert_tail(SampleRate::Hz48000, SampleRate::Hz16000, 1);
-    check_convert_tail(SampleRate::Hz16000, SampleRate::Hz48000, 3);
-    check_convert_tail(SampleRate::Hz11025, SampleRate::Hz44100, 5);
+    check_convert_tail(BandWidth::Full, BandWidth::Wide, 1);
+    check_convert_tail(BandWidth::Wide, BandWidth::Full, 3);
+    check_convert_tail(BandWidth::QuarterCD, BandWidth::CDQuality, 5);
 
     const PortSpec input_spec(rate, 1, SampleFormat::F32P);
     const float zero[2]{};
@@ -378,7 +378,7 @@ void convert_activity_and_tail()
 
 void fractional_rate_and_antialias()
 {
-    for (const auto target : {SampleRate::Hz44100, SampleRate::Hz16000})
+    for (const auto target : {BandWidth::CDQuality, BandWidth::Wide})
     {
         const PortSpec input(rate, 2, SampleFormat::F32P), output(target, 2, SampleFormat::F32P);
         Engine engine(period);

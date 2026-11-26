@@ -8,7 +8,7 @@ namespace aereborn
 PullSink::PullSink(PortSpec output_spec) : output_spec_(output_spec)
 {
     if (!valid_pcm_spec(output_spec_))
-        throw Error(ErrorCode::InvalidArg, "PullSink requires a valid interleaved PCM PortSpec");
+        throw Error(RetCode::EPARAM, "PullSink requires a valid interleaved PCM PortSpec");
 }
 
 void PullSink::bind(Playback &endpoint)
@@ -19,13 +19,13 @@ void PullSink::bind(Playback &endpoint)
 std::size_t PullSink::pull(OBBlock output)
 {
     if (output.spec() != output_spec_)
-        throw Error(ErrorCode::FormatMismatch, "PullSink output spec mismatch");
+        throw Error(RetCode::INVFMT, "PullSink output spec mismatch");
     const auto total_frames = output.frames();
     if (!total_frames)
         return 0;
     auto *bytes = output.byte_view().data();
     if (!bytes)
-        throw Error(ErrorCode::InvalidArg, "PullSink output data is null");
+        throw Error(RetCode::EPARAM, "PullSink output data is null");
     if (!running())
         return 0;
 

@@ -21,7 +21,7 @@ inline void check(bool condition, const char *message)
     }
 }
 
-template <class Fn> void expect_error(ErrorCode expected, Fn &&fn)
+template <class Fn> void expect_error(RetCode::Code expected, Fn &&fn)
 {
     try
     {

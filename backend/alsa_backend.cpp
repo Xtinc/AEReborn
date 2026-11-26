@@ -16,7 +16,7 @@ namespace
 
 RetCode alsa_error(int error) noexcept
 {
-    return error == -ENODEV || error == -ENXIO || error == -ENOENT ? ErrorCode::DeviceLost : ErrorCode::IoFailed;
+    return error == -ENODEV || error == -ENXIO || error == -ENOENT ? RetCode::DEVLOST : RetCode::IOFAILED;
 }
 
 std::string normalize_device_name(std::string card, unsigned int device)
@@ -44,7 +44,7 @@ Result<PortSpec> AlsaBackend::configure_pcm(snd_pcm_t *handle, bool mmap, PortSp
     if (snd_pcm_hw_params_any(handle, hw) < 0 ||
         snd_pcm_hw_params_set_access(handle, hw, access) < 0 ||
         snd_pcm_hw_params_set_channels(handle, hw, static_cast<unsigned>(logical.channels)) < 0)
-        return ErrorCode::FormatMismatch;
+        return RetCode::INVFMT;
 
     const std::pair<snd_pcm_format_t, SampleFormat> formats[] = {
         {SND_PCM_FORMAT_FLOAT_LE, SampleFormat::F32LE}, {SND_PCM_FORMAT_S32_LE, SampleFormat::S32LE},
@@ -58,11 +58,11 @@ Result<PortSpec> AlsaBackend::configure_pcm(snd_pcm_t *handle, bool mmap, PortSp
             break;
         }
 
-    auto hz = static_cast<unsigned>(logical.sample_rate);
-    if (!is_interleaved_pcm(format) || snd_pcm_hw_params_set_rate_near(handle, hw, &hz, nullptr) < 0 ||
-        !is_sample_rate(static_cast<SampleRate>(hz)))
-        return ErrorCode::FormatMismatch;
-    const auto rate = static_cast<SampleRate>(hz);
+    auto hz = static_cast<unsigned>(logical.bandwidth);
+    if (format == SampleFormat::F32P || snd_pcm_hw_params_set_rate_near(handle, hw, &hz, nullptr) < 0 ||
+        !is_bandwidth(static_cast<BandWidth>(hz)))
+        return RetCode::INVFMT;
+    const auto rate = static_cast<BandWidth>(hz);
     const auto budget = frames_in_period(rate, duration);
     if (!budget)
         return budget.ret_code();
@@ -70,7 +70,7 @@ Result<PortSpec> AlsaBackend::configure_pcm(snd_pcm_t *handle, bool mmap, PortSp
     auto period = static_cast<snd_pcm_uframes_t>(budget.value());
     int period_dir = -1;
     if (snd_pcm_hw_params_set_period_size_near(handle, hw, &period, &period_dir) < 0)
-        return ErrorCode::FormatMismatch;
+        return RetCode::INVFMT;
 
     // Keep the period constraints for the buffer-size fallback.
     snd_pcm_hw_params_t *buffer_params;
@@ -80,15 +80,15 @@ Result<PortSpec> AlsaBackend::configure_pcm(snd_pcm_t *handle, bool mmap, PortSp
     if (snd_pcm_hw_params_set_periods_near(handle, hw, &periods, nullptr) < 0)
     {
         if (period > std::numeric_limits<snd_pcm_uframes_t>::max() / 2)
-            return ErrorCode::TooLarge;
+            return RetCode::TOOLARGE;
         auto buffer_frames = 2 * period;
         hw = buffer_params;
         if (snd_pcm_hw_params_set_buffer_size_near(handle, hw, &buffer_frames) < 0)
-            return ErrorCode::FormatMismatch;
+            return RetCode::INVFMT;
     }
     const auto rc = snd_pcm_hw_params(handle, hw);
     if (rc == -EINVAL || rc == -ENOSYS || rc == -EOPNOTSUPP)
-        return ErrorCode::FormatMismatch;
+        return RetCode::INVFMT;
     if (rc < 0)
         return alsa_error(rc);
     set_device_max_frames(std::min<std::size_t>(period, budget.value()));
@@ -98,7 +98,7 @@ Result<PortSpec> AlsaBackend::configure_pcm(snd_pcm_t *handle, bool mmap, PortSp
 Result<PortSpec> AlsaBackend::on_open(bool capture, PortSpec logical, std::chrono::microseconds duration)
 {
     if (logical.channels > std::numeric_limits<unsigned>::max())
-        return ErrorCode::TooLarge;
+        return RetCode::TOOLARGE;
     snd_pcm_t *handle = nullptr;
     const auto rc = snd_pcm_open(&handle, device_.c_str(), capture ? SND_PCM_STREAM_CAPTURE : SND_PCM_STREAM_PLAYBACK,
                                  SND_PCM_NONBLOCK);
@@ -108,7 +108,7 @@ Result<PortSpec> AlsaBackend::on_open(bool capture, PortSpec logical, std::chron
 
     auto mmap = use_mmap_;
     auto spec = configure_pcm(handle, mmap, logical, duration);
-    if (mmap && spec.ret_code() == ErrorCode::FormatMismatch)
+    if (mmap && spec.ret_code() == RetCode::INVFMT)
     {
         mmap = false;
         spec = configure_pcm(handle, mmap, logical, duration);
@@ -120,7 +120,7 @@ Result<PortSpec> AlsaBackend::on_open(bool capture, PortSpec logical, std::chron
     snd_pcm_sw_params_t *sw;
     snd_pcm_sw_params_alloca(&sw);
     if (snd_pcm_sw_params_current(handle, sw) < 0 || snd_pcm_sw_params_set_avail_min(handle, sw, frames) < 0)
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     if (!capture)
     {
         snd_pcm_uframes_t boundary = 0;
@@ -128,20 +128,20 @@ Result<PortSpec> AlsaBackend::on_open(bool capture, PortSpec logical, std::chron
             snd_pcm_sw_params_set_silence_threshold(handle, sw, 0) < 0 ||
             snd_pcm_sw_params_get_boundary(sw, &boundary) < 0 ||
             snd_pcm_sw_params_set_silence_size(handle, sw, boundary) < 0)
-            return ErrorCode::IoFailed;
+            return RetCode::IOFAILED;
     }
     if (snd_pcm_sw_params(handle, sw) < 0)
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
 
     const auto count = snd_pcm_poll_descriptors_count(handle);
     if (count <= 0)
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     std::vector<pollfd> descriptors(static_cast<std::size_t>(count) + 1);
     if (snd_pcm_poll_descriptors(handle, descriptors.data(), count) != count)
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     const auto wake = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (wake < 0)
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
 
     descriptors.back() = {wake, POLLIN, 0};
     poll_ = std::move(descriptors);
@@ -158,7 +158,7 @@ RetCode AlsaBackend::on_start() noexcept
         bytes = ::read(poll_.back().fd, &signal, sizeof(signal));
     while (bytes < 0 && errno == EINTR);
     if (bytes < 0 && errno != EAGAIN)
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     return prepare_stream();
 }
 
@@ -210,7 +210,7 @@ RetCode AlsaBackend::recover(int error) noexcept
             if (resumed >= 0)
                 return {};
             if (resumed == -ENODEV || resumed == -ENXIO)
-                return ErrorCode::DeviceLost;
+                return RetCode::DEVLOST;
             if (resumed != -EAGAIN || attempt == resume_attempts)
                 break;
 
@@ -219,11 +219,11 @@ RetCode AlsaBackend::recover(int error) noexcept
                 rc = ::poll(&cancel, 1, std::min(50, remaining_io_ms()));
             while (rc < 0 && errno == EINTR);
             if (rc < 0)
-                return ErrorCode::IoFailed;
+                return RetCode::IOFAILED;
             if (cancel.revents & POLLIN)
-                return ErrorCode::Cancelled;
+                return RetCode::CANCELLED;
             if (!remaining_io_ms())
-                return ErrorCode::Timeout;
+                return RetCode::TIMEOUT;
         }
     }
     else if (error != -EPIPE)
@@ -237,23 +237,23 @@ RetCode AlsaBackend::wait_ready() noexcept
     {
         const auto timeout = remaining_io_ms();
         if (!timeout)
-            return ErrorCode::Timeout;
+            return RetCode::TIMEOUT;
         const auto rc = ::poll(poll_.data(), poll_.size(), timeout);
         if (!rc)
-            return ErrorCode::Timeout;
+            return RetCode::TIMEOUT;
         if (rc < 0)
         {
             if (errno == EINTR)
                 continue;
-            return ErrorCode::IoFailed;
+            return RetCode::IOFAILED;
         }
         if (poll_.back().revents & POLLIN)
-            return ErrorCode::Cancelled;
+            return RetCode::CANCELLED;
         unsigned short events = 0;
         const auto code = snd_pcm_poll_descriptors_revents(pcm_, poll_.data(), poll_.size() - 1, &events);
         if ((events & (POLLHUP | POLLNVAL)) ||
             ((code < 0 || (events & POLLERR)) && snd_pcm_state(pcm_) == SND_PCM_STATE_DISCONNECTED))
-            return ErrorCode::DeviceLost;
+            return RetCode::DEVLOST;
         if (code < 0)
             return alsa_error(code);
         if (events & (POLLIN | POLLOUT | POLLERR))

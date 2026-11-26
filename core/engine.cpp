@@ -19,14 +19,34 @@ thread_local const Engine *clock_engine = nullptr;
 BlockPeriod checked_period(BlockPeriod period)
 {
     if (!is_block_period(period))
-        throw Error(ErrorCode::InvalidArg);
+        throw Error(RetCode::EPARAM);
     return period;
 }
 
-std::uint64_t next_identifier() noexcept
+void require_base_node_id(NodeId id)
+{
+    if (id.port() != 0)
+        throw Error(RetCode::EPORT);
+}
+
+std::size_t checked_port_index(NodeId port, std::size_t count)
+{
+    const auto index = port.port();
+    if (index >= count)
+        throw Error(RetCode::EPORT);
+    return index;
+}
+
+std::uint64_t next_identifier()
 {
     static std::atomic<std::uint64_t> next{1};
-    return next.fetch_add(1, std::memory_order_relaxed);
+    auto id = next.load(std::memory_order_relaxed);
+    do
+    {
+        if (id > NodeId::max_node)
+            throw Error(RetCode::TOOLARGE);
+    } while (!next.compare_exchange_weak(id, id + 1, std::memory_order_relaxed));
+    return id;
 }
 
 bool same_ports(View<const PortSpec> a, View<const PortSpec> b) noexcept
@@ -50,7 +70,7 @@ struct PoolSize
         const auto units = pool_units_per_channel(spec.format, spec.max_frames(period));
         const auto available = unconnected ? limit - outputs : limit - outputs - silence;
         if (spec.channels > available / units)
-            throw Error(ErrorCode::TooLarge);
+            throw Error(RetCode::TOOLARGE);
         const auto size = spec.channels * units;
         if (unconnected)
             silence = std::max(silence, size);
@@ -84,15 +104,6 @@ struct NodeEntry
         : id(id), node(std::move(instance)), inputs(inputs), outputs(outputs)
     {
     }
-    View<const PortSpec> ports(IPort) const noexcept
-    {
-        return inputs;
-    }
-    View<const PortSpec> ports(OPort) const noexcept
-    {
-        return outputs;
-    }
-
     const NodeId id;
     std::unique_ptr<Node> node;
     const View<const PortSpec> inputs;
@@ -121,18 +132,22 @@ class Engine::Graph
     NodeId add_node(std::unique_ptr<Node> instance)
     {
         if (!instance)
-            throw Error(ErrorCode::InvalidArg);
+            throw Error(RetCode::EPARAM);
         const auto inputs = instance->inputs();
         const auto outputs = instance->outputs();
         if (inputs.empty() && outputs.empty())
-            throw Error(ErrorCode::InvalidArg);
+            throw Error(RetCode::EPARAM);
         for (const auto ports : {inputs, outputs})
+        {
+            if (ports.size() > NodeId::invalid_port)
+                throw Error(RetCode::TOOLARGE);
             for (const auto &port : ports)
                 if (!port.valid())
-                    throw Error(ErrorCode::InvalidArg);
+                    throw Error(RetCode::EPARAM);
+        }
 
-        std::vector<OPort> links(inputs.size());
-        const NodeId id{next_identifier()};
+        std::vector<NodeId> links(inputs.size());
+        const auto id = NodeId::make(next_identifier());
         auto entry = std::make_shared<NodeEntry>(id, std::move(instance), inputs, outputs);
         nodes_.emplace(id, DraftNode{std::move(entry), std::move(links)});
         dirty_ = true;
@@ -143,7 +158,7 @@ class Engine::Graph
     {
         const auto found = find_node(id);
         for (auto it = connections_.begin(); it != connections_.end();)
-            if (it->second.from.node == id || it->second.to.node == id)
+            if (it->second.from.base() == id || it->second.to.base() == id)
                 it = erase_connection(it);
             else
                 ++it;
@@ -155,12 +170,12 @@ class Engine::Graph
     {
         const auto found = find_node(id);
         if (!replacement)
-            throw Error(ErrorCode::InvalidArg);
+            throw Error(RetCode::EPARAM);
         const auto inputs = replacement->inputs();
         const auto outputs = replacement->outputs();
         auto &current = found->second.entry;
         if (!same_ports(current->inputs, inputs) || !same_ports(current->outputs, outputs))
-            throw Error(ErrorCode::FormatMismatch);
+            throw Error(RetCode::INVFMT);
         auto entry = std::make_shared<NodeEntry>(id, std::move(replacement), inputs, outputs);
         dirty_ = true;
         current = std::move(entry);
@@ -179,17 +194,19 @@ class Engine::Graph
         return found->second.entry->node.get();
     }
 
-    ConnId connect(OPort from, IPort to)
+    ConnId connect(NodeId from, NodeId to)
     {
-        const auto &source = port_owner(from);
-        auto &destination = port_owner(to);
-        if (source.entry->outputs[from.index] != destination.entry->inputs[to.index])
-            throw Error(ErrorCode::FormatMismatch);
-        auto &input = destination.inputs[to.index];
-        if (input.node)
-            throw Error(input == from ? ErrorCode::DuplicateConn : ErrorCode::InputBusy);
-        if (would_cycle(from.node, to.node))
-            throw Error(ErrorCode::Cycle);
+        const auto &source = *find_node(from.base())->second.entry;
+        const auto output_index = checked_port_index(from, source.outputs.size());
+        auto &destination = find_node(to.base())->second;
+        const auto input_index = checked_port_index(to, destination.inputs.size());
+        if (source.outputs[output_index] != destination.entry->inputs[input_index])
+            throw Error(RetCode::INVFMT);
+        auto &input = destination.inputs[input_index];
+        if (input)
+            throw Error(input == from ? RetCode::DUPLICATE : RetCode::EINPUTBUSY);
+        if (would_cycle(source.id, destination.entry->id))
+            throw Error(RetCode::CYCLE);
         const ConnId id{next_identifier()};
         connections_.emplace(id, ConnectionPorts{from, to});
         input = from;
@@ -201,7 +218,7 @@ class Engine::Graph
     {
         const auto found = connections_.find(id);
         if (found == connections_.end())
-            throw Error(ErrorCode::UnknownConn);
+            throw Error(RetCode::ECONN);
         erase_connection(found);
         dirty_ = true;
     }
@@ -217,7 +234,7 @@ class Engine::Graph
         for (const auto &item : connections_)
         {
             const auto &connection = item.second;
-            if (node_index.count(connection.from.node) && node_index.count(connection.to.node))
+            if (node_index.count(connection.from.base()) && node_index.count(connection.to.base()))
                 topology.connections.push_back({item.first, connection.from, connection.to});
         }
         return topology;
@@ -249,13 +266,13 @@ class Engine::Graph
     struct DraftNode
     {
         std::shared_ptr<NodeEntry> entry;
-        std::vector<OPort> inputs;
+        std::vector<NodeId> inputs;
         bool paused = false;
     };
     struct ConnectionPorts
     {
-        OPort from;
-        IPort to;
+        NodeId from;
+        NodeId to;
     };
     using Nodes = std::map<NodeId, DraftNode>;
     using Connections = std::map<ConnId, ConnectionPorts>;
@@ -264,17 +281,8 @@ class Engine::Graph
     {
         const auto found = nodes_.find(id);
         if (found == nodes_.end())
-            throw Error(ErrorCode::UnknownNode);
+            throw Error(RetCode::ENODE);
         return found;
-    }
-
-    template <class Port> DraftNode &port_owner(Port port)
-    {
-        const auto found = find_node(port.node);
-        const auto ports = found->second.entry->ports(port);
-        if (port.index >= ports.size())
-            throw Error(ErrorCode::InvalidPort);
-        return found->second;
     }
 
     bool would_cycle(NodeId from, NodeId to) const
@@ -288,8 +296,11 @@ class Engine::Graph
             if (id == to)
                 return true;
             for (const auto input : nodes_.find(id)->second.inputs)
-                if (input.node && visited.insert(input.node).second)
-                    stack.push_back(input.node);
+            {
+                const auto upstream = input.base();
+                if (upstream && visited.insert(upstream).second)
+                    stack.push_back(upstream);
+            }
         }
 
         return false;
@@ -298,7 +309,7 @@ class Engine::Graph
     Connections::iterator erase_connection(Connections::iterator connection) noexcept
     {
         const auto to = connection->second.to;
-        nodes_.find(to.node)->second.inputs[to.index] = {};
+        nodes_.find(to.base())->second.inputs[to.port()] = {};
         return connections_.erase(connection);
     }
 
@@ -308,9 +319,9 @@ class Engine::Graph
             return;
 
         for (const auto input : draft.inputs)
-            if (input.node)
+            if (input)
             {
-                const auto &source = nodes_.find(input.node)->second;
+                const auto &source = nodes_.find(input.base())->second;
                 if (!source.paused)
                     visit(source, topology, node_index);
             }
@@ -321,8 +332,8 @@ class Engine::Graph
         // An absent source is unconnected or was excluded by pause.
         for (const auto input : draft.inputs)
         {
-            const auto source = input.node ? node_index.find(input.node) : node_index.end();
-            topology.links.push_back(source == node_index.end() ? Link{} : Link{source->second, input.index});
+            const auto source = input ? node_index.find(input.base()) : node_index.end();
+            topology.links.push_back(source == node_index.end() ? Link{} : Link{source->second, input.port()});
         }
     }
 
@@ -452,7 +463,7 @@ class Engine::Runner
             for (const auto &entry : current_->owners)
                 if (entry->id == id)
                     return entry->node.get();
-        throw Error(ErrorCode::UnknownNode);
+        throw Error(RetCode::ENODE);
     }
 
     /// @brief Reset nodes held by the current plan after removal or replacement in the draft.
@@ -559,10 +570,10 @@ class Engine::Runner
     {
         const auto period_ms = static_cast<std::uint32_t>(period);
         const auto fractional = [period_ms](PortSpec spec) {
-            return (static_cast<std::uint32_t>(spec.sample_rate) * period_ms) % 1000 != 0;
+            return (static_cast<std::uint32_t>(spec.bandwidth) * period_ms) % 1000 != 0;
         };
         if (topology.nodes.size() > plan.steps.max_size())
-            throw Error(ErrorCode::TooLarge);
+            throw Error(RetCode::TOOLARGE);
         const auto max_inputs = std::min({plan.inputs.max_size(), plan.input_active.max_size(),
                                           plan.input_sources.max_size()});
         const auto max_outputs = std::min(plan.outputs.max_size(), plan.output_active.max_size() - 1);
@@ -572,7 +583,7 @@ class Engine::Runner
             const auto inputs = entry->inputs;
             const auto outputs = entry->outputs;
             if (inputs.size() > max_inputs - layout.input_count || outputs.size() > max_outputs - layout.output_count)
-                throw Error(ErrorCode::TooLarge);
+                throw Error(RetCode::TOOLARGE);
             plan.steps.push_back(
                 {entry->node.get(), layout.input_count, inputs.size(), layout.output_count, outputs.size()});
 
@@ -661,7 +672,7 @@ Engine::~Engine() = default;
 void Engine::require_control_thread() const
 {
     if (clock_engine == this)
-        throw Error(ErrorCode::Busy);
+        throw Error(RetCode::BUSY);
 }
 
 bool Engine::tick() noexcept
@@ -686,28 +697,32 @@ NodeId Engine::insert_node(std::unique_ptr<Node> instance)
 void Engine::remove_node(NodeId id)
 {
     require_control_thread();
+    require_base_node_id(id);
     graph_->remove_node(id);
 }
 
 void Engine::replace_node(NodeId id, std::unique_ptr<Node> replacement)
 {
     require_control_thread();
+    require_base_node_id(id);
     graph_->replace_node(id, std::move(replacement));
 }
 
 void Engine::set_paused(NodeId id, bool paused)
 {
     require_control_thread();
+    require_base_node_id(id);
     graph_->set_paused(id, paused);
 }
 
 Node *Engine::node(NodeId id)
 {
     require_control_thread();
+    require_base_node_id(id);
     return graph_->node(id);
 }
 
-ConnId Engine::connect(OPort from, IPort to)
+ConnId Engine::connect(NodeId from, NodeId to)
 {
     require_control_thread();
     return graph_->connect(from, to);
@@ -736,9 +751,9 @@ void Engine::start()
 {
     require_control_thread();
     if (state_ == State::Running)
-        throw Error(ErrorCode::Busy);
+        throw Error(RetCode::BUSY);
     if (state_ == State::Unprepared)
-        throw Error(ErrorCode::NotReady);
+        throw Error(RetCode::ESTATE);
     clock_->start(*this);
     state_ = State::Running;
 }
@@ -757,7 +772,7 @@ void Engine::reset()
 {
     require_control_thread();
     if (state_ == State::Running)
-        throw Error(ErrorCode::Busy);
+        throw Error(RetCode::BUSY);
     runner_->reset(*graph_);
     graph_->reset_nodes();
     position_.store(0, std::memory_order_release);
@@ -798,6 +813,7 @@ View<const Connection> Engine::plan_connections() const
 const Node *Engine::plan_node(NodeId node_id) const
 {
     require_control_thread();
+    require_base_node_id(node_id);
     return runner_->node(node_id);
 }
 

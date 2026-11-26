@@ -3,12 +3,12 @@
 #include <cstring>
 namespace aereborn
 {
-Tone::Tone(SampleRate rate, std::size_t channels, double frequency, float amplitude)
+Tone::Tone(BandWidth rate, std::size_t channels, double frequency, float amplitude)
     : NodeT({}, {PortSpec(rate, channels, SampleFormat::F32P)}), frequency_(frequency), amplitude_(amplitude)
 {
     if (!outputs()[0].valid() || !(frequency >= 0 && frequency < static_cast<std::uint32_t>(rate) / 2.0) ||
         !std::isfinite(amplitude))
-        throw Error(ErrorCode::InvalidArg, "Invalid tone specification");
+        throw Error(RetCode::EPARAM, "Invalid tone specification");
 }
 void Tone::process(const ProcessContext &context) noexcept
 {
@@ -17,7 +17,7 @@ void Tone::process(const ProcessContext &context) noexcept
     if (frames == 0)
         return;
     const auto spec = outputs()[0];
-    const auto step = 6.28318530717958647692 * frequency_ / static_cast<std::uint32_t>(spec.sample_rate);
+    const auto step = 6.28318530717958647692 * frequency_ / static_cast<std::uint32_t>(spec.bandwidth);
     const auto start = spec.frame_position(context.block_period, context.tick_position);
     const auto phase = std::fmod(static_cast<double>(start) * step, 6.28318530717958647692);
     auto *first = output.channel(0);

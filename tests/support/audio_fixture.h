@@ -13,15 +13,15 @@ namespace aereborn
 {
 namespace test
 {
-constexpr auto rate = SampleRate::Hz48000;
-constexpr auto period = BlockPeriod::Ms05;
+constexpr auto rate = BandWidth::Full;
+constexpr auto period = BlockPeriod::INR_05MS;
 constexpr double two_pi = 6.28318530717958647692;
 
 class FloatSource : public NodeT<0, 1>
 {
   public:
     using Generator = std::function<float(std::uint64_t, std::size_t)>;
-    FloatSource(SampleRate rate, std::size_t channels, Generator generate)
+    FloatSource(BandWidth rate, std::size_t channels, Generator generate)
         : NodeT({}, {PortSpec(rate, channels, SampleFormat::F32P)}), generate_(std::move(generate))
     {
     }
@@ -72,7 +72,7 @@ class PacketSink final : public NodeT<1, 0>
 
 inline ConnId connect(Engine &engine, NodeId from, NodeId to, std::size_t input = 0)
 {
-    return engine.connect(OPORT(from, 0), IPORT(to, input));
+    return engine.connect(from, to[input]);
 }
 } // namespace test
 } // namespace aereborn

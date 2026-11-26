@@ -97,7 +97,7 @@ void alsa_duplex(bool prefer_mmap)
         check(QueueState::primed(source) && source.running() && sink.running(), "Both ALSA streams reach steady state");
         source.unbind();
         sink.unbind();
-        check(source.last_error() == ErrorCode::Ok && sink.last_error() == ErrorCode::Ok, "Both ALSA streams cancel cleanly");
+        check(source.last_error() == RetCode::OK && sink.last_error() == RetCode::OK, "Both ALSA streams cancel cleanly");
         graph.reset();
     }
 }
@@ -204,7 +204,7 @@ void wasapi_device(bool input, const std::wstring &id)
     wait_for([&] { return QueueState::primed(backend); }, "The configured WASAPI device exchanges graph frames");
     check(backend.running(), "WASAPI stays online during graph processing");
     backend.stop();
-    check(backend.last_error() == ErrorCode::Ok, "WASAPI cancellation stops the device cleanly");
+    check(backend.last_error() == RetCode::OK, "WASAPI cancellation stops the device cleanly");
 }
 #endif
 } // namespace

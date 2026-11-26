@@ -11,12 +11,6 @@ namespace aereborn
 
 constexpr std::uint64_t max_clock_drift_ppm = 2000;
 
-/// @brief Check whether format is a supported interleaved little-endian PCM format.
-constexpr bool is_interleaved_pcm(SampleFormat format) noexcept
-{
-    return format != SampleFormat::F32P && sample_bytes(format) != 0;
-}
-
 /// @brief Decode interleaved PCM frames into planar F32P samples.
 /// @pre is_interleaved_pcm(input.spec().format), matching channels and frames, non-overlapping buffers.
 void decode_pcm(IBBlock input, OFBlock output) noexcept;
@@ -37,7 +31,7 @@ class SincResampler
 
     /// @brief Prepare filter kernel and history for channels, rates, and rate offset in [0, 0.5).
     /// @note Replaces filter storage and resets state on success; failure preserves previous state.
-    void prepare(std::size_t channels, SampleRate src_fs, SampleRate dst_fs, double max_rate_offset = 0.0);
+    void prepare(std::size_t channels, BandWidth src_fs, BandWidth dst_fs, double max_rate_offset = 0.0);
 
     /// @brief Zero input frames sufficient to flush the FIR history at end of stream.
     std::size_t tail_frames() const noexcept;
@@ -64,12 +58,12 @@ class SincResampler
     Transfer process(IFBlock input, OFBlock output, double rate_scale = 1.0) noexcept;
 
     /// @brief Bound streaming output for the given input batch and rate offset.
-    /// @throws Error InvalidArg for invalid rates or offset, or TooLarge for an unsupported frame count.
-    static std::size_t max_output_frames(SampleRate src_fs, SampleRate dst_fs, std::size_t input_frames,
+    /// @throws Error RetCode::EPARAM for invalid rates or offset, or RetCode::TOOLARGE for an unsupported frame count.
+    static std::size_t max_output_frames(BandWidth src_fs, BandWidth dst_fs, std::size_t input_frames,
                                          double max_rate_offset = 0.0);
     /// @brief Bound streaming input for the given output batch and rate offset.
-    /// @throws Error InvalidArg for invalid rates or offset, or TooLarge for an unsupported frame count.
-    static std::size_t max_input_frames(SampleRate src_fs, SampleRate dst_fs, std::size_t output_frames,
+    /// @throws Error RetCode::EPARAM for invalid rates or offset, or RetCode::TOOLARGE for an unsupported frame count.
+    static std::size_t max_input_frames(BandWidth src_fs, BandWidth dst_fs, std::size_t output_frames,
                                         double max_rate_offset = 0.0);
 
   private:
@@ -85,8 +79,8 @@ class SincResampler
 
     bool need_fir_ = false;
     std::size_t channels_ = 0;
-    SampleRate src_fs_{};
-    SampleRate dst_fs_{};
+    BandWidth src_fs_{};
+    BandWidth dst_fs_{};
     double nominal_ = 0.0;
     double max_rate_offset_ = 0.0;
     Position position_;

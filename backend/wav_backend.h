@@ -8,7 +8,7 @@
 namespace aereborn
 {
 
-/// @brief Graph-clocked RIFF/WAVE source. Reports EndOfStream when all passes have been read.
+/// @brief Graph-clocked RIFF/WAVE source. Reports RetCode::EOS when all passes have been read.
 /// @note Unsigned 8-bit PCM and 64-bit float files are exposed as F32LE.
 /// @note Restart resumes at the next file frame to read. Rebinding opens the file from the beginning.
 class WavCapture final : public ActiveBackend

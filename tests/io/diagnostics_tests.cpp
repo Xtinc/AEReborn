@@ -35,7 +35,7 @@ void diagnostic_reports()
               dump_dot(engine).find(">UNPREPARED<") != std::string::npos,
           "Diagnostics work before the initial commit");
     const PortSpec stereo_pcm(rate, 2, SampleFormat::F32LE);
-    const PortSpec converted(SampleRate::Hz16000, 1, SampleFormat::S16LE);
+    const PortSpec converted(BandWidth::Wide, 1, SampleFormat::S16LE);
     const auto capture = engine.emplace_node<Capture>(rate, 2, 5ms);
     const auto muted_capture = engine.emplace_node<Capture>(rate, 2, 5ms);
     const auto mixer = engine.emplace_node<Mixer>(rate, 2, 2);
@@ -55,7 +55,7 @@ void diagnostic_reports()
     engine.commit();
 
     PushSource source(stereo_pcm);
-    PullSink sink({SampleRate::Hz44100, 1, SampleFormat::F32LE});
+    PullSink sink({BandWidth::CDQuality, 1, SampleFormat::F32LE});
     TestBackend failed_source(stereo_pcm, 240);
     TestBackend disconnected(pcm, 240);
     source.bind(*engine.node<Capture>(capture));
@@ -66,18 +66,18 @@ void diagnostic_reports()
     for (int block = 0; block < 3; ++block)
         check(source.push({silence, stereo_pcm, 240}) == 240, "The report fixture has a partially filled capture queue");
     failed_source.bind(*engine.node<Capture>(muted_capture));
-    failed_source.io_result = ErrorCode::EndOfStream;
+    failed_source.io_result = RetCode::EOS;
     failed_source.start();
     wait_for([&] { return !failed_source.running(); }, "The capture backend reaches the end of stream");
     disconnected.bind(*engine.node<Playback>(detached));
-    disconnected.io_result = ErrorCode::DeviceLost;
+    disconnected.io_result = RetCode::DEVLOST;
     disconnected.start();
     wait_for([&] { return !disconnected.running(); }, "The worker reports the device failure");
 
     engine.set_paused(detached, true);
     engine.commit();
     engine.set_paused(muted_capture, true);
-    expect_error(ErrorCode::UnknownNode, [&] { engine.plan_node(detached); });
+    expect_error(RetCode::ENODE, [&] { engine.plan_node(detached); });
     const auto nodes = engine.plan_nodes();
     check(nodes.size() == 7 && nodes[0] == capture && nodes[1] == muted_capture && nodes[2] == mixer &&
               nodes[3] == matrix && nodes[4] == convert && nodes[5] == observer && nodes[6] == playback,
@@ -101,15 +101,15 @@ void diagnostic_reports()
           "Text reports the port formats, DSP settings, connections, and attached backends");
     const auto detached_section = text.find("Detached Backends:\n");
     check(detached_section != std::string::npos &&
-              text.find(RetCode(ErrorCode::DeviceLost).message(), detached_section) != std::string::npos &&
+              text.find(RetCode(RetCode::DEVLOST).what(), detached_section) != std::string::npos &&
               text.find("#" + std::to_string(pruned.value) + ": ") == std::string::npos,
           "A stopped backend and its error remain visible after its connection is pruned");
 
-    const auto capture_id = std::to_string(capture.value);
-    const auto muted_id = std::to_string(muted_capture.value);
-    const auto mixer_id = std::to_string(mixer.value);
-    const auto matrix_id = std::to_string(matrix.value);
-    const auto playback_id = std::to_string(playback.value);
+    const auto capture_id = std::to_string(capture.node());
+    const auto muted_id = std::to_string(muted_capture.node());
+    const auto mixer_id = std::to_string(mixer.node());
+    const auto matrix_id = std::to_string(matrix.node());
+    const auto playback_id = std::to_string(playback.node());
     check(graph.find("digraph AEReborn") == 0 && graph.find("shape=plain") != std::string::npos &&
               graph.find("STYLE=\"ROUNDED\" BGCOLOR=\"#DFF4F0\" COLOR=\"#2E8B7D\"><TR><TD ALIGN=\"LEFT\">")
                   != std::string::npos &&
@@ -132,9 +132,9 @@ void diagnostic_reports()
               graph.find("n" + playback_id + ":e -> b" + playback_id + ":w [style=dashed, color=\"#64748B\", label=\"FIR\"")
                   != std::string::npos &&
               graph.find("tooltip=\"" + input_label + "[" + capture_id + "]:0") != std::string::npos &&
-              graph.find("cluster_detached") != std::string::npos && graph.find("ERR: DeviceLost") != std::string::npos &&
-              graph.find("ERR: EndOfStream") != std::string::npos &&
-              graph.find(RetCode(ErrorCode::DeviceLost).message()) != std::string::npos,
+              graph.find("cluster_detached") != std::string::npos && graph.find("ERR: DEVLOST") != std::string::npos &&
+              graph.find("ERR: EOS") != std::string::npos &&
+              graph.find(RetCode(RetCode::DEVLOST).what()) != std::string::npos,
           "DOT labels backend modes and error codes and retains detailed tooltips for edges and failures");
 
     engine.node<Matrix>(matrix)->set_gain(0.0f);
@@ -175,7 +175,7 @@ void mixer_priority_diagnostics()
           "Text reports requested priorities and latest suppression in port order");
     const auto graph = dump_dot(engine);
     const auto mixer_edge =
-        "n" + std::to_string(source.value) + ":e -> n" + std::to_string(mixed.value) + ":i";
+        "n" + std::to_string(source.node()) + ":e -> n" + std::to_string(mixed.node()) + ":i";
     check(graph.find("in0 [SUPP]</FONT>") != std::string::npos &&
               graph.find("in1 [HIGH]") != std::string::npos && graph.find("in2 [HIGH MUTE]") != std::string::npos,
           "DOT labels suppressed, high, and muted high inputs");
@@ -185,10 +185,10 @@ void mixer_priority_diagnostics()
               graph.find(mixer_edge + "2:w [label=\"48k 1ch F32P (muted)\", style=dashed, color=\"#9CA3AF\"") !=
                   std::string::npos,
           "DOT gives suppressed and muted connections distinct edge styles and tooltips");
-    const auto single_id = std::to_string(single.value);
+    const auto single_id = std::to_string(single.node());
     check(graph.find("in0 [HIGH]") != std::string::npos &&
               graph.find(" -> n" + single_id + ":i0:w") != std::string::npos &&
-              graph.find("n" + single_id + ":o0:e -> n" + std::to_string(extra_monitor.value) + ":w") !=
+              graph.find("n" + single_id + ":o0:e -> n" + std::to_string(extra_monitor.node()) + ":w") !=
                   std::string::npos,
           "A single high-priority mixer exposes matching port labels and edge anchors");
 
@@ -268,7 +268,7 @@ void endpoint_diagnostics()
           "Synchronous playback has one short batch below the prefill watermark");
     worker.stop();
     clock.stop();
-    check(drained == frames_per_tick && !playback.steady() && worker.last_error() == ErrorCode::Ok,
+    check(drained == frames_per_tick && !playback.steady() && worker.last_error() == RetCode::OK,
           "Synchronous playback drains the short batch before resetting prefill");
 }
 } // namespace

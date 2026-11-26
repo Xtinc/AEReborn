@@ -15,7 +15,7 @@ class PushSource final : public PassiveBackend
     /// @copydoc Backend::type_name
     const char *type_name() const noexcept override { return "PushSource"; }
 
-    /// @throws Error InvalidArg if input_spec is invalid or is not interleaved PCM.
+    /// @throws Error RetCode::EPARAM if input_spec is invalid or is not interleaved PCM.
     explicit PushSource(PortSpec input_spec);
     /// @brief Prepare DSP buffers and bind to a prepared Capture node.
     /// @throws Error If already bound, the endpoint is unprepared or occupied, or format validation fails.
@@ -25,7 +25,7 @@ class PushSource final : public PassiveBackend
     /// @param input Borrowed PCM storage, valid until the call returns.
     /// @return Input frames accepted. Resume a short write at this frame offset. Zero means no frames were accepted,
     ///         including when stopped or when the queue has less space than the FIR output bound.
-    /// @throws Error FormatMismatch for a different PortSpec, or InvalidArg for nonzero frames with a null pointer.
+    /// @throws Error RetCode::INVFMT for a different PortSpec, or RetCode::EPARAM for nonzero frames with a null pointer.
     std::size_t push(IBBlock input);
 
   private:

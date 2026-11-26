@@ -8,7 +8,7 @@ namespace aereborn
 PushSource::PushSource(PortSpec input_spec) : input_spec_(input_spec)
 {
     if (!valid_pcm_spec(input_spec_))
-        throw Error(ErrorCode::InvalidArg, "PushSource requires a valid interleaved PCM PortSpec");
+        throw Error(RetCode::EPARAM, "PushSource requires a valid interleaved PCM PortSpec");
 }
 
 void PushSource::bind(Capture &endpoint)
@@ -19,13 +19,13 @@ void PushSource::bind(Capture &endpoint)
 std::size_t PushSource::push(IBBlock input)
 {
     if (input.spec() != input_spec_)
-        throw Error(ErrorCode::FormatMismatch, "PushSource input spec mismatch");
+        throw Error(RetCode::INVFMT, "PushSource input spec mismatch");
     const auto total_frames = input.frames();
     if (!total_frames)
         return 0;
     const auto *bytes = input.byte_view().data();
     if (!bytes)
-        throw Error(ErrorCode::InvalidArg, "PushSource input data is null");
+        throw Error(RetCode::EPARAM, "PushSource input data is null");
     if (!running())
         return 0;
 

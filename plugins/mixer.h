@@ -21,9 +21,9 @@ class Mixer final : public Node
     /// @param rate Sample rate of every port.
     /// @param channels Channel count of every port.
     /// @param inputs Number of input ports in [1, max_inputs].
-    /// @throws Error InvalidArg If the port specification is invalid or inputs is zero.
-    /// @throws Error TooLarge if inputs exceeds max_inputs.
-    Mixer(SampleRate rate, std::size_t channels, std::size_t inputs);
+    /// @throws Error RetCode::EPARAM If the port specification is invalid or inputs is zero.
+    /// @throws Error RetCode::TOOLARGE if inputs exceeds max_inputs.
+    Mixer(BandWidth rate, std::size_t channels, std::size_t inputs);
 
     /// @copydoc Node::inputs
     /// @note The view borrows port specifications from this mixer and remains valid until destruction.
@@ -35,35 +35,35 @@ class Mixer final : public Node
     /// @brief Set whether one input is muted.
     /// @param input Zero-based input port index.
     /// @param muted True to mute the input, false to unmute it.
-    /// @throws Error InvalidPort if the index is out of range.
+    /// @throws Error RetCode::EPORT if the index is out of range.
     /// @note Safe to call concurrently with process(). Each nonempty block reads one mute mask.
     void set_muted(std::size_t input, bool muted);
 
     /// @brief Read the requested mute state of one input.
     /// @param input Zero-based input port index.
     /// @return The mute value.
-    /// @throws Error InvalidPort if the index is out of range.
+    /// @throws Error RetCode::EPORT if the index is out of range.
     /// @note Safe to call concurrently with set_muted() and process().
     bool muted(std::size_t input) const;
 
     /// @brief Set whether an input has high priority.
     /// @param input Zero-based input port index.
     /// @param high True for high priority, false for normal priority.
-    /// @throws Error InvalidPort if the index is out of range.
+    /// @throws Error RetCode::EPORT if the index is out of range.
     /// @note Safe to call concurrently with process(). High-priority inputs mix together.
     void set_high_priority(std::size_t input, bool high);
 
     /// @brief Read the requested priority of an input.
     /// @param input Zero-based input port index.
     /// @return True if the input has high priority.
-    /// @throws Error InvalidPort if the index is out of range.
+    /// @throws Error RetCode::EPORT if the index is out of range.
     /// @note Safe to call concurrently with set_high_priority() and process().
     bool high_priority(std::size_t input) const;
 
     /// @brief Report whether an active, unmuted input was suppressed in the latest nonempty block.
     /// @param input Zero-based input port index.
     /// @return True during the fade-out and steady suppression blocks.
-    /// @throws Error InvalidPort if the index is out of range.
+    /// @throws Error RetCode::EPORT if the index is out of range.
     /// @note Safe to call concurrently with process().
     bool suppressed(std::size_t input) const;
 

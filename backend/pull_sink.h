@@ -14,7 +14,7 @@ class PullSink final : public PassiveBackend
     /// @copydoc Backend::type_name
     const char *type_name() const noexcept override { return "PullSink"; }
 
-    /// @throws Error InvalidArg if output_spec is invalid or is not interleaved PCM.
+    /// @throws Error RetCode::EPARAM if output_spec is invalid or is not interleaved PCM.
     explicit PullSink(PortSpec output_spec);
 
     /// @brief Bind to a prepared Playback endpoint and allocate conversion buffers.
@@ -23,7 +23,7 @@ class PullSink final : public PassiveBackend
     /// @brief Pull available PCM without waiting for the graph to fill the queue.
     /// @param output Borrowed writable PCM storage, valid until the call returns.
     /// @return Output frames written. The unwritten suffix is left intact.
-    /// @throws Error FormatMismatch for a different PortSpec, or InvalidArg for a nonempty null buffer.
+    /// @throws Error RetCode::INVFMT for a different PortSpec, or RetCode::EPARAM for a nonempty null buffer.
     std::size_t pull(OBBlock output);
 
   private:

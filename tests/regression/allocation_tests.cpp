@@ -74,7 +74,7 @@ template <class Operation> bool allocation_fails(int countdown, Operation operat
 
 void commit_allocation_rollback()
 {
-    const PortSpec output(SampleRate::Hz16000, 1, SampleFormat::F32P);
+    const PortSpec output(BandWidth::Wide, 1, SampleFormat::F32P);
     for (int at = 0; at < 128; ++at)
     {
         Engine engine(period);
@@ -131,7 +131,7 @@ void check_binding_rollback(Driver &driver, Endpoint &endpoint, NullBackend &rep
 
 void backend_allocation_rollback()
 {
-    const PortSpec device(SampleRate::Hz16000, 1, SampleFormat::S16LE);
+    const PortSpec device(BandWidth::Wide, 1, SampleFormat::S16LE);
     Capture capture(rate, 1, 5ms);
     Playback playback(rate, 1, 5ms);
     capture.prepare(period);
@@ -175,7 +175,7 @@ class MeasureRender final : public NodeT<1, 0>
 
 void render_and_passive_io_without_heap()
 {
-    const auto source_rate = SampleRate::Hz44100;
+    const auto source_rate = BandWidth::CDQuality;
     const PortSpec source_spec(source_rate, 1, SampleFormat::F32LE);
     Engine engine(period);
     ClockedGraph clock(engine);
@@ -263,7 +263,7 @@ void active_workers_without_heap()
         }
         source.stop();
         sink.stop();
-        check(source.last_error() == ErrorCode::Ok && sink.last_error() == ErrorCode::Ok,
+        check(source.last_error() == RetCode::OK && sink.last_error() == RetCode::OK,
               "Both workers stop after steady transfers");
     }
     check(heap::worker_operations.load() == 0, "The restarted workers use the prepared endpoint buffers");

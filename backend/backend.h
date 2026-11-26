@@ -59,7 +59,7 @@ class Backend
     void claim(Capture &endpoint);
     void claim(Playback &endpoint);
     // The adapter has validated the device rate, channels, and batch size.
-    void prepare(PortSpec logical, SampleRate device_rate, double max_rate_offset);
+    void prepare(PortSpec logical, BandWidth device_rate, double max_rate_offset);
     // Publish only after the adapter has prepared all of its resources.
     void complete_binding(PortSpec device) noexcept { device_spec_ = device; }
 
@@ -95,11 +95,7 @@ class Backend
     std::size_t read_playback(OFBlock output) noexcept;
     OBBlock encode_from_playback(IFBlock input, OBBlock output, double scale) noexcept;
 
-    static constexpr bool valid_pcm_spec(PortSpec spec) noexcept
-    {
-        return is_sample_rate(spec.sample_rate) && spec.channels && is_interleaved_pcm(spec.format);
-    }
-    static Result<std::size_t> frames_in_period(SampleRate rate, std::chrono::microseconds period) noexcept;
+    static Result<std::size_t> frames_in_period(BandWidth rate, std::chrono::microseconds period) noexcept;
     static void validate_channels(std::size_t logical_channels, std::size_t device_channels);
 
   private:
@@ -137,10 +133,10 @@ class PassiveBackend : public Backend
 
         // Bound scratch size and the queue threshold for large endpoints.
         const auto period = std::min(endpoint_period(), std::chrono::microseconds(10000));
-        set_device_max_frames(frames_in_period(device.sample_rate, period).value_or_throw());
+        set_device_max_frames(frames_in_period(device.bandwidth, period).value_or_throw());
         const auto logical = endpoint.spec();
         validate_channels(logical.channels, device.channels);
-        prepare(logical, device.sample_rate, 0.0);
+        prepare(logical, device.bandwidth, 0.0);
         complete_binding(device);
         rollback.dismiss();
     }
@@ -214,7 +210,7 @@ class ActiveBackend : public Backend
     /// @brief Stop the stream and release worker resources after a successful on_start().
     virtual void on_stop() noexcept {}
 
-    /// @brief Wake blocked I/O hooks promptly so they return Cancelled. Idempotent and non-blocking.
+    /// @brief Wake blocked I/O hooks promptly so they return RetCode::CANCELLED. Idempotent and non-blocking.
     /// @note Called only from control-side stop() while bound; must remain safe until on_close().
     virtual void on_cancel() noexcept {}
 
@@ -244,7 +240,7 @@ class ActiveBackend : public Backend
         double scale() const noexcept { return 1.0 + correction.load(std::memory_order_relaxed); }
         void reset() noexcept;
         void update(std::size_t queued_before, std::size_t queued_after, std::size_t target_frames,
-                    SampleRate logical_rate, std::size_t device_frames, SampleRate device_rate) noexcept;
+                    BandWidth logical_rate, std::size_t device_frames, BandWidth device_rate) noexcept;
     };
 
     template <class Endpoint> void bind_endpoint(Endpoint &endpoint);

@@ -1,8 +1,8 @@
 #ifndef AEREBORN_BACKEND_WASAPI_BACKEND_H
 #define AEREBORN_BACKEND_WASAPI_BACKEND_H
 
+#include "audio_types.h"
 #include "backend.h"
-#include "core/os.h"
 
 #if WINDOWS_OS_ENVIRONMENT
 #include <array>

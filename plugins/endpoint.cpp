@@ -11,11 +11,11 @@ namespace
 constexpr unsigned graph_open = 1u;
 constexpr unsigned graph_active = 2u;
 
-PortSpec endpoint_spec(SampleRate rate, std::size_t channels, std::chrono::microseconds io_period)
+PortSpec endpoint_spec(BandWidth rate, std::size_t channels, std::chrono::microseconds io_period)
 {
     const PortSpec spec(rate, channels, SampleFormat::F32P);
     if (!spec.valid() || io_period.count() <= 0)
-        throw Error(ErrorCode::InvalidArg, "Invalid endpoint port or I/O period");
+        throw Error(RetCode::EPARAM, "Invalid endpoint port or I/O period");
     return spec;
 }
 
@@ -23,23 +23,23 @@ void prepare_ring(FrameRing &ring, PortSpec spec, BlockPeriod period, std::chron
                   BlockPeriod &prepared_period, bool in_use)
 {
     if (!is_block_period(period))
-        throw Error(ErrorCode::InvalidArg);
+        throw Error(RetCode::EPARAM);
     if (period == prepared_period)
         return;
     if (in_use)
-        throw Error(ErrorCode::Busy);
+        throw Error(RetCode::BUSY);
     const auto graph_frames = spec.max_frames(period);
-    const auto rate = static_cast<std::uint32_t>(spec.sample_rate);
+    const auto rate = static_cast<std::uint32_t>(spec.bandwidth);
     const auto us = static_cast<std::uint64_t>(io_period.count());
     if (us > std::numeric_limits<std::uint64_t>::max() / rate)
-        throw Error(ErrorCode::TooLarge);
+        throw Error(RetCode::TOOLARGE);
     // Round up at the slowest allowed device clock to cover the largest logical batch.
     constexpr auto effective_second = 1000000 - max_clock_drift_ppm;
     const auto units = us * rate;
     const auto device_frames = units / effective_second + (units % effective_second != 0);
     const auto capacity = std::max<std::uint64_t>(8 * graph_frames, 2 * device_frames + 4 * graph_frames);
     if (capacity > std::numeric_limits<std::size_t>::max())
-        throw Error(ErrorCode::TooLarge);
+        throw Error(RetCode::TOOLARGE);
     ring.prepare(spec.channels, static_cast<std::size_t>(capacity));
     prepared_period = period;
 }
@@ -77,7 +77,7 @@ bool prefill_ready(const FrameRing &ring, std::atomic<bool> &primed, std::size_t
 }
 } // namespace
 
-Capture::Capture(SampleRate rate, std::size_t channels, std::chrono::microseconds io_period)
+Capture::Capture(BandWidth rate, std::size_t channels, std::chrono::microseconds io_period)
     : NodeT({}, {endpoint_spec(rate, channels, io_period)}), io_period_(io_period)
 {
 }
@@ -123,7 +123,7 @@ void Capture::close() noexcept
     primed_.store(false, std::memory_order_release);
 }
 
-Playback::Playback(SampleRate rate, std::size_t channels, std::chrono::microseconds io_period)
+Playback::Playback(BandWidth rate, std::size_t channels, std::chrono::microseconds io_period)
     : NodeT({endpoint_spec(rate, channels, io_period)}, {}), io_period_(io_period)
 {
 }

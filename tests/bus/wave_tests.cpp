@@ -13,7 +13,7 @@ using namespace aereborn;
 using namespace aereborn::test;
 using namespace std::chrono_literals;
 
-constexpr auto archive_rate = SampleRate::Hz44100;
+constexpr auto archive_rate = BandWidth::CDQuality;
 const PortSpec stereo(rate, 2, SampleFormat::F32P);
 const PortSpec music(rate, 2, SampleFormat::F32LE);
 const char *dukou = AEREBORN_TEST_DATA "/dukou_excerpt.wav";
@@ -120,11 +120,11 @@ void four_channel_song_archive()
         written += output_frames;
     }
     wait_for([&] { return !source.running(); }, "The four-channel file reaches EOF");
-    check(source.last_error() == ErrorCode::EndOfStream, "The input is consumed completely");
+    check(source.last_error() == RetCode::EOS, "The input is consumed completely");
     for (auto *archive : archives)
     {
         archive->unbind();
-        check(archive->last_error() == ErrorCode::Ok, "The archive drains and finalizes");
+        check(archive->last_error() == RetCode::OK, "The archive drains and finalizes");
     }
 
     const PortSpec split_spec(rate, 2, SampleFormat::S16LE);
@@ -204,10 +204,10 @@ void repeated_tracks_and_segments()
                 check(heard.sample(frame, ch) == expected(frame, ch), "Repeat and EOF preserve the mixed timeline");
     }
     wait_for([&] { return !loop.running() && !once.running(); }, "Both tracks reach EOF");
-    check(loop.last_error() == ErrorCode::EndOfStream && once.last_error() == ErrorCode::EndOfStream,
+    check(loop.last_error() == RetCode::EOS && once.last_error() == RetCode::EOS,
           "Both sources report natural completion");
     writer.unbind();
-    check(writer.last_error() == ErrorCode::Ok, "Both segments finalize");
+    check(writer.last_error() == RetCode::OK, "Both segments finalize");
     const auto front = read_wave(first_path, music, segment);
     const auto back = read_wave(second_path, music, heard.frames - segment);
     check(std::equal(front.bytes.begin(), front.bytes.end(), heard.bytes.begin()) &&
@@ -219,7 +219,7 @@ void three_output_specs()
 {
     constexpr std::size_t ticks = 20;
     const PortSpec wav_spec(archive_rate, 2, SampleFormat::S16LE);
-    const PortSpec callback_spec(SampleRate::Hz16000, 1, SampleFormat::S16LE);
+    const PortSpec callback_spec(BandWidth::Wide, 1, SampleFormat::S16LE);
     TempWave files("three-outputs");
     const auto path = files.path();
     Engine engine(period);
@@ -275,7 +275,7 @@ void three_output_specs()
     }
     file.unbind();
     client.stop();
-    check(file.last_error() == ErrorCode::Ok && client.last_error() == ErrorCode::Ok, "Both workers drain successfully");
+    check(file.last_error() == RetCode::OK && client.last_error() == RetCode::OK, "Both workers drain successfully");
     const auto recorded = read_wave(path, wav_spec, ticks * 441 / 2);
     const auto s16 = [](const Pcm &pcm, std::size_t sample) {
         const int bits = pcm.bytes[2 * sample] | (pcm.bytes[2 * sample + 1] << 8);

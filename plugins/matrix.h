@@ -19,8 +19,8 @@ class Matrix final : public NodeT<1, 1>
     /// @param rate Sample rate of both ports.
     /// @param channels Channel count of both ports.
     /// @param gain Initial finite linear gain.
-    /// @throws Error InvalidArg If the port specification is invalid or gain is not finite.
-    Matrix(SampleRate rate, std::size_t channels, float gain = 1.0f);
+    /// @throws Error RetCode::EPARAM If the port specification is invalid or gain is not finite.
+    Matrix(BandWidth rate, std::size_t channels, float gain = 1.0f);
 
     /// @brief Construct a channel map from a row-major matrix.
     /// @param rate Sample rate of both ports.
@@ -29,19 +29,19 @@ class Matrix final : public NodeT<1, 1>
     /// @param coefficients Finite coefficients in output-channel order, one row per output.
     /// @param gain Initial finite linear gain.
     /// @note The constructor copies the coefficients. Keep the view valid until it returns.
-    /// @throws Error InvalidArg For invalid port specs, mismatched dimensions, or nonfinite coefficients or gain.
-    /// @throws Error TooLarge If the matrix exceeds the supported storage size.
-    Matrix(SampleRate rate, std::size_t input_channels, std::size_t output_channels, View<const float> coefficients,
+    /// @throws Error RetCode::EPARAM For invalid port specs, mismatched dimensions, or nonfinite coefficients or gain.
+    /// @throws Error RetCode::TOOLARGE If the matrix exceeds the supported storage size.
+    Matrix(BandWidth rate, std::size_t input_channels, std::size_t output_channels, View<const float> coefficients,
            float gain = 1.0f);
 
     /// @brief Construct a row-major channel map from an initializer list.
     /// @note Uses the same dimensions, validation, and copying rules as the view overload.
-    Matrix(SampleRate rate, std::size_t input_channels, std::size_t output_channels,
+    Matrix(BandWidth rate, std::size_t input_channels, std::size_t output_channels,
            std::initializer_list<float> coefficients, float gain = 1.0f);
 
     /// @brief Set the requested linear gain.
     /// @param gain New finite gain target.
-    /// @throws Error InvalidArg if the gain is not finite.
+    /// @throws Error RetCode::EPARAM if the gain is not finite.
     /// @note Safe to call concurrently with process(). A nonempty block reaches its sampled target on its final frame.
     void set_gain(float gain);
 

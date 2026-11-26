@@ -18,16 +18,17 @@ class Convert final : public NodeT<1, 1>
     /// @brief Construct a converter with fixed input and output specifications.
     /// @param input Source sample format, sample rate, and channel count.
     /// @param output Destination specification with the same channel count.
-    /// @throws Error InvalidArg If either spec is invalid or the channel counts differ.
+    /// @throws Error RetCode::EPARAM If either spec is invalid or the channel counts differ.
     Convert(PortSpec input, PortSpec output);
 
     /// @brief Prepare conversion buffers and reset the resampler for the graph period.
     /// @param period Graph block period used to size the buffers.
-    /// @throws Error InvalidArg for an unsupported period, or TooLarge if a buffer exceeds its limit.
+    /// @throws Error RetCode::EPARAM for an unsupported period, or RetCode::TOOLARGE if a buffer exceeds its limit.
     /// @note A failed preparation preserves the existing buffers and resampler state.
     void prepare(BlockPeriod period) override;
 
     /// @copydoc Node::process
+    /// @pre The blocks match the declared port specifications.
     /// @note Resampling aligns its fractional phase to the graph tick.
     void process(const ProcessContext &context) noexcept override;
 

@@ -114,7 +114,7 @@ struct Pcm
 inline Pcm read_wave(const std::string &path, PortSpec spec, std::size_t frames)
 {
     WavFile file;
-    file.open_read(path).or_throw();
+    throw_if_error(file.open_read(path));
     check(file.spec() == spec && file.frame_count() == frames, "WAV has the expected format and frame count");
     Pcm pcm(spec, frames);
     check(file.read(pcm.output(0, frames)).value_or_throw() == frames, "WAV provides every declared frame");
@@ -124,9 +124,9 @@ inline Pcm read_wave(const std::string &path, PortSpec spec, std::size_t frames)
 inline void write_wave(const std::string &path, const Pcm &pcm)
 {
     WavFile file;
-    file.open_write(path, pcm.spec, WavFile::WriteMode::Exclusive).or_throw();
-    file.write(pcm.input(0, pcm.frames)).or_throw();
-    file.close().or_throw();
+    throw_if_error(file.open_write(path, pcm.spec, WavFile::WriteMode::Exclusive));
+    throw_if_error(file.write(pcm.input(0, pcm.frames)));
+    throw_if_error(file.close());
 }
 
 } // namespace test

@@ -15,25 +15,25 @@ void endpoint_ownership_and_restart()
 {
     Capture capture(rate, 1, 5ms);
     Playback playback(rate, 1, 5ms);
-    expect_error(ErrorCode::InvalidArg, [] { Capture invalid(rate, 0, 5ms); });
-    expect_error(ErrorCode::InvalidArg, [] { Playback invalid(rate, 1, 0ms); });
+    expect_error(RetCode::EPARAM, [] { Capture invalid(rate, 0, 5ms); });
+    expect_error(RetCode::EPARAM, [] { Playback invalid(rate, 1, 0ms); });
     PushSource source(pcm), other(pcm);
     PullSink sink(pcm), competing(pcm);
-    expect_error(ErrorCode::NotReady, [&] { source.bind(capture); });
-    expect_error(ErrorCode::NotReady, [&] { sink.bind(playback); });
+    expect_error(RetCode::ESTATE, [&] { source.bind(capture); });
+    expect_error(RetCode::ESTATE, [&] { sink.bind(playback); });
     capture.prepare(period);
     playback.prepare(period);
     PushSource wrong({rate, 2, SampleFormat::F32LE});
-    expect_error(ErrorCode::FormatMismatch, [&] { wrong.bind(capture); });
+    expect_error(RetCode::INVFMT, [&] { wrong.bind(capture); });
     source.bind(capture);
     sink.bind(playback);
-    expect_error(ErrorCode::Busy, [&] { other.bind(capture); });
-    expect_error(ErrorCode::Busy, [&] { competing.bind(playback); });
-    expect_error(ErrorCode::Busy, [&] { capture.prepare(BlockPeriod::Ms10); });
-    expect_error(ErrorCode::Busy, [&] { playback.prepare(BlockPeriod::Ms10); });
+    expect_error(RetCode::BUSY, [&] { other.bind(capture); });
+    expect_error(RetCode::BUSY, [&] { competing.bind(playback); });
+    expect_error(RetCode::BUSY, [&] { capture.prepare(BlockPeriod::INR_10MS); });
+    expect_error(RetCode::BUSY, [&] { playback.prepare(BlockPeriod::INR_10MS); });
     source.start();
     sink.start();
-    expect_error(ErrorCode::Busy, [&] { source.start(); });
+    expect_error(RetCode::BUSY, [&] { source.start(); });
     const std::uint8_t sample[4]{0, 0, 0x80, 0x3e};
     check(source.push({sample, pcm, 1}) == 1 && QueueState::queued(source) == 1, "Capture queues external PCM");
     source.stop();
@@ -48,20 +48,21 @@ void endpoint_ownership_and_restart()
 
 void device_worker_errors()
 {
+    check(std::atomic<RetCode>{RetCode{}}.is_lock_free(), "Backend worker status uses lock-free atomics");
     Capture capture(rate, 1, 5ms);
     capture.prepare(period);
     BackendCalls calls;
     TestBackend source(pcm, 240, &calls);
-    source.start_result = ErrorCode::IoFailed;
+    source.start_result = RetCode::IOFAILED;
     source.bind(capture);
-    expect_error(ErrorCode::IoFailed, [&] { source.start(); });
+    expect_error(RetCode::IOFAILED, [&] { source.start(); });
     check(source.bound() && !source.running(), "A worker startup failure leaves a retryable binding");
     source.start_result = {};
     source.cadence = 1ms;
     source.empty_capture = true;
     source.start();
     wait_for([&] { return !source.running(); }, "The worker times out with empty capture batches");
-    check(source.last_error() == ErrorCode::Timeout && calls.starts == 2 && calls.stops == 1 &&
+    check(source.last_error() == RetCode::TIMEOUT && calls.starts == 2 && calls.stops == 1 &&
               calls.start_thread == calls.stop_thread && calls.stop_thread != std::this_thread::get_id(),
           "The I/O worker owns its lifecycle and reports the progress timeout");
     source.stop();
@@ -69,7 +70,7 @@ void device_worker_errors()
     source.start();
     check(source.wait_for_io(), "The restarted worker reaches the blocking I/O call");
     source.unbind();
-    check(!source.bound() && !source.running() && source.last_error() == ErrorCode::Ok && calls.cancels == 1,
+    check(!source.bound() && !source.running() && source.last_error() == RetCode::OK && calls.cancels == 1,
           "Unbind cancels blocked I/O and joins the worker");
 }
 
@@ -81,19 +82,19 @@ void wav_seek_and_padding()
     const PortSpec spec(rate, 1, SampleFormat::S24_3LE);
     const std::uint8_t original[]{1, 2, 3, 4, 5, 6, 7, 8, 9}, middle[]{10, 11, 12};
     WavFile file;
-    file.open_write(path, spec, WavFile::WriteMode::Exclusive).or_throw();
-    file.write({original, spec, 3}).or_throw();
-    file.seek(1).or_throw();
-    file.write({middle, spec, 1}).or_throw();
+    throw_if_error(file.open_write(path, spec, WavFile::WriteMode::Exclusive));
+    throw_if_error(file.write({original, spec, 3}));
+    throw_if_error(file.seek(1));
+    throw_if_error(file.write({middle, spec, 1}));
     check(file.tell() == 2 && file.frame_count() == 3, "Overwriting a frame keeps the existing tail");
-    file.close().or_throw();
+    throw_if_error(file.close());
     {
         std::ifstream bytes(path, std::ios::binary | std::ios::ate);
         check(bytes.tellg() == std::streamoff(54), "The odd-sized payload has a RIFF pad byte");
         bytes.seekg(-1, std::ios::end);
         check(bytes.get() == 0, "The padding byte is zero");
     }
-    file.open_read(path).or_throw();
+    throw_if_error(file.open_read(path));
     {
         std::ofstream bad(invalid, std::ios::binary);
         bad << "RIFF";
@@ -140,8 +141,8 @@ class CrossingRate
 
 void sample_clock_drift()
 {
-    constexpr auto sample_rate = SampleRate::Hz8000;
-    constexpr auto graph_period = BlockPeriod::Ms02;
+    constexpr auto sample_rate = BandWidth::Narrow;
+    constexpr auto graph_period = BlockPeriod::INR_02MS;
     constexpr std::size_t batch_frames = 128, block_frames = 16;
     const PortSpec native(sample_rate, 1, SampleFormat::F32LE), planar(sample_rate, 1, SampleFormat::F32P);
     Pcm wire_input(native, batch_frames), wire_output(native, batch_frames);
@@ -200,7 +201,7 @@ void sample_clock_drift()
         device_out.stop();
         check(std::abs(captured.scale() - 1 - ppm * 1e-6) < 0.0002 &&
                   std::abs(played.scale() - 1 + ppm * 1e-6) < 0.0002 &&
-                  device_in.last_error() == ErrorCode::Ok && device_out.last_error() == ErrorCode::Ok,
+                  device_in.last_error() == RetCode::OK && device_out.last_error() == RetCode::OK,
               "Both directions follow the device clock across jitter and signed drift");
     }
 }

@@ -3,13 +3,13 @@ namespace aereborn
 {
 namespace
 {
-PortSpec mixer_output(SampleRate rate, std::size_t channels, std::size_t inputs)
+PortSpec mixer_output(BandWidth rate, std::size_t channels, std::size_t inputs)
 {
     const PortSpec spec(rate, channels, SampleFormat::F32P);
     if (!spec.valid() || inputs == 0)
-        throw Error(ErrorCode::InvalidArg, "Mixer needs valid ports and at least one input");
+        throw Error(RetCode::EPARAM, "Mixer needs valid ports and at least one input");
     if (inputs > Mixer::max_inputs)
-        throw Error(ErrorCode::TooLarge);
+        throw Error(RetCode::TOOLARGE);
     return spec;
 }
 
@@ -21,7 +21,7 @@ constexpr std::uint64_t input_bit(std::size_t input) noexcept
 std::uint64_t checked_bit(std::size_t input, std::size_t count)
 {
     if (input >= count)
-        throw Error(ErrorCode::InvalidPort);
+        throw Error(RetCode::EPORT);
     return input_bit(input);
 }
 
@@ -67,7 +67,7 @@ void accumulate_ramp(OFBlock output, IFBlock input, double scale) noexcept
 
 constexpr std::size_t Mixer::max_inputs;
 
-Mixer::Mixer(SampleRate rate, std::size_t channels, std::size_t inputs)
+Mixer::Mixer(BandWidth rate, std::size_t channels, std::size_t inputs)
     : output_(mixer_output(rate, channels, inputs)), inputs_(inputs, output_)
 {
 }

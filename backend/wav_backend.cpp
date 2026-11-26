@@ -26,12 +26,12 @@ WavCapture::WavCapture(std::string path, Repeat repeats)
 Result<PortSpec> WavCapture::on_open(bool capture, PortSpec, std::chrono::microseconds period)
 {
     if (!capture)
-        return ErrorCode::InvalidArg;
+        return RetCode::EPARAM;
     const auto opened = file_.open_read(path_);
     if (!opened)
         return opened;
     const auto spec = file_.spec();
-    const auto count = frames_in_period(spec.sample_rate, period);
+    const auto count = frames_in_period(spec.bandwidth, period);
     if (!count)
         return count.ret_code();
 
@@ -69,7 +69,7 @@ Result<std::size_t> WavCapture::on_read(OBBlock output) noexcept
         frames += read.value();
     }
     if (!frames)
-        return ErrorCode::EndOfStream;
+        return RetCode::EOS;
     return frames;
 }
 
@@ -82,16 +82,16 @@ WavPlayback::WavPlayback(std::string path, SampleFormat format, std::chrono::sec
     : ActiveBackend(false), path_(std::move(path)), format_(format), segment_duration_(segment_duration)
 {
     if (segment_duration_.count() < 0)
-        throw Error(ErrorCode::InvalidArg);
+        throw Error(RetCode::EPARAM);
     if (!WavFile::supports_write_format(format_))
-        throw Error(ErrorCode::FormatMismatch);
+        throw Error(RetCode::INVFMT);
 }
 
 Result<PortSpec> WavPlayback::on_open(bool capture, PortSpec logical, std::chrono::microseconds period)
 {
     if (capture)
-        return ErrorCode::InvalidArg;
-    const auto count = frames_in_period(logical.sample_rate, period);
+        return RetCode::EPARAM;
+    const auto count = frames_in_period(logical.bandwidth, period);
     if (!count)
         return count.ret_code();
     logical.format = format_;
@@ -100,17 +100,17 @@ Result<PortSpec> WavPlayback::on_open(bool capture, PortSpec logical, std::chron
         const auto limit = WavFile::max_write_frames(logical);
         if (!limit)
             return limit.ret_code();
-        const auto hz = static_cast<std::uint32_t>(logical.sample_rate);
+        const auto hz = static_cast<std::uint32_t>(logical.bandwidth);
         const auto seconds = static_cast<std::uint64_t>(segment_duration_.count());
         if (seconds > limit.value() / hz)
-            return ErrorCode::TooLarge;
+            return RetCode::TOOLARGE;
         segment_frames_ = static_cast<std::size_t>(seconds * hz);
 
         segment_path_ = path_;
         const auto separator = path_.find_last_of("/\\");
         const auto name_start = separator == std::string::npos ? 0 : separator + 1;
         if (name_start == path_.size())
-            return ErrorCode::InvalidArg;
+            return RetCode::EPARAM;
         auto extension = path_.find_last_of('.');
         if (extension == std::string::npos || extension <= name_start)
         {
@@ -132,13 +132,13 @@ Result<PortSpec> WavPlayback::on_open(bool capture, PortSpec logical, std::chron
 RetCode WavPlayback::on_start() noexcept
 {
     const auto state = file_.status();
-    return state == ErrorCode::NotReady ? open_file(device_spec()) : state;
+    return state == RetCode::ESTATE ? open_file(device_spec()) : state;
 }
 
 void WavPlayback::on_stop() noexcept
 {
     const auto flushed = file_.flush();
-    if (flushed != ErrorCode::NotReady)
+    if (flushed != RetCode::ESTATE)
         record_io_error(flushed);
 }
 
@@ -149,12 +149,12 @@ RetCode WavPlayback::open_file(PortSpec spec) noexcept
     for (;;)
     {
         if (segment_index_ == std::numeric_limits<std::uint32_t>::max())
-            return ErrorCode::TooLarge;
+            return RetCode::TOOLARGE;
         auto index = ++segment_index_;
         for (auto pos = segment_number_offset_ + segment_number_width; pos != segment_number_offset_; index /= 10)
             segment_path_[--pos] = static_cast<char>('0' + index % 10);
         const auto opened = file_.open_write(segment_path_, spec, WavFile::WriteMode::Exclusive);
-        if (opened != ErrorCode::Busy)
+        if (opened != RetCode::BUSY)
             return opened;
     }
 }

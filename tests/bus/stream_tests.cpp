@@ -84,8 +84,8 @@ void slow_callback_parallel_archive()
     release_on_failure.dismiss();
     callback.stop();
     writer.unbind();
-    check(fits && delivered == frames + queued && callback.last_error() == ErrorCode::Ok &&
-              writer.last_error() == ErrorCode::Ok,
+    check(fits && delivered == frames + queued && callback.last_error() == RetCode::OK &&
+              writer.last_error() == RetCode::OK,
           "The slow branch delivers exactly its first block and the queued prefix");
     for (std::size_t frame = 0; frame < delivered; ++frame)
         check(raw_pcm.sample(frame) == static_cast<float>(frame) / 8192, "The retained callback prefix stays in order");
@@ -309,10 +309,10 @@ void device_loss_and_rebind()
                   "The healthy branch stays aligned while the device changes");
     };
     verify(0.25f);
-    device.io_result = ErrorCode::DeviceLost;
+    device.io_result = RetCode::DEVLOST;
     check(!device.run_batch(), "The next device transfer ends on loss");
     wait_for([&] { return !device.running(); }, "The lost device worker stops");
-    check(device.last_error() == ErrorCode::DeviceLost && QueueState::queued(device) == 0,
+    check(device.last_error() == RetCode::DEVLOST && QueueState::queued(device) == 0,
           "Loss closes the capture queue");
     verify(0);
     device.unbind();
@@ -369,7 +369,7 @@ void restart_shared_outputs()
             check(std::abs(output.sample(frame) - expected) < 1e-6, "The mix starts with new samples and zero tone phase");
         }
         wait_for([&] { return QueueState::queued(sink) == 0; }, "Null playback consumes the fresh block");
-        check(sink.running() && sink.last_error() == ErrorCode::Ok, "Null playback remains ready after consuming");
+        check(sink.running() && sink.last_error() == RetCode::OK, "Null playback remains ready after consuming");
         source.stop();
         listener.stop();
         sink.stop();

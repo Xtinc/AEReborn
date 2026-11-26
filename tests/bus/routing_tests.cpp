@@ -13,7 +13,7 @@ using namespace std::chrono_literals;
 
 void subgroup_and_monitor()
 {
-    const auto sample_rate = SampleRate::Hz44100;
+    const auto sample_rate = BandWidth::CDQuality;
     const PortSpec stereo(sample_rate, 2, SampleFormat::F32P);
     Engine engine(period);
     ClockedGraph clock(engine);
@@ -98,7 +98,7 @@ class HalfPcm final : public NodeT<1, 1>
 void parallel_pcm_algorithm()
 {
     const PortSpec dry_spec(rate, 1, SampleFormat::F32P);
-    const PortSpec pcm(SampleRate::Hz16000, 1, SampleFormat::S16LE);
+    const PortSpec pcm(BandWidth::Wide, 1, SampleFormat::S16LE);
     Engine engine(period);
     ClockedGraph clock(engine);
     const auto input = engine.emplace_node<Tone>(rate, 1, 875, 0.25f);
@@ -193,7 +193,7 @@ void live_input_switch()
     verify_block(first, in_mono, 0.5f, 0.5f, true);
     mix->set_muted(0, true);
     verify_block(first, in_mono, 0, 0, false);
-    expect_error(ErrorCode::FormatMismatch, [&] { engine.replace_node(input, std::make_unique<Capture>(rate, 2, 5ms)); });
+    expect_error(RetCode::INVFMT, [&] { engine.replace_node(input, std::make_unique<Capture>(rate, 2, 5ms)); });
     first.unbind();
     engine.remove_node(input);
     engine.remove_node(mapping);

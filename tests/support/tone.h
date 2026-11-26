@@ -9,7 +9,7 @@ class Tone final : public NodeT<0, 1>
     /// @copydoc Node::type_name
     const char *type_name() const noexcept override { return "Tone"; }
 
-    Tone(SampleRate rate, std::size_t channels, double frequency = 440, float amplitude = 0.25f);
+    Tone(BandWidth rate, std::size_t channels, double frequency = 440, float amplitude = 0.25f);
     void process(const ProcessContext &context) noexcept override;
 
   private:

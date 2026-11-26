@@ -54,7 +54,7 @@ const char *format_name(SampleFormat format)
 void write_spec(std::ostream &out, PortSpec spec)
 {
     if (spec.channels)
-        out << static_cast<std::uint32_t>(spec.sample_rate) << '/' << spec.channels << "ch/" << format_name(spec.format);
+        out << static_cast<std::uint32_t>(spec.bandwidth) << '/' << spec.channels << "ch/" << format_name(spec.format);
     else
         out << '-';
 }
@@ -170,7 +170,7 @@ void write_backend(std::ostream &out, const Backend &backend, RetCode error)
     if (async)
         out << " drift=" << std::fixed << std::setprecision(1) << std::showpos << active->drift_ppm()
             << std::noshowpos << "ppm";
-    out << " err=" << (error ? "Ok" : error.message());
+    out << " err=" << (error ? "OK" : error.what());
 #if WINDOWS_OS_ENVIRONMENT
     if (const auto *wasapi = dynamic_cast<const WasapiBackend *>(&backend))
     {
@@ -267,33 +267,35 @@ void write_html_escaped(std::ostream &out, const std::string &text)
     }
 }
 
-const char *error_code_name(ErrorCode code)
+const char *error_code_name(RetCode::Code code)
 {
     switch (code)
     {
-    case ErrorCode::Ok: return "Ok";
-    case ErrorCode::InvalidArg: return "InvalidArg";
-    case ErrorCode::InvalidPort: return "InvalidPort";
-    case ErrorCode::InvalidType: return "InvalidType";
-    case ErrorCode::TooLarge: return "TooLarge";
-    case ErrorCode::NotReady: return "NotReady";
-    case ErrorCode::Busy: return "Busy";
-    case ErrorCode::UnknownNode: return "UnknownNode";
-    case ErrorCode::UnknownConn: return "UnknownConn";
-    case ErrorCode::DuplicateConn: return "DuplicateConn";
-    case ErrorCode::InputBusy: return "InputBusy";
-    case ErrorCode::Cycle: return "Cycle";
-    case ErrorCode::FormatMismatch: return "FormatMismatch";
-    case ErrorCode::IoFailed: return "IoFailed";
-    case ErrorCode::DeviceLost: return "DeviceLost";
-    case ErrorCode::EndOfStream: return "EndOfStream";
-    case ErrorCode::Cancelled: return "Cancelled";
-    case ErrorCode::Timeout: return "Timeout";
+    case RetCode::OK: return "OK";
+    case RetCode::NOACTION: return "NOACTION";
+    case RetCode::FAILED: return "FAILED";
+    case RetCode::EPARAM: return "EPARAM";
+    case RetCode::EPORT: return "EPORT";
+    case RetCode::ETYPE: return "ETYPE";
+    case RetCode::TOOLARGE: return "TOOLARGE";
+    case RetCode::ESTATE: return "ESTATE";
+    case RetCode::BUSY: return "BUSY";
+    case RetCode::ENODE: return "ENODE";
+    case RetCode::ECONN: return "ECONN";
+    case RetCode::DUPLICATE: return "DUPLICATE";
+    case RetCode::EINPUTBUSY: return "EINPUTBUSY";
+    case RetCode::CYCLE: return "CYCLE";
+    case RetCode::INVFMT: return "INVFMT";
+    case RetCode::IOFAILED: return "IOFAILED";
+    case RetCode::DEVLOST: return "DEVLOST";
+    case RetCode::EOS: return "EOS";
+    case RetCode::CANCELLED: return "CANCELLED";
+    case RetCode::TIMEOUT: return "TIMEOUT";
     }
     return "Unknown";
 }
 
-void write_short_rate(std::ostream &out, SampleRate rate)
+void write_short_rate(std::ostream &out, BandWidth rate)
 {
     const auto hz = static_cast<std::uint32_t>(rate);
     out << hz / 1000;
@@ -312,7 +314,7 @@ void write_short_rate(std::ostream &out, SampleRate rate)
 
 void write_short_spec(std::ostream &out, PortSpec spec)
 {
-    write_short_rate(out, spec.sample_rate);
+    write_short_rate(out, spec.bandwidth);
     out << ' ' << spec.channels << "ch " << format_name(spec.format);
 }
 
@@ -330,7 +332,7 @@ void begin_card(std::ostream &out, const CardColors &colors, const char *title, 
     write_html_escaped(out, title);
     out << "</B></FONT>";
     if (id)
-        out << " <FONT POINT-SIZE=\"9\" COLOR=\"#475569\">#" << id.value << "</FONT>";
+        out << " <FONT POINT-SIZE=\"9\" COLOR=\"#475569\">#" << id.node() << "</FONT>";
 }
 
 void write_badge(std::ostream &out, const char *text, const CardColors &colors)
@@ -441,7 +443,7 @@ void write_dot_ports(std::ostream &out, const Node &node, const MixerFlags &mixe
 
 void write_convert(std::ostream &out, PortSpec input, PortSpec output)
 {
-    const auto rate_changed = input.sample_rate != output.sample_rate;
+    const auto rate_changed = input.bandwidth != output.bandwidth;
     const auto format_changed = input.format != output.format;
     if (!rate_changed && !format_changed)
     {
@@ -451,7 +453,7 @@ void write_convert(std::ostream &out, PortSpec input, PortSpec output)
 
     const auto write_changed_fields = [&](PortSpec spec) {
         if (rate_changed)
-            write_short_rate(out, spec.sample_rate);
+            write_short_rate(out, spec.bandwidth);
         if (rate_changed && format_changed)
             out << ' ';
         if (format_changed)
@@ -491,7 +493,7 @@ void write_single_port_node(std::ostream &out, const Node &node)
 
 void write_dot_node(std::ostream &out, NodeId id, const Node &node, const DotNode &info)
 {
-    out << "  n" << id.value;
+    out << "  n" << id.node();
     if (const auto *capture = dynamic_cast<const Capture *>(&node))
         write_dot_endpoint(out, id, *capture, capture->underrun_frames(), "Underrun");
     else if (const auto *playback = dynamic_cast<const Playback *>(&node))
@@ -512,7 +514,7 @@ void write_dot_node(std::ostream &out, NodeId id, const Node &node, const DotNod
 
     std::ostringstream details;
     details.imbue(std::locale::classic());
-    details << '[' << id.value << "] " << node.type_name();
+    details << '[' << id.node() << "] " << node.type_name();
     write_ports(details, "in", node.inputs());
     write_ports(details, "out", node.outputs());
     write_node_details(details, node, info.mixer);
@@ -601,7 +603,7 @@ void write_dot_engine(std::ostream &out, const Engine &engine)
 
 PortSpec connection_spec(const Engine &engine, const Connection &connection)
 {
-    return engine.plan_node(connection.from.node)->outputs()[connection.from.index];
+    return engine.plan_node(connection.from.base())->outputs()[connection.from.port()];
 }
 } // namespace
 
@@ -613,14 +615,14 @@ std::string dump_text(const Engine &engine, View<const Backend *const> backends)
     const auto nodes = engine.plan_nodes();
     out << "\nPlan Order:";
     for (std::size_t i = 0; i < nodes.size(); ++i)
-        out << (i ? " -> [" : " [") << nodes[i].value << ']';
+        out << (i ? " -> [" : " [") << nodes[i].node() << ']';
 
     BackendLinks links(backends);
     out << "\n\nNodes:\n";
     for (const auto id : nodes)
     {
         const auto &node = *engine.plan_node(id);
-        out << "  [" << id.value << "] " << std::left << std::setw(9) << node.type_name() << std::right;
+        out << "  [" << id.node() << "] " << std::left << std::setw(9) << node.type_name() << std::right;
         write_ports(out, "in", node.inputs());
         write_ports(out, "out", node.outputs());
         write_node_details(out, node, read_mixer_flags(node));
@@ -636,8 +638,8 @@ std::string dump_text(const Engine &engine, View<const Backend *const> backends)
     out << "\nConnections:\n";
     for (const auto &connection : engine.plan_connections())
     {
-        out << "  #" << connection.id.value << ": [" << connection.from.node.value << "]:" << connection.from.index
-            << " -> [" << connection.to.node.value << "]:" << connection.to.index << " (";
+        out << "  #" << connection.id.value << ": [" << connection.from.node() << "]:" << connection.from.port()
+            << " -> [" << connection.to.node() << "]:" << connection.to.port() << " (";
         write_spec(out, connection_spec(engine, connection));
         out << ")\n";
     }
@@ -693,13 +695,13 @@ std::string dump_dot(const Engine &engine, View<const Backend *const> backends)
         if (const auto *backend = links.take(node))
         {
             const auto error = backend->last_error();
-            out << "  b" << id.value;
+            out << "  b" << id.node();
             const auto *mode = write_dot_backend(out, *backend, error, false);
             // A backend binds to a Capture source or a Playback sink.
             if (node.inputs().empty())
-                out << "  b" << id.value << ":e -> n" << id.value << ":w";
+                out << "  b" << id.node() << ":e -> n" << id.node() << ":w";
             else
-                out << "  n" << id.value << ":e -> b" << id.value << ":w";
+                out << "  n" << id.node() << ":e -> b" << id.node() << ":w";
             out << " [style=dashed, color=\"" << (error ? backend_colors.border : error_colors.border)
                 << "\", label=\"" << mode << "\", tooltip=\"";
             write_dot_escaped(out, backend->type_name());
@@ -713,18 +715,18 @@ std::string dump_dot(const Engine &engine, View<const Backend *const> backends)
 
     for (const auto &connection : engine.plan_connections())
     {
-        const auto &from = nodes.find(connection.from.node)->second;
-        const auto &to = nodes.find(connection.to.node)->second;
-        const auto spec = from.outputs[connection.from.index];
+        const auto &from = nodes.find(connection.from.base())->second;
+        const auto &to = nodes.find(connection.to.base())->second;
+        const auto spec = from.outputs[connection.from.port()];
         const auto style =
-            to.has_ports ? input_style(to.mixer, to.mixer.bit(connection.to.index)) : InputStyle::Normal;
+            to.has_ports ? input_style(to.mixer, to.mixer.bit(connection.to.port())) : InputStyle::Normal;
         const auto *status = style == InputStyle::Muted ? "muted" : "suppressed";
-        out << "  n" << connection.from.node.value;
+        out << "  n" << connection.from.node();
         if (from.has_ports)
-            out << ":o" << connection.from.index;
-        out << ":e -> n" << connection.to.node.value;
+            out << ":o" << connection.from.port();
+        out << ":e -> n" << connection.to.node();
         if (to.has_ports)
-            out << ":i" << connection.to.index;
+            out << ":i" << connection.to.port();
         out << ":w [label=\"";
         write_short_spec(out, spec);
         if (style != InputStyle::Normal)
@@ -735,8 +737,8 @@ std::string dump_dot(const Engine &engine, View<const Backend *const> backends)
         }
         else
             out << '"';
-        out << ", tooltip=\"#" << connection.id.value << ": [" << connection.from.node.value << "]:" << connection.from.index
-            << " -> [" << connection.to.node.value << "]:" << connection.to.index << " (";
+        out << ", tooltip=\"#" << connection.id.value << ": [" << connection.from.node() << "]:" << connection.from.port()
+            << " -> [" << connection.to.node() << "]:" << connection.to.port() << " (";
         write_spec(out, spec);
         if (style != InputStyle::Normal)
             out << ", " << status;

@@ -18,7 +18,7 @@ class UsrPlayback final : public ActiveBackend
 
     using Callback = std::function<void(IBBlock)>;
 
-    /// @throws Error InvalidArg if spec is not valid interleaved PCM or callback is empty.
+    /// @throws Error RetCode::EPARAM if spec is not valid interleaved PCM or callback is empty.
     UsrPlayback(PortSpec spec, Callback callback);
     ~UsrPlayback() override { unbind(); }
 

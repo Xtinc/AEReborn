@@ -22,14 +22,14 @@ class WavFile
 
     /// @brief Open a WAV file at frame zero. Invalid input leaves the current reader usable.
     RetCode open_read(const std::string &path) noexcept;
-    /// @brief Open a file for writing. Exclusive returns Busy for an existing path.
+    /// @brief Open a file for writing. Exclusive returns RetCode::BUSY for an existing path.
     /// @pre Close the current file before opening an output.
     RetCode open_write(const std::string &path, PortSpec spec, WriteMode mode) noexcept;
     /// @brief Close the file and finalize the header when writing.
     RetCode close() noexcept;
     /// @brief Flush buffered output to the operating system and report any write error.
     RetCode flush() noexcept;
-    /// @brief Report an I/O error or NotReady if there is no open file.
+    /// @brief Report an I/O error or RetCode::ESTATE if there is no open file.
     RetCode status() const noexcept;
     /// @brief Report whether the sample format is supported for RIFF/WAVE output.
     static bool supports_write_format(SampleFormat format) noexcept;

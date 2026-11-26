@@ -16,8 +16,8 @@ void graph_constraints()
 {
     Engine engine(period), other(period);
     ClockedGraph clock(engine);
-    expect_error(ErrorCode::InvalidArg, [] { Engine invalid(static_cast<BlockPeriod>(0)); });
-    expect_error(ErrorCode::NotReady, [&] { engine.start(); });
+    expect_error(RetCode::EPARAM, [] { Engine invalid(static_cast<BlockPeriod>(0)); });
+    expect_error(RetCode::ESTATE, [&] { engine.start(); });
     const auto source = engine.emplace_node<Tone>(rate, 1, 997, 0.25f);
     const auto first = engine.emplace_node<Mixer>(rate, 1, 2);
     const auto second = engine.emplace_node<Matrix>(rate, 1);
@@ -27,14 +27,14 @@ void graph_constraints()
     const auto input = connect(engine, source, first);
     connect(engine, first, second);
     connect(engine, second, sink);
-    expect_error(ErrorCode::DuplicateConn, [&] { connect(engine, source, first); });
-    expect_error(ErrorCode::InputBusy, [&] { connect(engine, second, first); });
-    expect_error(ErrorCode::InvalidPort, [&] { connect(engine, source, first, 2); });
-    expect_error(ErrorCode::FormatMismatch, [&] { connect(engine, source, stereo); });
-    expect_error(ErrorCode::UnknownNode, [&] { connect(engine, foreign, first, 1); });
-    expect_error(ErrorCode::InvalidType, [&] { engine.node<Mixer>(source); });
+    expect_error(RetCode::DUPLICATE, [&] { connect(engine, source, first); });
+    expect_error(RetCode::EINPUTBUSY, [&] { connect(engine, second, first); });
+    expect_error(RetCode::EPORT, [&] { connect(engine, source, first, 2); });
+    expect_error(RetCode::INVFMT, [&] { connect(engine, source, stereo); });
+    expect_error(RetCode::ENODE, [&] { connect(engine, foreign, first, 1); });
+    expect_error(RetCode::ETYPE, [&] { engine.node<Mixer>(source); });
     engine.set_paused(second, true);
-    expect_error(ErrorCode::Cycle, [&] { connect(engine, second, first, 1); });
+    expect_error(RetCode::CYCLE, [&] { connect(engine, second, first, 1); });
     engine.set_paused(second, false);
     engine.commit();
     clock.start();
@@ -45,7 +45,7 @@ void graph_constraints()
     clock.commit();
     clock.advance();
     check(result->sample(1) == 0, "An unconnected mixer input renders silence");
-    expect_error(ErrorCode::UnknownConn, [&] { engine.disconnect(input); });
+    expect_error(RetCode::ECONN, [&] { engine.disconnect(input); });
 }
 
 class SplitSignal final : public NodeT<2, 2>
@@ -74,6 +74,40 @@ class SplitSignal final : public NodeT<2, 2>
     std::atomic<bool> copy_enabled{true};
 };
 
+void composite_node_id()
+{
+    Engine engine(period);
+    const auto source = engine.emplace_node<Tone>(rate, 1, 997, 0.25f);
+    const auto split = engine.emplace_node<SplitSignal>();
+    const auto mix = engine.emplace_node<Mixer>(rate, 1, 2);
+    const auto sink = engine.emplace_node<PacketSink>(mono);
+    engine.connect(source, split[1]);
+    const auto route = engine.connect(split[1], mix[1]);
+    engine.connect(mix, sink);
+    engine.commit();
+
+    expect_error(RetCode::EPORT, [&] { engine.connect(source, mix[65536]); });
+    expect_error(RetCode::EPORT, [&] { engine.connect(split[65536], mix); });
+    expect_error(RetCode::EPORT, [&] { engine.connect(sink, source); });
+    expect_error(RetCode::EPORT, [&] { engine.connect(mix, source); });
+    expect_error(RetCode::EPORT, [&] { engine.remove_node(mix[1]); });
+    expect_error(RetCode::EPORT, [&] { engine.replace_node(mix[1], std::make_unique<Mixer>(rate, 1, 2)); });
+    expect_error(RetCode::EPORT, [&] { engine.set_paused(mix[1], true); });
+    expect_error(RetCode::EPORT, [&] { engine.node(mix[1]); });
+    expect_error(RetCode::EPORT, [&] { engine.plan_node(mix[1]); });
+    check(!engine.dirty() && engine.node(mix[0]) == engine.plan_node(mix), "Rejected edits leave the graph intact");
+    const auto connections = engine.plan_connections();
+    check(connections.size() == 3 && connections[1].id == route && connections[1].from == split[1] &&
+              connections[1].to == mix[1],
+          "The committed connection preserves both port indices");
+
+    engine.remove_node(split);
+    expect_error(RetCode::ECONN, [&] { engine.disconnect(route); });
+    engine.connect(source, mix[1]);
+    engine.commit();
+    check(engine.plan_connections().size() == 2, "Removing a node clears links at nonzero ports");
+}
+
 void port_activity()
 {
     Engine engine(period);
@@ -91,8 +125,8 @@ void port_activity()
     connect(engine, split, mixer);
     connect(engine, mixer, mixed);
     connect(engine, split, direct);
-    engine.connect(OPORT(split, 1), IPORT(copied, 0));
-    engine.connect(OPORT(split, 1), IPORT(fanout, 0));
+    engine.connect(split[1], copied);
+    engine.connect(split[1], fanout);
     engine.commit();
     const auto *mixed_result = engine.node<PacketSink>(mixed);
     const auto *direct_result = engine.node<PacketSink>(direct);
@@ -155,7 +189,7 @@ class PreparingGain final : public NodeT<1, 1>
     {
         ++prepares;
         if (fail)
-            throw Error(ErrorCode::IoFailed);
+            throw Error(RetCode::IOFAILED);
     }
     void process(const ProcessContext &context) noexcept override
     {
@@ -192,7 +226,7 @@ void commit_failure_and_retry()
     engine.disconnect(direct);
     connect(engine, source, inserted);
     connect(engine, inserted, sink);
-    expect_error(ErrorCode::IoFailed, [&] { engine.commit(); });
+    expect_error(RetCode::IOFAILED, [&] { engine.commit(); });
     const auto old_connections = engine.plan_connections();
     check(old_connections.size() == 1 && old_connections[0].id == direct &&
               engine.plan_generation() == original_generation && engine.dirty(),
@@ -287,7 +321,7 @@ void clock_boundary_barriers()
 
 void fractional_frames_and_ring_wrap()
 {
-    const PortSpec spec(SampleRate::Hz44100, 2, SampleFormat::F32P);
+    const PortSpec spec(BandWidth::CDQuality, 2, SampleFormat::F32P);
     std::size_t total = 0;
     for (std::uint64_t tick = 0; tick < 200; ++tick)
     {
@@ -319,6 +353,7 @@ void fractional_frames_and_ring_wrap()
 int main(int argc, char **argv)
 {
     return aereborn::test::run_tests(argc, argv, {{"graph_constraints", graph_constraints},
+                                                {"composite_node_id", composite_node_id},
                                                 {"port_activity", port_activity},
                                                 {"commit_failure_and_retry", commit_failure_and_retry},
                                                 {"clock_boundary_barriers", clock_boundary_barriers},

@@ -10,18 +10,19 @@ Convert::Convert(PortSpec input, PortSpec output)
     : NodeT({input}, {output}), same_spec_(input == output)
 {
     if (!input.valid() || !output.valid() || input.channels != output.channels)
-        throw Error(ErrorCode::InvalidArg, "Invalid converter port specifications");
+        throw Error(RetCode::EPARAM, "Invalid converter port specifications");
 }
 
 void Convert::prepare(BlockPeriod period)
 {
     if (!is_block_period(period))
-        throw Error(ErrorCode::InvalidArg);
+        throw Error(RetCode::EPARAM);
     if (same_spec_)
         return;
     const auto input = inputs()[0], output = outputs()[0];
-    const auto in_pcm = is_interleaved_pcm(input.format), out_pcm = is_interleaved_pcm(output.format);
-    const auto fir = input.sample_rate != output.sample_rate;
+    const auto in_pcm = input.format != SampleFormat::F32P;
+    const auto out_pcm = output.format != SampleFormat::F32P;
+    const auto fir = input.bandwidth != output.bandwidth;
     Buffer decoded, resampled;
     if (in_pcm && (fir || out_pcm))
         decoded.resize(input.channels, input.max_frames(period));
@@ -29,7 +30,7 @@ void Convert::prepare(BlockPeriod period)
     {
         if (out_pcm)
             resampled.resize(output.channels, output.max_frames(period));
-        resampler_.prepare(input.channels, input.sample_rate, output.sample_rate);
+        resampler_.prepare(input.channels, input.bandwidth, output.bandwidth);
     }
     decoded_ = std::move(decoded);
     resampled_ = std::move(resampled);
@@ -60,8 +61,8 @@ void Convert::process(const ProcessContext &context) noexcept
         return;
     }
 
-    const auto in_pcm = is_interleaved_pcm(input.spec().format);
-    const auto out_pcm = is_interleaved_pcm(output.spec().format);
+    const auto in_pcm = input.spec().format != SampleFormat::F32P;
+    const auto out_pcm = output.spec().format != SampleFormat::F32P;
     const auto fir = resampler_.needs_fir();
     IFBlock source;
     if (in_pcm)

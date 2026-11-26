@@ -8,12 +8,12 @@ namespace aereborn
 NullBackend::NullBackend(SampleFormat format) : ActiveBackend(false), format_(format)
 {
     if (!is_interleaved_pcm(format_))
-        throw Error(ErrorCode::InvalidArg);
+        throw Error(RetCode::EPARAM);
 }
 
 Result<PortSpec> NullBackend::on_open(bool, PortSpec logical, std::chrono::microseconds period)
 {
-    const auto count = frames_in_period(logical.sample_rate, period);
+    const auto count = frames_in_period(logical.bandwidth, period);
     if (!count)
         return count.ret_code();
     logical.format = format_;

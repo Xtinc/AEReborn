@@ -166,7 +166,7 @@ class TestBackend final : public ActiveBackend
             changed_.wait(lock, [&] { return cancelled_; });
         else
             changed_.wait_for(lock, cadence, [&] { return cancelled_; });
-        return cancelled_ ? RetCode{ErrorCode::Cancelled} : io_result;
+        return cancelled_ ? RetCode{RetCode::CANCELLED} : io_result;
     }
 
     PortSpec spec_;

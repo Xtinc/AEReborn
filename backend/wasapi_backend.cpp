@@ -51,12 +51,12 @@ RetCode record_failure(WasapiBackend::Failure &failure, const char *operation, H
 {
     failure = {operation, static_cast<std::int32_t>(error)};
     if (error == AUDCLNT_E_WRONG_ENDPOINT_TYPE)
-        return ErrorCode::InvalidArg;
+        return RetCode::EPARAM;
     if (error == AUDCLNT_E_UNSUPPORTED_FORMAT)
-        return ErrorCode::FormatMismatch;
+        return RetCode::INVFMT;
     if (error == AUDCLNT_E_DEVICE_INVALIDATED || error == HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
-        return ErrorCode::DeviceLost;
-    return ErrorCode::IoFailed;
+        return RetCode::DEVLOST;
+    return RetCode::IOFAILED;
 }
 
 RetCode activate(const std::wstring &id, EDataFlow direction, Interface<IAudioClient> &client,
@@ -173,12 +173,12 @@ Result<PortSpec> WasapiBackend::on_open(bool capture, PortSpec logical, std::chr
     if (FAILED(rc))
         return record_failure(failure_, "IAudioClient::GetMixFormat", rc);
     const std::unique_ptr<WAVEFORMATEX, FreeComBuffer> format(format_ptr);
-    const PortSpec spec{static_cast<SampleRate>(format->nSamplesPerSec), format->nChannels, sample_format(*format)};
+    const PortSpec spec{static_cast<BandWidth>(format->nSamplesPerSec), format->nChannels, sample_format(*format)};
     if (!valid_pcm_spec(spec) || logical.channels != spec.channels ||
         format->nBlockAlign != spec.channels * sample_bytes(spec.format) ||
         sizeof(*format) + format->cbSize > format_.size())
-        return ErrorCode::FormatMismatch;
-    const auto budget = frames_in_period(spec.sample_rate, period);
+        return RetCode::INVFMT;
+    const auto budget = frames_in_period(spec.bandwidth, period);
     if (!budget)
         return budget.ret_code();
 
@@ -190,7 +190,7 @@ Result<PortSpec> WasapiBackend::on_open(bool capture, PortSpec logical, std::chr
     if (capture)
     {
         if (capacity > packet.max_size() / format->nBlockAlign)
-            return ErrorCode::TooLarge;
+            return RetCode::TOOLARGE;
         packet.resize(static_cast<std::size_t>(capacity) * format->nBlockAlign);
     }
 
@@ -243,7 +243,7 @@ RetCode WasapiBackend::on_start() noexcept
         return initialized.ret_code();
     const auto capacity = initialized.value();
     if (source && capacity > packet_.size() / format.Format.nBlockAlign)
-        return ErrorCode::TooLarge;
+        return RetCode::TOOLARGE;
     auto rc = client->SetEventHandle(ready_);
     if (FAILED(rc))
         return record_failure(failure_, "IAudioClient::SetEventHandle", rc);
@@ -299,15 +299,15 @@ RetCode WasapiBackend::wait() noexcept
     const HANDLE handles[] = {cancelled_, ready_};
     const auto timeout = remaining_io_ms();
     if (!timeout)
-        return ErrorCode::Timeout;
+        return RetCode::TIMEOUT;
     switch (WaitForMultipleObjects(2, handles, FALSE, static_cast<DWORD>(timeout)))
     {
-    case WAIT_OBJECT_0: return ErrorCode::Cancelled;
+    case WAIT_OBJECT_0: return RetCode::CANCELLED;
     case WAIT_OBJECT_0 + 1: return {};
-    case WAIT_TIMEOUT: return ErrorCode::Timeout;
+    case WAIT_TIMEOUT: return RetCode::TIMEOUT;
     case WAIT_FAILED:
         return record_failure(failure_, "WaitForMultipleObjects", HRESULT_FROM_WIN32(GetLastError()));
-    default: return ErrorCode::IoFailed;
+    default: return RetCode::IOFAILED;
     }
 }
 

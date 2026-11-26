@@ -12,7 +12,7 @@ namespace aereborn
 
 /// @brief Owns an audio graph and advances it on an internal software clock.
 /// @note Serialize control calls, including node lookup, and destruction on the control side.
-/// Control calls from this engine's clock thread throw Error with code Busy.
+/// Control calls from this engine's clock thread throw Error with code RetCode::BUSY.
 /// Node callbacks must defer control requests and return without waiting for them.
 /// block_period() and tick_position() may run concurrently while the Engine is alive.
 class Engine
@@ -28,7 +28,7 @@ class Engine
 
     /// @brief Construct an engine with an empty draft graph.
     /// @param block_period Fixed duration of each tick.
-    /// @throws Error InvalidArg if the period is unsupported.
+    /// @throws Error RetCode::EPARAM if the period is unsupported.
     explicit Engine(BlockPeriod block_period);
 
     /// @brief Stop the clock and release all plans and nodes.
@@ -40,7 +40,8 @@ class Engine
     /// @brief Add a node to the draft graph.
     /// @param instance Node to transfer to the engine. The call consumes it on success or failure.
     /// @return The new node ID.
-    /// @throws Error InvalidArg for a null node or invalid port layout.
+    /// @throws Error RetCode::EPARAM for a null node or invalid port layout, or RetCode::TOOLARGE
+    /// if the port count or identifier space exceeds capacity.
     NodeId add_node(std::unique_ptr<Node> instance);
 
     /// @brief Construct a node and add it to the draft graph.
@@ -57,27 +58,28 @@ class Engine
 
     /// @brief Remove a node and its connections from the draft graph.
     /// @param node_id ID of the node to remove.
-    /// @throws Error UnknownNode if the draft has no such node.
+    /// @throws Error RetCode::EPORT for a nonzero port, or RetCode::ENODE for an absent node.
     void remove_node(NodeId node_id);
 
     /// @brief Replace a draft node while preserving its ID and connections.
     /// @param node_id ID of the node to replace.
     /// @param replacement New instance with identical port specifications in the same order.
     /// The call consumes it on success or failure.
-    /// @throws Error UnknownNode for an absent node, InvalidArg for a null replacement,
-    /// or FormatMismatch for a different port layout.
+    /// @throws Error RetCode::EPORT for a nonzero port, RetCode::ENODE for an absent node,
+    /// RetCode::EPARAM for a null replacement,
+    /// or RetCode::INVFMT for a different port layout.
     void replace_node(NodeId node_id, std::unique_ptr<Node> replacement);
 
     /// @brief Stage a local pause or resume for the next submitted plan.
     /// @param node_id ID of the node to pause or resume.
     /// @param paused True to exclude the node from the next plan, false to make it eligible again.
-    /// @throws Error UnknownNode if the draft has no such node.
+    /// @throws Error RetCode::EPORT for a nonzero port, or RetCode::ENODE for an absent node.
     void set_paused(NodeId node_id, bool paused);
 
     /// @brief Look up a node in the draft graph.
     /// @param node_id ID of the node to look up.
     /// @return A borrowed node pointer.
-    /// @throws Error UnknownNode if the draft has no such node.
+    /// @throws Error RetCode::EPORT for a nonzero port, or RetCode::ENODE for an absent node.
     /// @note The pointer is valid until removal, replacement, or Engine destruction.
     /// Follow the node's own contract for concurrent access during rendering.
     Node *node(NodeId node_id);
@@ -86,13 +88,13 @@ class Engine
     /// @tparam T Node type to cast the result to.
     /// @param node_id ID of the node to look up.
     /// @return A borrowed pointer.
-    /// @throws Error UnknownNode if the draft has no such node, or InvalidType if the cast fails.
+    /// @throws Error As documented for node(NodeId), or RetCode::ETYPE if the cast fails.
     /// @note The pointer follows the same lifetime and access rules as node(NodeId).
     template <class T> T *node(NodeId node_id)
     {
         auto *typed_node = dynamic_cast<T *>(node(node_id));
         if (!typed_node)
-            throw Error(ErrorCode::InvalidType);
+            throw Error(RetCode::ETYPE);
         return typed_node;
     }
 
@@ -100,13 +102,14 @@ class Engine
     /// @param from Source output port.
     /// @param to Destination input port, which can have only one source.
     /// @return The new connection ID.
-    /// @throws Error If graph validation fails.
+    /// @throws Error RetCode::EPORT if either port is unavailable in the requested direction,
+    /// or another status if graph validation fails.
     /// @note Port specifications must match, and the connection must leave the graph acyclic.
-    ConnId connect(OPort from, IPort to);
+    ConnId connect(NodeId from, NodeId to);
 
     /// @brief Remove a connection from the draft graph.
     /// @param conn_id ID returned by connect().
-    /// @throws Error UnknownConn if the connection is absent.
+    /// @throws Error RetCode::ECONN if the connection is absent.
     void disconnect(ConnId conn_id);
 
     /// @brief Prepare the draft and make it the current render plan.
@@ -116,16 +119,16 @@ class Engine
     void commit();
 
     /// @brief Start the software clock with the current plan and tick position.
-    /// @throws Error NotReady before the first successful commit, or Busy if already running.
+    /// @throws Error RetCode::ESTATE before the first successful commit, or RetCode::BUSY if already running.
     /// @note Thread creation exceptions propagate and leave the engine ready to retry.
     void start();
 
     /// @brief Stop the clock and wait for any in-flight block.
-    /// @throws Error Busy if called from this engine's clock thread.
+    /// @throws Error RetCode::BUSY if called from this engine's clock thread.
     void stop();
 
     /// @brief Reset nodes and the tick position while stopped.
-    /// @throws Error Busy while running.
+    /// @throws Error RetCode::BUSY while running.
     /// @note Resets each node instance held by the draft or current plan once and sets the next tick to zero.
     void reset();
 
@@ -165,7 +168,7 @@ class Engine
     View<const Connection> plan_connections() const;
 
     /// @brief Borrow a committed node instance, with the same lifetime as plan_nodes().
-    /// @throws Error UnknownNode if the node is outside the current plan.
+    /// @throws Error RetCode::EPORT for a nonzero port, or RetCode::ENODE for a node outside the plan.
     /// @note Follow the node's own contract for access during rendering.
     const Node *plan_node(NodeId node_id) const;
 

@@ -1,5 +1,5 @@
 #include "wav_file.h"
-#include "core/os.h"
+#include "audio_types.h"
 
 #include <algorithm>
 #include <array>
@@ -37,7 +37,7 @@ std::uint32_t wav_header_size(SampleFormat format) noexcept
 bool write_header(std::FILE *file, PortSpec spec, std::uint32_t data_size) noexcept
 {
     const auto width = static_cast<std::uint16_t>(spec.channels * sample_bytes(spec.format));
-    const auto rate = static_cast<std::uint32_t>(spec.sample_rate);
+    const auto rate = static_cast<std::uint32_t>(spec.bandwidth);
     const auto floating = spec.format == SampleFormat::F32LE;
     std::array<unsigned char, 58> header;
     auto *out = header.data();
@@ -159,10 +159,9 @@ bool parse_format(std::FILE *file, std::uint32_t size, WaveData &data)
         tag = read_u16(fmt.data() + 24);
     }
     const auto bits = read_u16(fmt.data() + 14);
-    data.spec = {static_cast<SampleRate>(read_u32(fmt.data() + 4)), read_u16(fmt.data() + 2), wav_format(tag, bits)};
+    data.spec = {static_cast<BandWidth>(read_u32(fmt.data() + 4)), read_u16(fmt.data() + 2), wav_format(tag, bits)};
     data.frame_bytes = read_u16(fmt.data() + 12);
-    return data.spec.format != SampleFormat::F32P && data.spec.valid() &&
-           data.frame_bytes == data.spec.channels * (bits / 8);
+    return valid_pcm_spec(data.spec) && data.frame_bytes == data.spec.channels * (bits / 8);
 }
 
 RetCode parse_wav(std::FILE *file, WaveData &data)
@@ -170,26 +169,26 @@ RetCode parse_wav(std::FILE *file, WaveData &data)
     unsigned char header[12];
     if (!read_bytes(file, header, sizeof(header)) || std::memcmp(header, "RIFF", 4) ||
         std::memcmp(header + 8, "WAVE", 4))
-        return ErrorCode::FormatMismatch;
+        return RetCode::INVFMT;
     const auto limit = std::int64_t{8} + read_u32(header + 4);
     if (limit < 12 || !seek_bytes(file, 0, SEEK_END) || tell_bytes(file) < limit)
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
 
     bool have_format = false;
     for (std::int64_t pos = 12; pos + 8 <= limit; )
     {
         unsigned char chunk[8];
         if (!seek_bytes(file, pos, SEEK_SET) || !read_bytes(file, chunk, sizeof(chunk)))
-            return ErrorCode::IoFailed;
+            return RetCode::IOFAILED;
         const auto size = read_u32(chunk + 4);
         const auto payload = pos + 8;
         pos = payload + size + (size & 1);
         if (pos > limit)
-            return ErrorCode::IoFailed;
+            return RetCode::IOFAILED;
         if (!have_format && !std::memcmp(chunk, "fmt ", 4))
         {
             if (!parse_format(file, size, data))
-                return ErrorCode::FormatMismatch;
+                return RetCode::INVFMT;
             have_format = true;
         }
         else if (!data.offset && !std::memcmp(chunk, "data", 4))
@@ -200,11 +199,11 @@ RetCode parse_wav(std::FILE *file, WaveData &data)
         if (have_format && data.offset)
         {
             if (data.size % data.frame_bytes)
-                return ErrorCode::FormatMismatch;
-            return seek_bytes(file, data.offset, SEEK_SET) ? RetCode{} : RetCode{ErrorCode::IoFailed};
+                return RetCode::INVFMT;
+            return seek_bytes(file, data.offset, SEEK_SET) ? RetCode::OK : RetCode::IOFAILED;
         }
     }
-    return ErrorCode::FormatMismatch;
+    return RetCode::INVFMT;
 }
 
 float read_f64(const unsigned char *bytes) noexcept
@@ -241,11 +240,11 @@ WavFile::~WavFile()
 RetCode WavFile::open_read(const std::string &path) noexcept
 {
     if (file_ && writing_)
-        return ErrorCode::Busy;
+        return RetCode::BUSY;
     const auto close_input = [](std::FILE *file) noexcept { std::fclose(file); };
     std::unique_ptr<std::FILE, decltype(close_input)> file(open_file(path.c_str(), "rb"), close_input);
     if (!file)
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     WaveData data;
     const auto parsed = parse_wav(file.get(), data);
     if (!parsed)
@@ -272,15 +271,15 @@ Result<std::size_t> WavFile::max_write_frames(PortSpec spec) noexcept
 {
     const auto format = spec.format;
     if (!supports_write_format(format))
-        return ErrorCode::FormatMismatch;
+        return RetCode::INVFMT;
     if (!spec.valid())
-        return ErrorCode::InvalidArg;
+        return RetCode::EPARAM;
     const auto sample_width = sample_bytes(format);
-    const auto rate = static_cast<std::uint32_t>(spec.sample_rate);
+    const auto rate = static_cast<std::uint32_t>(spec.bandwidth);
     constexpr auto max_bytes = std::numeric_limits<std::uint32_t>::max();
     if (spec.channels > std::numeric_limits<std::uint16_t>::max() / sample_width ||
         spec.channels > max_bytes / sample_width / rate)
-        return ErrorCode::TooLarge;
+        return RetCode::TOOLARGE;
 
     // Leave room for the RIFF header and the pad byte of an odd data chunk.
     const auto limit = (max_bytes - (wav_header_size(format) - 8)) & ~std::uint32_t{1};
@@ -290,19 +289,19 @@ Result<std::size_t> WavFile::max_write_frames(PortSpec spec) noexcept
 RetCode WavFile::open_write(const std::string &path, PortSpec spec, WriteMode mode) noexcept
 {
     if (file_)
-        return ErrorCode::Busy;
+        return RetCode::BUSY;
     const auto limit = max_write_frames(spec);
     if (!limit)
         return limit.ret_code();
     const auto exclusive = mode == WriteMode::Exclusive;
     auto *file = open_file(path.c_str(), exclusive ? "wbx" : "wb");
     if (!file)
-        return exclusive && errno == EEXIST ? ErrorCode::Busy : ErrorCode::IoFailed;
+        return exclusive && errno == EEXIST ? RetCode::BUSY : RetCode::IOFAILED;
 
     if (!write_header(file, spec, 0) || std::fflush(file) != 0)
     {
         std::fclose(file);
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     }
 
     file_ = file;
@@ -333,34 +332,34 @@ RetCode WavFile::close() noexcept
     writing_ = false;
     spec_ = {};
     frame_count_ = position_ = 0;
-    return prior_ok && finalized && closed == 0 ? RetCode{} : RetCode{ErrorCode::IoFailed};
+    return prior_ok && finalized && closed == 0 ? RetCode::OK : RetCode::IOFAILED;
 }
 
 RetCode WavFile::flush() noexcept
 {
     if (!writing_)
-        return ErrorCode::NotReady;
-    return std::fflush(file_) != 0 || std::ferror(file_) ? RetCode{ErrorCode::IoFailed} : RetCode{};
+        return RetCode::ESTATE;
+    return std::fflush(file_) != 0 || std::ferror(file_) ? RetCode::IOFAILED : RetCode::OK;
 }
 
 RetCode WavFile::status() const noexcept
 {
     if (!file_)
-        return ErrorCode::NotReady;
-    return std::ferror(file_) ? RetCode{ErrorCode::IoFailed} : RetCode{};
+        return RetCode::ESTATE;
+    return std::ferror(file_) ? RetCode::IOFAILED : RetCode::OK;
 }
 
 RetCode WavFile::seek(std::size_t frame) noexcept
 {
     if (!file_)
-        return ErrorCode::NotReady;
+        return RetCode::ESTATE;
     if (frame > frame_count_)
-        return ErrorCode::InvalidArg;
+        return RetCode::EPARAM;
     // Allow readers to retry while preserving any write error for close().
     if (!writing_)
         std::clearerr(file_);
     if (!seek_bytes(file_, data_offset_ + frame * file_frame_bytes_, SEEK_SET))
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     position_ = frame;
     return {};
 }
@@ -368,9 +367,9 @@ RetCode WavFile::seek(std::size_t frame) noexcept
 Result<std::size_t> WavFile::read(OBBlock output) noexcept
 {
     if (!file_ || writing_)
-        return ErrorCode::NotReady;
+        return RetCode::ESTATE;
     if (output.spec() != spec_)
-        return ErrorCode::FormatMismatch;
+        return RetCode::INVFMT;
     const auto frames = std::min(output.frames(), frame_count_ - position_);
     if (!frames)
         return frames;
@@ -379,7 +378,7 @@ Result<std::size_t> WavFile::read(OBBlock output) noexcept
     if (file_frame_bytes_ == spec_.channels * sample_bytes(spec_.format))
     {
         if (!read_bytes(file_, dst, frames * file_frame_bytes_))
-            return ErrorCode::IoFailed;
+            return RetCode::IOFAILED;
     }
     else
     {
@@ -391,7 +390,7 @@ Result<std::size_t> WavFile::read(OBBlock output) noexcept
         {
             const auto count = std::min(samples, scratch.size() / sample_width);
             if (!read_bytes(file_, scratch.data(), count * sample_width))
-                return ErrorCode::IoFailed;
+                return RetCode::IOFAILED;
             convert_to_f32le(scratch.data(), sample_width, count, dst);
             samples -= count;
             dst += count * sizeof(float);
@@ -404,19 +403,19 @@ Result<std::size_t> WavFile::read(OBBlock output) noexcept
 RetCode WavFile::write(IBBlock input) noexcept
 {
     if (!writing_)
-        return ErrorCode::NotReady;
+        return RetCode::ESTATE;
     if (input.spec() != spec_)
-        return ErrorCode::FormatMismatch;
+        return RetCode::INVFMT;
     if (std::ferror(file_))
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     if (input.frames() > write_limit_ - position_)
-        return ErrorCode::TooLarge;
+        return RetCode::TOOLARGE;
     if (!input.frames())
         return {};
 
     if (std::fwrite(input.byte_view().data(), file_frame_bytes_, input.frames(), file_) != input.frames() ||
         std::ferror(file_))
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     position_ += input.frames();
     frame_count_ = std::max(frame_count_, position_);
     return {};

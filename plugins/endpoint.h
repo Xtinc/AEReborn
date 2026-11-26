@@ -21,12 +21,12 @@ class Capture final : public NodeT<0, 1>
     /// @param rate Graph-side sample rate.
     /// @param channels Number of output channels.
     /// @param io_period Maximum duration of one external batch, used to size the queue.
-    /// @throws Error InvalidArg If the port specification is invalid or the I/O period is nonpositive.
-    Capture(SampleRate rate, std::size_t channels, std::chrono::microseconds io_period);
+    /// @throws Error RetCode::EPARAM If the port specification is invalid or the I/O period is nonpositive.
+    Capture(BandWidth rate, std::size_t channels, std::chrono::microseconds io_period);
 
     /// @brief Prepare the queue for the graph period on the control side.
     /// @param period Graph block period.
-    /// @throws Error InvalidArg for an unsupported period, Busy if changing it while bound, or TooLarge if the
+    /// @throws Error RetCode::EPARAM for an unsupported period, RetCode::BUSY if changing it while bound, or RetCode::TOOLARGE if the
     /// queue exceeds its capacity limit.
     void prepare(BlockPeriod period) override;
 
@@ -108,12 +108,12 @@ class Playback final : public NodeT<1, 0>
     /// @param rate Graph-side sample rate.
     /// @param channels Number of input channels.
     /// @param io_period Maximum duration of one external batch, used to size the queue.
-    /// @throws Error InvalidArg If the port specification is invalid or the I/O period is nonpositive.
-    Playback(SampleRate rate, std::size_t channels, std::chrono::microseconds io_period);
+    /// @throws Error RetCode::EPARAM If the port specification is invalid or the I/O period is nonpositive.
+    Playback(BandWidth rate, std::size_t channels, std::chrono::microseconds io_period);
 
     /// @brief Prepare the queue for the graph period on the control side.
     /// @param period Graph block period.
-    /// @throws Error InvalidArg for an unsupported period, Busy if changing it while bound, or TooLarge if the
+    /// @throws Error RetCode::EPARAM for an unsupported period, RetCode::BUSY if changing it while bound, or RetCode::TOOLARGE if the
     /// queue exceeds its capacity limit.
     void prepare(BlockPeriod period) override;
 

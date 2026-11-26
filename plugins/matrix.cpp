@@ -46,31 +46,31 @@ void apply_ramping_gain(float *dst, const float *src, std::size_t frames, float 
 }
 } // namespace
 
-Matrix::Matrix(SampleRate rate, std::size_t channels, float gain)
+Matrix::Matrix(BandWidth rate, std::size_t channels, float gain)
     : NodeT({PortSpec(rate, channels, SampleFormat::F32P)}, {PortSpec(rate, channels, SampleFormat::F32P)}),
       target_(gain), gain_(gain)
 {
     if (!inputs()[0].valid() || !std::isfinite(gain))
-        throw Error(ErrorCode::InvalidArg, "Invalid matrix specification");
+        throw Error(RetCode::EPARAM, "Invalid matrix specification");
 }
-Matrix::Matrix(SampleRate rate, std::size_t input_channels, std::size_t output_channels, View<const float> coefficients,
+Matrix::Matrix(BandWidth rate, std::size_t input_channels, std::size_t output_channels, View<const float> coefficients,
                float gain)
     : NodeT({PortSpec(rate, input_channels, SampleFormat::F32P)},
             {PortSpec(rate, output_channels, SampleFormat::F32P)}),
       target_(gain), gain_(gain)
 {
     if (!inputs()[0].valid() || !outputs()[0].valid() || !std::isfinite(gain))
-        throw Error(ErrorCode::InvalidArg, "Invalid matrix specification");
+        throw Error(RetCode::EPARAM, "Invalid matrix specification");
     if (output_channels > coefficients_.max_size() / input_channels)
-        throw Error(ErrorCode::TooLarge, "Channel matrix exceeds supported size");
+        throw Error(RetCode::TOOLARGE, "Channel matrix exceeds supported size");
     if (coefficients.size() != input_channels * output_channels)
-        throw Error(ErrorCode::InvalidArg, "Channel matrix dimensions do not match coefficients");
+        throw Error(RetCode::EPARAM, "Channel matrix dimensions do not match coefficients");
     for (const auto value : coefficients)
         if (!std::isfinite(value))
-            throw Error(ErrorCode::InvalidArg, "Matrix coefficients must be finite");
+            throw Error(RetCode::EPARAM, "Matrix coefficients must be finite");
     coefficients_.assign(coefficients.begin(), coefficients.end());
 }
-Matrix::Matrix(SampleRate rate, std::size_t input_channels, std::size_t output_channels,
+Matrix::Matrix(BandWidth rate, std::size_t input_channels, std::size_t output_channels,
                std::initializer_list<float> coefficients, float gain)
     : Matrix(rate, input_channels, output_channels, {coefficients.begin(), coefficients.size()}, gain)
 {
@@ -78,7 +78,7 @@ Matrix::Matrix(SampleRate rate, std::size_t input_channels, std::size_t output_c
 void Matrix::set_gain(float gain)
 {
     if (!std::isfinite(gain))
-        throw Error(ErrorCode::InvalidArg);
+        throw Error(RetCode::EPARAM);
     target_.store(gain, std::memory_order_release);
 }
 float Matrix::gain() const noexcept

@@ -259,22 +259,22 @@ bool valid_offset(double offset) noexcept
     return offset >= 0.0 && offset < 0.5;
 }
 
-bool needs_filter(SampleRate src_fs, SampleRate dst_fs, double offset) noexcept
+bool needs_filter(BandWidth src_fs, BandWidth dst_fs, double offset) noexcept
 {
     return src_fs != dst_fs || offset > 0;
 }
 
-double nominal_step(SampleRate src_fs, SampleRate dst_fs) noexcept
+double nominal_step(BandWidth src_fs, BandWidth dst_fs) noexcept
 {
     return static_cast<double>(static_cast<std::uint32_t>(src_fs)) / static_cast<std::uint32_t>(dst_fs);
 }
 
-std::size_t workspace_bound(SampleRate src_fs, SampleRate dst_fs, std::size_t frames, double offset, bool bound_input)
+std::size_t workspace_bound(BandWidth src_fs, BandWidth dst_fs, std::size_t frames, double offset, bool bound_input)
 {
-    if (!is_sample_rate(src_fs) || !is_sample_rate(dst_fs) || !valid_offset(offset))
-        throw Error(ErrorCode::InvalidArg);
+    if (!is_bandwidth(src_fs) || !is_bandwidth(dst_fs) || !valid_offset(offset))
+        throw Error(RetCode::EPARAM);
     if (frames > frame_limit)
-        throw Error(ErrorCode::TooLarge);
+        throw Error(RetCode::TOOLARGE);
     if (!frames || !needs_filter(src_fs, dst_fs, offset))
         return frames;
 
@@ -297,7 +297,7 @@ std::size_t workspace_bound(SampleRate src_fs, SampleRate dst_fs, std::size_t fr
     }
     const auto rounded = std::ceil(scaled);
     if (rounded >= static_cast<long double>(frame_limit))
-        throw Error(ErrorCode::TooLarge);
+        throw Error(RetCode::TOOLARGE);
     return static_cast<std::size_t>(rounded) + 1;
 }
 } // namespace
@@ -323,10 +323,10 @@ void SincResampler::Position::advance(std::uint64_t step, std::uint64_t unit) no
     fraction = next % unit;
 }
 
-void SincResampler::prepare(std::size_t channels, SampleRate src_fs, SampleRate dst_fs, double offset)
+void SincResampler::prepare(std::size_t channels, BandWidth src_fs, BandWidth dst_fs, double offset)
 {
-    if (!channels || !is_sample_rate(src_fs) || !is_sample_rate(dst_fs) || !valid_offset(offset))
-        throw Error(ErrorCode::InvalidArg);
+    if (!channels || !is_bandwidth(src_fs) || !is_bandwidth(dst_fs) || !valid_offset(offset))
+        throw Error(RetCode::EPARAM);
 
     Buffer history;
     std::vector<float> kernel;
@@ -444,12 +444,12 @@ SincResampler::Transfer SincResampler::run(IFBlock input, OFBlock output, Positi
     return result;
 }
 
-std::size_t SincResampler::max_output_frames(SampleRate src_fs, SampleRate dst_fs, std::size_t frames, double offset)
+std::size_t SincResampler::max_output_frames(BandWidth src_fs, BandWidth dst_fs, std::size_t frames, double offset)
 {
     return workspace_bound(src_fs, dst_fs, frames, offset, false);
 }
 
-std::size_t SincResampler::max_input_frames(SampleRate src_fs, SampleRate dst_fs, std::size_t frames, double offset)
+std::size_t SincResampler::max_input_frames(BandWidth src_fs, BandWidth dst_fs, std::size_t frames, double offset)
 {
     return workspace_bound(src_fs, dst_fs, frames, offset, true);
 }
