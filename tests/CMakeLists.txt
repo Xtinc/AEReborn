@@ -22,7 +22,7 @@ add_executable(aereborn_public_audio_center public/audio_center.cpp)
 target_link_libraries(aereborn_public_audio_center PRIVATE aereborn::aereborn)
 target_include_directories(aereborn_public_audio_center PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/support")
 target_compile_definitions(aereborn_public_audio_center PRIVATE AEREBORN_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/data")
-foreach(case wav_routing_and_bridge live_control_and_cleanup concurrency_and_teardown)
+foreach(case channel_map wav_routing_and_bridge live_control_and_cleanup concurrency_and_teardown)
     add_test(NAME public.audio_center_${case} COMMAND aereborn_public_audio_center ${case})
     set_tests_properties(public.audio_center_${case} PROPERTIES LABELS public TIMEOUT 20)
 endforeach()
@@ -58,5 +58,5 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ALSA_FOUND)
 endif()
 aereborn_test_group(regression allocation_tests.cpp aereborn::aereborn
     commit_allocation_rollback backend_allocation_rollback command_queue_timer_allocation_rollback
-    graph_service_allocation_rollback graph_service_live_commit_failure
+    channel_map_allocation_status graph_service_allocation_rollback graph_service_live_commit_failure
     render_and_passive_io_without_heap active_workers_without_heap)

@@ -8,6 +8,7 @@
 #include "plugins/matrix.h"
 #include "plugins/mixer.h"
 #include "app/graph_service.h"
+#include "audio_interface.h"
 #include <cstdlib>
 #include <future>
 #include <memory>
@@ -131,6 +132,18 @@ void commit_allocation_rollback()
         }
     }
     check(false, "All graph preparation allocations were visited");
+}
+
+void channel_map_allocation_status()
+{
+    ChannelMap empty, dense;
+    const std::vector<float> coefficients{1.0f, 0.0f};
+    check(!allocation_fails(0, [&] { empty = ChannelMap(2, 1); }),
+          "Construction reports allocation failure through the map");
+    check(!allocation_fails(0, [&] { dense = ChannelMap::dense(2, 1, coefficients); }),
+          "Dense construction catches allocation failure when copying the coefficients");
+    check(empty.route(10, 10).status() == RetCode::TOOLARGE && dense.status() == RetCode::TOOLARGE,
+          "Allocation failure is retained as the first error");
 }
 
 void graph_service_allocation_rollback()
@@ -408,6 +421,7 @@ int main(int argc, char **argv)
 {
     return aereborn::test::run_tests(argc, argv, {{"commit_allocation_rollback", commit_allocation_rollback},
                                                 {"backend_allocation_rollback", backend_allocation_rollback},
+                                                {"channel_map_allocation_status", channel_map_allocation_status},
                                                 {"graph_service_allocation_rollback", graph_service_allocation_rollback},
                                                 {"graph_service_live_commit_failure", graph_service_live_commit_failure},
                                                 {"command_queue_timer_allocation_rollback",

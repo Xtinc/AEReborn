@@ -73,11 +73,12 @@ NodeId AudioCenter::create_matrix(BandWidth bandwidth, std::size_t channels, flo
     return dispatch(*commands_, [&] { return graph_->create_matrix(bandwidth, channels, gain); });
 }
 
-NodeId AudioCenter::create_matrix(BandWidth bandwidth, std::size_t input_channels, std::size_t output_channels,
-                                  const std::vector<float> &coefficients, float gain)
+NodeId AudioCenter::create_matrix(BandWidth bandwidth, const ChannelMap &map, float gain)
 {
     return dispatch(*commands_, [&] {
-        return graph_->create_matrix(bandwidth, input_channels, output_channels,
+        throw_if_error(map.status());
+        const auto &coefficients = map.coefficients();
+        return graph_->create_matrix(bandwidth, map.input_channels(), map.output_channels(),
                                      {coefficients.data(), coefficients.size()}, gain);
     });
 }

@@ -4,6 +4,7 @@
 #include "audio_types.h"
 #include <chrono>
 #include <cstddef>
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <vector>
@@ -13,6 +14,73 @@ namespace aereborn
 
 class CommandQueue;
 class GraphService;
+
+/// @brief Build a weighted channel map for AudioCenter::create_matrix().
+/// @note Indices are zero-based and follow the direction from input to output.
+///       Construction and editing keep the first error. Later edits leave the map alone.
+class ChannelMap
+{
+  public:
+    /// @brief Construct an empty map with status EPARAM.
+    ChannelMap() noexcept = default;
+    /// @brief Construct a silent map with the given input and output channel counts.
+    explicit ChannelMap(std::size_t input_channels, std::size_t output_channels) noexcept;
+
+    /// @brief Route every input to the corresponding output at unity gain.
+    static ChannelMap identity(std::size_t channels) noexcept;
+    /// @brief Pick inputs in output order. An input may appear more than once.
+    static ChannelMap select(std::size_t input_channels, const std::vector<std::size_t> &sources) noexcept;
+    /// @copydoc select(std::size_t, const std::vector<std::size_t>&)
+    static ChannelMap select(std::size_t input_channels, std::initializer_list<std::size_t> sources) noexcept;
+    /// @brief Pick count consecutive input channels starting at first.
+    static ChannelMap slice(std::size_t input_channels, std::size_t first, std::size_t count) noexcept;
+    /// @brief Average the input channels into a single output.
+    static ChannelMap to_mono(std::size_t input_channels) noexcept;
+    /// @brief Copy one input channel to every output.
+    static ChannelMap from_mono(std::size_t output_channels) noexcept;
+    /// @brief Copy row-major coefficients, one row of input weights per output.
+    static ChannelMap dense(std::size_t input_channels, std::size_t output_channels,
+                            const std::vector<float> &coefficients) noexcept;
+    /// @copydoc dense(std::size_t, std::size_t, const std::vector<float>&)
+    static ChannelMap dense(std::size_t input_channels, std::size_t output_channels,
+                            std::initializer_list<float> coefficients) noexcept;
+
+    /// @brief Set the weight from one input to one output. Zero disconnects that route.
+    ChannelMap &route(std::size_t from, std::size_t to, float weight = 1.0f) noexcept;
+    /// @brief Replace an output's weights with gain divided equally among distinct inputs.
+    ChannelMap &mix(const std::vector<std::size_t> &from, std::size_t to, float gain = 1.0f) noexcept;
+    /// @copydoc mix(const std::vector<std::size_t>&, std::size_t, float)
+    ChannelMap &mix(std::initializer_list<std::size_t> from, std::size_t to, float gain = 1.0f) noexcept;
+    /// @brief Multiply the weights feeding one output by factor.
+    ChannelMap &scale_output(std::size_t to, float factor) noexcept;
+    /// @brief Clear all weights feeding one output.
+    ChannelMap &clear_output(std::size_t to) noexcept;
+    /// @brief Exchange the weights feeding two outputs.
+    ChannelMap &swap_outputs(std::size_t first, std::size_t second) noexcept;
+
+    /// @brief Report whether this map can be passed to AudioCenter::create_matrix().
+    bool valid() const noexcept;
+    /// @brief Report EPARAM for invalid maps or edits and TOOLARGE for capacity or allocation failures.
+    RetCode status() const noexcept;
+    std::size_t input_channels() const noexcept { return input_channels_; }
+    std::size_t output_channels() const noexcept { return output_channels_; }
+    /// @brief Return a routing weight, or zero for an invalid map or index.
+    float weight(std::size_t from, std::size_t to) const noexcept;
+    /// @brief Borrow row-major coefficients until the map is edited, moved, or destroyed.
+    const std::vector<float> &coefficients() const noexcept { return coefficients_; }
+
+  private:
+    static ChannelMap select(std::size_t input_channels, const std::size_t *sources, std::size_t count) noexcept;
+    static ChannelMap dense(std::size_t input_channels, std::size_t output_channels,
+                            const float *coefficients, std::size_t count) noexcept;
+    ChannelMap &mix(const std::size_t *from, std::size_t count, std::size_t to, float gain) noexcept;
+    float *output_row(std::size_t to) noexcept;
+
+    std::size_t input_channels_ = 0;
+    std::size_t output_channels_ = 0;
+    std::vector<float> coefficients_;
+    RetCode status_{RetCode::EPARAM};
+};
 
 /// @brief Control a graph of WAV endpoints, mixers, and channel matrices.
 /// @note Calls on a live instance serialize on a control thread and may block.
@@ -52,10 +120,10 @@ class AudioCenter
     NodeId create_mixer(BandWidth bandwidth, std::size_t channels, std::size_t inputs);
     /// @brief Create an identity channel map with linear gain. Returns an empty handle on failure.
     NodeId create_matrix(BandWidth bandwidth, std::size_t channels, float gain = 1.0f);
-    /// @brief Create a channel map with row-major coefficients (output by input) and linear gain.
+    /// @brief Create a node by copying a channel map and applying the given linear gain.
     /// @return A node handle, or an empty handle on failure.
-    NodeId create_matrix(BandWidth bandwidth, std::size_t input_channels, std::size_t output_channels,
-                         const std::vector<float> &coefficients, float gain = 1.0f);
+    /// @note Keep the map available for reading until this call returns. See last_error() on failure.
+    NodeId create_matrix(BandWidth bandwidth, const ChannelMap &map, float gain = 1.0f);
 
     /// @brief Stage a connection from an output to an input, inserting format bridges as needed.
     RetCode connect(NodeId from, NodeId to);

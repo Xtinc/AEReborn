@@ -26,6 +26,7 @@ add_library(aereborn STATIC
     backend/wav_file.cpp
     diag/inspect.cpp
     app/audio_center.cpp
+    app/channel_map.cpp
     app/graph_service.cpp
 )
 add_library(aereborn::aereborn ALIAS aereborn)

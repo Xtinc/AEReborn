@@ -6,7 +6,9 @@
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace
 {
@@ -86,16 +88,16 @@ bool has_signal(const Bytes &data)
     return std::any_of(data.begin(), data.end(), [](unsigned char byte) { return byte != 0; });
 }
 
-std::size_t find_steady_level(const Bytes &data, std::size_t start, std::uint16_t level)
+std::size_t find_steady_level(const Bytes &data, std::size_t start, std::uint16_t level, std::size_t channels = 2)
 {
     std::size_t matching = 0;
     for (auto sample = start; sample < data.size(); sample += 2)
     {
         matching = little_endian(data, sample, 2) == level ? matching + 1 : 0;
-        if (matching == 2 * 480 * 2)
+        if (matching == 2 * 480 * channels)
             return sample + 2;
     }
-    throw std::runtime_error("Expected two stereo blocks at level " + std::to_string(level));
+    throw std::runtime_error("Expected two blocks at level " + std::to_string(level));
 }
 
 std::uint64_t tick(const AudioCenter &audio)
@@ -112,6 +114,85 @@ void advance(const AudioCenter &audio, std::uint64_t blocks)
     wait_for([&] { return tick(audio) >= target; }, "Wait for the expected render ticks", 4s);
 }
 
+void channel_map()
+{
+    const auto selected = ChannelMap::select(3, std::vector<std::size_t>{2, 0, 2});
+    check(selected.valid() && selected.input_channels() == 3 && selected.output_channels() == 3 &&
+              selected.coefficients() == std::vector<float>{0, 0, 1, 1, 0, 0, 0, 0, 1},
+          "Selection reorders and duplicates input channels in output order");
+    const auto sliced = ChannelMap::slice(3, 1, 2);
+    check(sliced.coefficients() == std::vector<float>{0, 1, 0, 0, 0, 1}, "Slice preserves the selected channel order");
+    const auto mono = ChannelMap::to_mono(4);
+    check(mono.coefficients() == std::vector<float>{0.25f, 0.25f, 0.25f, 0.25f}, "Downmix averages all channels");
+    auto spread = ChannelMap::from_mono(3);
+    spread.clear_output(1);
+    check(spread.coefficients() == std::vector<float>{1, 0, 1}, "Broadcast copies mono and allows muting one output");
+    ChannelMap replaced(3, 1);
+    replaced.route(2, 0).mix({0, 1}, 0);
+    check(replaced.coefficients() == std::vector<float>{0.5f, 0.5f, 0}, "A mix replaces every weight in its output row");
+
+    auto edited = ChannelMap::identity(2);
+    edited.swap_outputs(0, 0).swap_outputs(0, 1).scale_output(1, -1.0f).route(1, 0, 0.0f).route(0, 0, 0.75f);
+    check(edited.coefficients() == std::vector<float>{0.75f, 0, -1, 0}, "Edits address weights from input to output");
+    check(edited.weight(0, 1) == -1.0f && edited.weight(2, 0) == 0.0f && edited.weight(0, 2) == 0.0f,
+          "Weight uses from-to indexing and handles out-of-range queries");
+
+    const std::vector<float> raw{1.0f, -0.5f};
+    auto moved_from = ChannelMap::dense(2, 1, raw);
+    auto moved = std::move(moved_from);
+    check(moved.valid() && moved.coefficients() == raw, "A dense map preserves coefficients through a move");
+    expect(moved_from.route(0, 0).status(), RetCode::EPARAM);
+    check(moved_from.weight(0, 0) == 0.0f, "Moved-from maps are safe to query");
+
+    auto invalid_edit = ChannelMap::identity(2);
+    invalid_edit.mix({0, 0}, 1).clear_output(0);
+    expect(invalid_edit.status(), RetCode::EPARAM);
+    check(invalid_edit.coefficients() == std::vector<float>{1, 0, 0, 1},
+          "A rejected mix and subsequent edits leave the previous coefficients intact");
+    const auto infinity = std::numeric_limits<float>::infinity();
+    const auto largest = std::numeric_limits<float>::max();
+    expect(ChannelMap().status(), RetCode::EPARAM);
+    expect(ChannelMap(0, 2).status(), RetCode::EPARAM);
+    expect(ChannelMap::identity(std::numeric_limits<std::size_t>::max()).status(), RetCode::TOOLARGE);
+    expect(ChannelMap::select(3, {}).status(), RetCode::EPARAM);
+    expect(ChannelMap::select(3, {3}).status(), RetCode::EPARAM);
+    expect(ChannelMap::slice(3, 1, std::numeric_limits<std::size_t>::max()).status(), RetCode::EPARAM);
+    expect(ChannelMap::dense(2, 1, {1.0f}).status(), RetCode::EPARAM);
+    expect(ChannelMap::dense(1, 1, {std::numeric_limits<float>::quiet_NaN()}).status(), RetCode::EPARAM);
+    expect(ChannelMap(2, 1).mix({}, 0).status(), RetCode::EPARAM);
+    expect(ChannelMap(2, 1).mix({0, 2}, 0).status(), RetCode::EPARAM);
+    expect(ChannelMap(2, 1).route(0, 0, infinity).status(), RetCode::EPARAM);
+    expect(ChannelMap::identity(1).swap_outputs(0, 1).status(), RetCode::EPARAM);
+    auto overflow = ChannelMap::dense(2, 1, {1.0f, largest});
+    overflow.scale_output(0, 2.0f);
+    expect(overflow.status(), RetCode::EPARAM);
+    check(overflow.coefficients() == std::vector<float>{1.0f, largest}, "A scaling overflow leaves the full row intact");
+
+    TempWave files("channel-map");
+    const auto input = files.path("-input.wav");
+    const auto output = files.path("-output.wav");
+    write_constant_stereo(input);
+    AudioCenter audio;
+    check(!audio.create_matrix(BandWidth::Full, invalid_edit), "Invalid maps do not create nodes");
+    expect(AudioCenter::last_error(), RetCode::EPARAM);
+    check(!audio.create_matrix(BandWidth::Full, ChannelMap::identity(std::numeric_limits<std::size_t>::max())),
+          "Map capacity failures do not create nodes");
+    expect(AudioCenter::last_error(), RetCode::TOOLARGE);
+    const auto source = audio.create_iwav(input, -1);
+    ChannelMap negative(2, 1);
+    negative.route(0, 0, 2.0f).mix(std::vector<std::size_t>{0, 1}, 0, -1.0f);
+    const auto matrix = audio.create_matrix(BandWidth::Full, negative, 0.5f);
+    negative.clear_output(0);
+    const auto sink = audio.create_owav(output, {BandWidth::Full, 1, SampleFormat::S16LE});
+    check(source && matrix && sink, "Create a two-to-one route from the map");
+    expect(audio.connect(source, matrix));
+    expect(audio.connect(matrix, sink));
+    expect(audio.start());
+    advance(audio, 8);
+    expect(audio.remove(sink));
+    find_steady_level(read_s16(output, 48000, 1), 0, static_cast<std::uint16_t>(-4096), 1);
+}
+
 void wav_routing_and_bridge()
 {
     const std::string input = AEREBORN_TEST_DATA "/dukou_excerpt.wav";
@@ -124,7 +205,7 @@ void wav_routing_and_bridge()
     AudioCenter audio;
     const auto source = audio.create_iwav(input);
     const auto mixer = audio.create_mixer(BandWidth::Full, 2, 2);
-    const auto matrix = audio.create_matrix(BandWidth::Full, 2, 2, {1.0f, 0.0f, 0.0f, 1.0f});
+    const auto matrix = audio.create_matrix(BandWidth::Full, ChannelMap::identity(2));
     const auto out_stereo = audio.create_owav(stereo);
     const auto out_mono = audio.create_owav(mono, cd_mono);
     check(source && mixer && matrix && out_stereo && out_mono, "Create all WAV routes");
@@ -330,7 +411,8 @@ void concurrency_and_teardown()
 
 int main(int argc, char **argv)
 {
-    return run_tests(argc, argv, {{"wav_routing_and_bridge", wav_routing_and_bridge},
+    return run_tests(argc, argv, {{"channel_map", channel_map},
+                                  {"wav_routing_and_bridge", wav_routing_and_bridge},
                                   {"live_control_and_cleanup", live_control_and_cleanup},
                                   {"concurrency_and_teardown", concurrency_and_teardown}});
 }
