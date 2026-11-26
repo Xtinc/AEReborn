@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -49,11 +50,8 @@ class GraphService
     std::string dump_dot() const;
 
   private:
-    struct NodeRecord
-    {
-        std::unique_ptr<Backend> backend;
-        bool started_in_plan = false; // Remains true through natural EOS until the node leaves the plan or stops.
-    };
+    using NodeMap = std::map<NodeId, std::unique_ptr<Backend>>;
+
     struct LogicalLink
     {
         NodeId from;
@@ -61,19 +59,19 @@ class GraphService
         ConnId direct{};
     };
 
-    std::map<NodeId, NodeRecord>::iterator add_node(std::unique_ptr<Node> node);
+    NodeMap::iterator add_node(std::unique_ptr<Node> node);
     template <class Endpoint>
     NodeId add_endpoint(std::unique_ptr<Endpoint> endpoint, std::unique_ptr<ActiveBackend> backend);
-    std::map<NodeId, NodeRecord>::iterator find_node(NodeId node);
+    NodeMap::iterator find_node(NodeId node);
+    Backend *backend_of(NodeId node) noexcept;
     PortSpec port_spec(NodeId port, bool output);
     void disconnect_input(NodeId to, const NodeId *from);
     void remove_bridges(const LogicalLink &link) noexcept;
-    void sync_backends();
     std::vector<const Backend *> backends() const;
 
     CommandQueue &commands_;
     Engine engine_;
-    std::map<NodeId, NodeRecord> nodes_;
+    NodeMap nodes_;
     std::map<NodeId, LogicalLink> links_; // Keyed by destination input port.
 };
 

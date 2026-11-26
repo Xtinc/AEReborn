@@ -119,6 +119,7 @@ void wav_routing_and_bridge()
     const auto stereo = files.path("-stereo.wav");
     const auto mono = files.path("-mono.wav");
     const auto upmixed = files.path("-upmixed.wav");
+    const auto added = files.path("-added.wav");
     const PortSpec cd_mono{BandWidth::CDQuality, 1, SampleFormat::S16LE};
     AudioCenter audio;
     const auto source = audio.create_iwav(input);
@@ -142,21 +143,40 @@ void wav_routing_and_bridge()
     check(audio.dump_dot().find("digraph") != std::string::npos, "Expect DOT diagnostics");
     wait_for([&] { return audio.dump_text().find("err=End of stream") != std::string::npos; },
              "The finite input reaches EOS", 4s);
+    const auto added_source = audio.create_iwav(input, -1);
+    const auto added_sink = audio.create_owav(added);
+    check(added_source && added_sink, "Create an independent branch while the engine is running");
+    expect(audio.connect(added_source, added_sink));
     expect(audio.set_paused(out_stereo, true));
     expect(audio.commit());
+    const auto changed = audio.dump_text();
+    check(changed.find("err=End of stream") != std::string::npos &&
+              changed.find("WavCapture (sync) state=Running") != std::string::npos,
+          "The new branch starts while the original capture stays at EOS");
+    advance(audio, 8);
     check(audio.dump_text().find("err=End of stream") != std::string::npos,
-          "A source still in the plan stays at EOS across a live commit");
-    advance(audio, 3); // Render the graph converter's tail after capture has drained.
+          "The original capture keeps its EOS status while the new branch runs");
+    expect(audio.stop());
     expect(audio.stop());
     expect(audio.remove(out_stereo));
     expect(audio.remove(out_mono));
+    expect(audio.remove(added_sink));
+    expect(audio.remove(added_source));
     check(has_signal(read_s16(stereo, 48000, 2)), "Stereo branch contains audio");
     check(has_signal(read_s16(mono, 44100, 1)), "Downmixed and resampled branch contains audio");
+    check(has_signal(read_s16(added, 48000, 2)), "The branch added during runtime records audio");
 
     const auto mono_source = audio.create_iwav(mono);
     const auto stereo_sink = audio.create_owav(upmixed);
     check(mono_source && stereo_sink, "Create the reverse specification route");
     expect(audio.connect(mono_source, stereo_sink));
+    expect(audio.commit());
+    const auto stopped = audio.dump_text();
+    check(stopped.find("Engine: Ready") != std::string::npos &&
+              stopped.find("WavCapture (sync) state=Stopped") != std::string::npos &&
+              stopped.find("WavPlayback (sync) state=Stopped") != std::string::npos &&
+              stopped.find("state=Running") == std::string::npos,
+          "A stopped engine can publish a new plan without starting its backends");
     expect(audio.start());
     const auto reverse = audio.dump_text();
     const auto upconvert = reverse.find("] Convert");
@@ -237,6 +257,20 @@ void live_control_and_cleanup()
     find_steady_level(sound, cursor, 4096);
     check(std::none_of(sound.end() - 480 * 4 * 4, sound.end(), [](unsigned char byte) { return byte != 0; }),
           "Disconnect keeps recording silence through the final blocks");
+
+    expect(audio.set_paused(monitor_sink, true));
+    expect(audio.commit());
+    const auto paused = audio.dump_text();
+    const auto detached = paused.find("Detached Backends:");
+    check(paused.find("WavPlayback (sync) state=Stopped", detached) != std::string::npos,
+          "A paused recorder stops and appears among detached backends");
+    expect(audio.set_paused(monitor_sink, false));
+    expect(audio.commit());
+    const auto resumed = audio.dump_text();
+    check(resumed.find("WavCapture (sync) state=Running") != std::string::npos &&
+              resumed.find("WavPlayback (sync) state=Running") != std::string::npos,
+          "Both endpoints restart when the recorder rejoins the plan");
+
     expect(audio.remove(source)); // Unbind while the old plan still includes this endpoint.
     expect(audio.commit());
     expect(audio.remove(monitor_sink));

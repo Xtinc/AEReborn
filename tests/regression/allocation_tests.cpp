@@ -195,7 +195,7 @@ void graph_service_live_commit_failure()
         const auto third_path = files.path("-third.wav");
         const auto failed = queue.sync([&] {
             GraphService graph(queue, period);
-            graph.create_owav(first_path, pcm, 0s, 10ms);
+            const auto first = graph.create_owav(first_path, pcm, 0s, 10ms);
             const auto second = graph.create_owav(second_path, pcm, 0s, 10ms);
             const auto third = graph.create_owav(third_path, pcm, 0s, 10ms);
             graph.set_paused(second, true);
@@ -210,7 +210,11 @@ void graph_service_live_commit_failure()
             if (after.find("dirty=true") != std::string::npos)
             {
                 preparation_failed = true;
-                check(after.find("Engine: Running") != std::string::npos, "Preparation failure keeps the old plan running");
+                check(after.find("Engine: Running") != std::string::npos &&
+                          after.find("[" + std::to_string(first.node()) + "] Playback") != std::string::npos &&
+                          after.find("[" + std::to_string(third.node()) + "] Playback") == std::string::npos &&
+                          after.find("state=Running") != std::string::npos,
+                      "Preparation failure keeps the old plan and its backend running");
                 graph.commit();
             }
             else

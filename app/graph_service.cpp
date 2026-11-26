@@ -14,6 +14,11 @@ namespace aereborn
 namespace
 {
 
+bool contains_node(View<const NodeId> nodes, NodeId id) noexcept
+{
+    return !nodes.empty() && std::find(nodes.begin(), nodes.end(), id) != nodes.end();
+}
+
 std::vector<float> default_matrix(std::size_t inputs, std::size_t outputs)
 {
     std::vector<float> coefficients;
@@ -36,19 +41,19 @@ GraphService::~GraphService()
 {
     assert(commands_.on_thread());
     for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it)
-        if (it->second.backend)
-            it->second.backend->unbind();
+        if (it->second)
+            it->second->unbind();
     engine_.stop();
 }
 
-std::map<NodeId, GraphService::NodeRecord>::iterator GraphService::add_node(std::unique_ptr<Node> node)
+GraphService::NodeMap::iterator GraphService::add_node(std::unique_ptr<Node> node)
 {
     const auto id = engine_.add_node(std::move(node));
     const auto cleanup = [&]() noexcept { engine_.remove_node(id); };
     ScopeExit<decltype(cleanup)> rollback(cleanup);
-    const auto record = nodes_.emplace(id, NodeRecord{}).first;
+    const auto entry = nodes_.emplace(id, nullptr).first;
     rollback.dismiss();
-    return record;
+    return entry;
 }
 
 template <class Endpoint>
@@ -56,16 +61,16 @@ NodeId GraphService::add_endpoint(std::unique_ptr<Endpoint> endpoint, std::uniqu
 {
     auto *node = endpoint.get();
     node->prepare(engine_.block_period());
-    const auto record = add_node(std::move(endpoint));
+    const auto entry = add_node(std::move(endpoint));
     const auto cleanup = [&]() noexcept {
-        engine_.remove_node(record->first);
-        nodes_.erase(record);
+        engine_.remove_node(entry->first);
+        nodes_.erase(entry);
     };
     ScopeExit<decltype(cleanup)> rollback(cleanup);
     backend->bind(*node);
-    record->second.backend = std::move(backend);
+    entry->second = std::move(backend);
     rollback.dismiss();
-    return record->first;
+    return entry->first;
 }
 
 NodeId GraphService::create_iwav(const std::string &path, int repeat, std::chrono::microseconds io_period)
@@ -109,15 +114,21 @@ NodeId GraphService::create_matrix(BandWidth bandwidth, std::size_t input_channe
     return add_node(std::make_unique<Matrix>(bandwidth, input_channels, output_channels, coefficients, gain))->first;
 }
 
-std::map<NodeId, GraphService::NodeRecord>::iterator GraphService::find_node(NodeId node)
+GraphService::NodeMap::iterator GraphService::find_node(NodeId node)
 {
     assert(commands_.on_thread());
     if (node.port() != 0)
         throw Error(RetCode::EPORT);
-    const auto record = nodes_.find(node);
-    if (record == nodes_.end())
+    const auto entry = nodes_.find(node);
+    if (entry == nodes_.end())
         throw Error(RetCode::ENODE);
-    return record;
+    return entry;
+}
+
+Backend *GraphService::backend_of(NodeId node) noexcept
+{
+    const auto entry = nodes_.find(node);
+    return entry == nodes_.end() ? nullptr : entry->second.get();
 }
 
 PortSpec GraphService::port_spec(NodeId port, bool output)
@@ -214,9 +225,9 @@ void GraphService::disconnect_input(NodeId to, const NodeId *from)
 
 void GraphService::remove(NodeId node)
 {
-    const auto record = find_node(node);
-    if (record->second.backend)
-        record->second.backend->unbind();
+    const auto entry = find_node(node);
+    if (entry->second)
+        entry->second->unbind();
     for (auto it = links_.begin(); it != links_.end();)
     {
         if (it->first.base() == node || it->second.from.base() == node)
@@ -228,29 +239,7 @@ void GraphService::remove(NodeId node)
             ++it;
     }
     engine_.remove_node(node);
-    nodes_.erase(record);
-}
-
-void GraphService::sync_backends()
-{
-    const auto plan = engine_.plan_nodes();
-    for (auto &entry : nodes_)
-    {
-        auto &record = entry.second;
-        if (!record.backend)
-            continue;
-        const auto in_plan = std::find(plan.begin(), plan.end(), entry.first) != plan.end();
-        if (in_plan && !record.started_in_plan)
-        {
-            record.backend->start();
-            record.started_in_plan = true;
-        }
-        else if (!in_plan && record.started_in_plan)
-        {
-            record.backend->stop();
-            record.started_in_plan = false;
-        }
-    }
+    nodes_.erase(entry);
 }
 
 void GraphService::commit()
@@ -258,14 +247,33 @@ void GraphService::commit()
     assert(commands_.on_thread());
     if (!engine_.dirty())
         return;
-    engine_.commit();
-    if (engine_.state() == Engine::State::Running)
+
+    const auto running = engine_.state() == Engine::State::Running;
+    std::vector<NodeId> previous;
+    if (running)
     {
-        const auto cleanup = [this]() noexcept { stop(); };
-        ScopeExit<decltype(cleanup)> rollback(cleanup);
-        sync_backends();
-        rollback.dismiss();
+        const auto plan = engine_.plan_nodes();
+        if (!plan.empty())
+            previous.assign(plan.begin(), plan.end());
     }
+
+    engine_.commit();
+    if (!running)
+        return;
+
+    const auto current = engine_.plan_nodes();
+    const View<const NodeId> old_plan{previous.data(), previous.size()};
+    const auto cleanup = [this]() noexcept { stop(); };
+    ScopeExit<decltype(cleanup)> rollback(cleanup);
+    for (auto it = previous.rbegin(); it != previous.rend(); ++it)
+        if (auto *backend = backend_of(*it))
+            if (!contains_node(current, *it))
+                backend->stop();
+    for (const auto id : current)
+        if (auto *backend = backend_of(id))
+            if (!contains_node(old_plan, id))
+                backend->start();
+    rollback.dismiss();
 }
 
 void GraphService::start()
@@ -276,7 +284,9 @@ void GraphService::start()
     engine_.commit();
     const auto cleanup = [this]() noexcept { stop(); };
     ScopeExit<decltype(cleanup)> rollback(cleanup);
-    sync_backends();
+    for (const auto id : engine_.plan_nodes())
+        if (auto *backend = backend_of(id))
+            backend->start();
     engine_.start();
     rollback.dismiss();
 }
@@ -285,14 +295,8 @@ void GraphService::stop() noexcept
 {
     assert(commands_.on_thread());
     for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it)
-    {
-        auto &record = it->second;
-        if (record.started_in_plan)
-        {
-            record.backend->stop();
-            record.started_in_plan = false;
-        }
-    }
+        if (it->second)
+            it->second->stop();
     engine_.stop();
 }
 
@@ -325,8 +329,8 @@ std::vector<const Backend *> GraphService::backends() const
     assert(commands_.on_thread());
     std::vector<const Backend *> result;
     for (const auto &entry : nodes_)
-        if (entry.second.backend)
-            result.push_back(entry.second.backend.get());
+        if (entry.second)
+            result.push_back(entry.second.get());
     return result;
 }
 
