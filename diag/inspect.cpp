@@ -283,7 +283,7 @@ const char *error_code_name(RetCode::Code code)
     case RetCode::ENODE: return "ENODE";
     case RetCode::ECONN: return "ECONN";
     case RetCode::DUPLICATE: return "DUPLICATE";
-    case RetCode::EINPUTBUSY: return "EINPUTBUSY";
+    case RetCode::INPUTBUSY: return "INPUTBUSY";
     case RetCode::CYCLE: return "CYCLE";
     case RetCode::INVFMT: return "INVFMT";
     case RetCode::IOFAILED: return "IOFAILED";
@@ -688,7 +688,8 @@ std::string dump_dot(const Engine &engine, View<const Backend *const> backends)
     {
         const auto &node = *engine.plan_node(id);
         const auto mixer = read_mixer_flags(node);
-        const DotNode info{node.outputs(), mixer, node.inputs().size() > 1 || node.outputs().size() > 1 || mixer.high};
+        const DotNode info{node.outputs(), mixer,
+                           node.inputs().size() > 1 || node.outputs().size() > 1 || mixer.high || mixer.muted};
         nodes.emplace(id, info);
         write_dot_node(out, id, node, info);
 

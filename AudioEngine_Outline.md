@@ -31,7 +31,7 @@ Node A 的输出端口 ── Connection ──> Node B 的输入端口
 | Port | 节点上的多声道音频入口或出口，固定声明采样率、声道数和格式 |
 | Connection | 将上游输出零拷贝地借给同规格的下游输入，只读 |
 
-使用 `engine.connect(source, mix[1])` 将源节点的第一个输出连到混音器的第二个输入。`connect(from, to)` 分别按输出和输入方向校验下标，无效端口抛出 `Error(RetCode::EPORT)`。`PortSpec` 固定声明采样率、声道数和 `SampleFormat`。连接两端的规格必须完全一致，规格冲突抛出 `Error(RetCode::INVFMT)`。需要转换时显式插入 Convert。输入端口已由其他来源占用时抛出 `Error(RetCode::EINPUTBUSY)`，多路求和使用 Mixer 的不同输入。没有连接的输入得到该格式的零值静音。
+使用 `engine.connect(source, mix[1])` 将源节点的第一个输出连到混音器的第二个输入。`connect(from, to)` 分别按输出和输入方向校验下标，无效端口抛出 `Error(RetCode::EPORT)`。`PortSpec` 固定声明采样率、声道数和 `SampleFormat`。连接两端的规格必须完全一致，规格冲突抛出 `Error(RetCode::INVFMT)`。需要转换时显式插入 Convert。输入端口已由其他来源占用时抛出 `Error(RetCode::INPUTBUSY)`，多路求和使用 Mixer 的不同输入。没有连接的输入得到该格式的零值静音。
 一个 Port 表示一组声道，声道间的选择、复制和合并由 Matrix 表达。
 `NodeId` 的高 48 位保存节点编号，低 16 位保存从零开始的端口下标。节点句柄等同于第 0 号端口。`0xFFFF` 标识越界端口，每个方向最多可声明 65535 个端口。删除、替换、暂停和节点查询接收下标为零的句柄，下标非零时抛出 `Error(RetCode::EPORT)`。`base()` 可从端口句柄取得节点句柄。替换节点实例时编号继续有效。`ConnId` 标识一次连接，重新连接相同端口会生成新的 ID。Node 不持有其他 Node 的共享所有权，也不各自维护连接列表或调度循环。
 

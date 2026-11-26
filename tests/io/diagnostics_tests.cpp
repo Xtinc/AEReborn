@@ -162,10 +162,11 @@ void mixer_priority_diagnostics()
     connect(engine, mixed, monitor);
     connect(engine, single, extra_monitor);
     auto &mixer = *engine.node<Mixer>(mixed);
+    auto &single_mixer = *engine.node<Mixer>(single);
     mixer.set_high_priority(1, true);
     mixer.set_high_priority(2, true);
     mixer.set_muted(2, true);
-    engine.node<Mixer>(single)->set_high_priority(0, true);
+    single_mixer.set_high_priority(0, true);
     engine.commit();
     clock.start();
     clock.advance();
@@ -191,6 +192,18 @@ void mixer_priority_diagnostics()
               graph.find("n" + single_id + ":o0:e -> n" + std::to_string(extra_monitor.node()) + ":w") !=
                   std::string::npos,
           "A single high-priority mixer exposes matching port labels and edge anchors");
+
+    single_mixer.set_high_priority(0, false);
+    single_mixer.set_muted(0, true);
+    const auto muted_graph = dump_dot(engine);
+    const auto single_card = muted_graph.find("\n  n" + single_id + " [");
+    check(single_card != std::string::npos &&
+              muted_graph.find("in0 [MUTE]</FONT>", single_card) < muted_graph.find('\n', single_card + 1),
+          "A single muted mixer displays the mute label on its input port");
+    const auto single_edge = "n" + std::to_string(source.node()) + ":e -> n" + single_id + ":i0:w";
+    check(muted_graph.find(single_edge + " [label=\"48k 1ch F32P (muted)\", style=dashed, color=\"#9CA3AF\"") !=
+              std::string::npos,
+          "The single muted mixer's input edge is anchored, dashed and grey");
 
     mixer.set_muted(1, true);
     clock.advance();

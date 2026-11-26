@@ -28,7 +28,7 @@ void graph_constraints()
     connect(engine, first, second);
     connect(engine, second, sink);
     expect_error(RetCode::DUPLICATE, [&] { connect(engine, source, first); });
-    expect_error(RetCode::EINPUTBUSY, [&] { connect(engine, second, first); });
+    expect_error(RetCode::INPUTBUSY, [&] { connect(engine, second, first); });
     expect_error(RetCode::EPORT, [&] { connect(engine, source, first, 2); });
     expect_error(RetCode::INVFMT, [&] { connect(engine, source, stereo); });
     expect_error(RetCode::ENODE, [&] { connect(engine, foreign, first, 1); });

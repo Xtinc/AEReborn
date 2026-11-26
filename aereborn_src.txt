@@ -1,368 +1,4 @@
 
-===== aereborn.md =====
-# AEReborn 静音标识与空块早退优化计划
-
-本方案参考 PipeWire（`SPA_CHUNK_FLAG_EMPTY`）与 GStreamer（`GST_BUFFER_FLAG_GAP`）的成熟设计，在不污染 `ByteBlock` 图外 I/O 视图、不引入业务逻辑到 `core/` 的前提下，为 AEReborn 音频图增加 **1 字节数据存在位（Active Flag）自动传播机制**，并基于该标识在内置插件上落地 **空块早退优化（Empty-Block Early Exit）**。
-
----
-
-## 1. 背景与优化目标
-
-在固定周期软件时钟引擎中，`Engine::Clock` 会按 2--40 ms 的固定节拍持续驱动整张生效渲染计划（`Plan`），导致当前存在两类问题：
-
-1. **语义混淆（阻塞自动优先级闪避）**：当上游 `Capture` 处于离线、预填充、队列读空（如 `PushSource` 停推、WAV 播完）或端口未连接/暂停时，引擎与端点会向缓冲填零静音。下游节点面对全 `0.0f` 样本，无法区分“**通话中对方静音但仍在推全零包**”与“**通话已挂断/文件已播完**”。
-2. **空闲算力浪费与次正规数隐患**：待机中的多路网络接收槽位、静音支路或未推流的 `PushSource` 若串联了跨采样率 `Convert`（96 抽头多相 Sinc 卷积）或多路 `Mixer`，每拍仍会对全零数据执行完整编解码、卷积与浮点乘加；对于未来的 IIR / 混响节点，持续处理全零输入还容易触发 IEEE 754 次正规浮点数（Denormal）性能退化。
-
-### 业界参考与 AEReborn 取舍
-
-| 维度 | GStreamer (`GST_BUFFER_FLAG_GAP`) | PipeWire (`SPA_CHUNK_FLAG_EMPTY`) | AEReborn 本方案设计 |
-| --- | --- | --- | --- |
-| **标志载体** | `GstBuffer::flags` | `spa_chunk::flags` | `ProcessContext` 中的 `input_active` / `output_active` 视图 |
-| **为何不放进 `ByteBlock`** | — | 块头与图强绑定 | `ByteBlock` 被 `WavFile`、`PushSource`、ALSA/WASAPI 等图外模块广泛复用，放入 `ProcessContext` 可保证图外接口零污染，且不破坏 `View<const OBBlock>` 的只读容器契约 |
-| **默认透传方式** | 框架基类自动复制 metadata | 端口共享 `spa_chunk` + `audioadapter` 转发 | `Engine::Runner::Plan::render()` 在每步 `process()` 前集中接力并写入默认值，**用户自定义节点一行不改即自动透传** |
-| **多输入汇聚规则** | 全 GAP 才输出 GAP | 全 EMPTY 才输出 EMPTY | 任意未静音输入为活跃，则输出活跃（逻辑或） |
-
----
-
-## 2. 五条核心不变式（设计红线）
-
-落地过程中必须严格守住以下五条契约，避免引入隐蔽的音频瑕疵或回归：
-
-1. **存在位语义与样本值彻底解耦**
-   * `active == 1`：上游本拍交付了真实音频流（**即使所有样本恰好都是 `0.0f`**，例如通话对方静音或 WAV 文件内的静音段）。
-   * `active == 0`：本拍无真实数据流（端口未连接、上游被 `set_paused(true)` 排除、`Capture` 离线/预填充/读空、`Matrix` 稳态零增益关断、或 `Mixer` 全部未静音输入均为空）。
-2. **静音内存安全兜底（Silence Memory Invariant）**
-   * 即使某节点将 `output_active` 置为 `0` 并走早退路径，**仍必须将输出块清零（`clear()` 或 `std::memset(0)`）**。
-   * 原因：`float_pool` 与 `byte_pool` 在每个 tick 间复用；不关心存在位的用户自定义节点或 `Playback` 会直接读取样本区，若跳过清零会导致上一拍残余样本循环泄漏。对单拍数 KB 的 L1 缓存块执行一次 `memset` 耗时仅纳秒级，换来绝对安全的内存不变式。
-3. **热路径零堆分配、零锁、`noexcept`**
-   * `input_active`、`output_active` 与 `input_sources` 全部在 `commit()` 阶段随 `Plan` 一次性分配完毕；`Plan::render()` 仅做顺序数组下标访问。
-4. **对既有代码与直接单测 100% 向后兼容**
-   * `ProcessContext` 保持 C++14 聚合类型（Aggregate），不引入用户自定义构造函数。既有单测直接构造 4 字段 `ProcessContext{period, tick, inputs, outputs}` 时，末尾两个 `View` 自动值初始化为空视图；`has_input()` 对空视图默认返回 `true`，`set_output_active()` 对空视图安全空操作。
-5. **汇端 `Playback` 必须照常消费静音块**
-   * `Playback::process()` **禁止**因 `has_input(0) == false` 而跳过写入 `FrameRing`。
-   * 原因：录音文件（`WavPlayback`）与周期回调（`UsrPlayback`）需要连续时间线，异步声卡（ALSA / WASAPI）的 ASRC PI 闭环依赖稳定入队维持 $50\%$ 队列水位。
-
----
-
-## 3. 内核改造设计（`core/`）
-
-### 3.1 `core/types.h`：扩展 `ProcessContext`
-
-在 `ProcessContext` 末尾追加两个轻量只读/可写字节视图，并提供语义清晰的访问方法：
-
-```cpp
-/// @brief Timing, port blocks, and per-port active flags passed to a node for one process call.
-/// @note All views and backing buffers are borrowed for the duration of that call.
-struct ProcessContext
-{
-    BlockPeriod block_period;             ///< Duration of the current engine tick.
-    std::uint64_t tick_position;          ///< Zero-based position of the current tick.
-    View<const IBBlock> inputs;           ///< Read-only input blocks in port index order.
-    View<const OBBlock> outputs;          ///< Output blocks with writable samples in port index order.
-    View<const std::uint8_t> input_active;  ///< Nonzero when an input carries real stream data.
-    View<std::uint8_t> output_active;       ///< Output active flags initialized to engine defaults.
-
-    /// @brief Check whether an input port carries real stream data on this tick.
-    /// @note Returns true when input_active is omitted (for direct standalone node calls).
-    bool has_input(std::size_t index) const noexcept
-    {
-        return index < input_active.size() ? input_active[index] != 0 : true;
-    }
-
-    /// @brief Override whether an output port carries real stream data on this tick.
-    /// @note Even when set to false, the node must still write silence to the output block.
-    void set_output_active(std::size_t index, bool active) const noexcept
-    {
-        if (index < output_active.size())
-            output_active[index] = active ? 1 : 0;
-    }
-};
-```
-
-### 3.2 `core/engine.cpp`：编译期索引与每拍自动传播
-
-#### (1) `port_range()` 支持可写视图重载
-
-在 `core/engine.cpp` 匿名命名空间补充非常量版本，供 `output_active` 构造可写 `View<std::uint8_t>`：
-
-```cpp
-template <class T>
-View<T> mutable_port_range(std::vector<T> &items, std::size_t first, std::size_t count) noexcept
-{
-    if (count == 0)
-        return {};
-    return {items.data() + first, count};
-}
-```
-
-#### (2) `Engine::Runner::Plan` 新增三个扁平数组
-
-与现有 `inputs`、`outputs` 一一对齐，全部由 `commit()` 一次性构建：
-
-```cpp
-struct Plan
-{
-    // 原有成员保持不变 ...
-    std::vector<IBBlock> inputs;
-    std::vector<OBBlock> outputs;
-
-    // 新增成员：每端口 1 字节存在位及上游输出下标映射
-    std::vector<std::uint8_t> input_active;
-    std::vector<std::uint8_t> output_active;
-    std::vector<std::size_t> input_sources; // Link::unconnected 表示未连接或上游已暂停
-};
-```
-
-#### (3) `bind_blocks()` 绑定阶段记录上游下标
-
-在 `Engine::Runner::bind_blocks()` 中同步分配数组并填充 `input_sources`：
-
-```cpp
-plan.input_active.assign(layout.input_count, 0);
-plan.output_active.assign(layout.output_count, 0);
-plan.input_sources.assign(layout.input_count, Link::unconnected);
-```
-
-在输入端口绑定循环内补充：
-
-```cpp
-if (link.node_index != Link::unconnected)
-{
-    const auto source_output = plan.steps[link.node_index].first_output + link.port_index;
-    plan.inputs[input_index] = plan.outputs[source_output];
-    plan.input_sources[input_index] = source_output;
-}
-else
-{
-    const auto spec = entry.inputs[port];
-    plan.inputs[input_index] = plan.block(spec, spec.max_frames(period), 0);
-}
-```
-
-> 容量边界安全性：`layout.input_count` 与 `layout.output_count` 已在 `measure_layout()` 中分别受 `plan.inputs.max_size()` 与 `plan.outputs.max_size()` 约束；由于 $\text{sizeof}(\text{IBBlock}) \ge \text{sizeof}(\text{size\_t}) > \text{sizeof}(\text{uint8\_t})$，新增三个数组不会发生容量溢出。
-
-#### (4) `Plan::render()` 自动接力与默认传播
-
-由于 `steps` 已按拓扑顺序排列（上游节点必先于下游节点执行），每拍循环如下：
-
-```cpp
-for (const auto &step : steps)
-{
-    std::uint8_t any_input_active = 0;
-    for (std::size_t p = 0; p < step.input_count; ++p)
-    {
-        const auto input_index = step.first_input + p;
-        const auto source = input_sources[input_index];
-        const std::uint8_t active = source != Link::unconnected ? output_active[source] : 0;
-        input_active[input_index] = active;
-        any_input_active |= active;
-    }
-
-    // 源节点（无输入端口）默认输出活跃；处理节点默认按全部输入的逻辑或透传。
-    const std::uint8_t default_output = step.input_count == 0 ? 1 : any_input_active;
-    for (std::size_t p = 0; p < step.output_count; ++p)
-        output_active[step.first_output + p] = default_output;
-
-    step.node->process({period, tick,
-                        port_range(inputs, step.first_input, step.input_count),
-                        port_range(outputs, step.first_output, step.output_count),
-                        port_range(input_active, step.first_input, step.input_count),
-                        mutable_port_range(output_active, step.first_output, step.output_count)});
-}
-```
-
----
-
-## 4. 内置插件的静音标识与早退优化（`plugins/`）
-
-### 4.1 全节点行为总览
-
-| 插件节点 | 存在位产生 / 改写规则 | 空块早退优化动作 | 算力收益 |
-| --- | --- | --- | --- |
-| **`Capture`** | `set_output_active(0, frames != 0)` | 离线或读空时原有逻辑已跳过队列读并清零 | 作为全图真实流源头，精确区分停推与全零包 |
-| **`Playback`** | 无输出端口 | **不早退**，照常写入静音帧保时间线与 ASRC 水位 | 保障设备/录盘连续性 |
-| **`Convert`** | 正常流 `1`；拖尾冲刷期强制 `1`；冲刷完毕走默认 `0` | `tail_remaining_ == 0` 且无输入时，跳过编解码与 96 抽头卷积，直接 `memset(0)` | **收益最高**（砍掉空闲分支全部重采样与编解码开销） |
-| **`Matrix`** | 无输入走默认 `0`；稳态零增益显式写 `0` | 无输入时跳过矩阵乘加与斜坡计算，清零并同步 `gain_ = target` | 跳过多声道矩阵乘加与斜坡循环 |
-| **`Mixer`** | 写未静音且活跃输入的逻辑或 | 跳过 `muted_[i] \|\| !has_input(i)` 的输入支路 | 空闲/静音路零样本读写开销 |
-| **`Tone` / 自定义节点** | 无需改代码（引擎默认：`Tone` 为 `1`，处理节点自动透传） | 保持原逻辑；未来有状态插件可按需接入三态早退 | 零侵入兼容 |
-
----
-
-### 4.2 `Capture`（`plugins/endpoint.cpp`）
-
-在 `Capture::process()` 末尾补 1 行即可成为整张图的精确活跃源头：
-
-```cpp
-void Capture::process(const ProcessContext &context) noexcept
-{
-    const auto output = context.outputs[0].f32p_view();
-    std::size_t frames = 0;
-    if (enter_graph(graph_state_))
-    {
-        if (prefill_ready(ring_, primed_, target_frames()))
-        {
-            frames = ring_.read(output);
-            if (frames < output.frames())
-                underrun_frames_.fetch_add(output.frames() - frames, std::memory_order_relaxed);
-        }
-        graph_state_.fetch_and(~graph_active, std::memory_order_release);
-    }
-    output.subblock(frames, output.frames() - frames).clear();
-    context.set_output_active(0, frames != 0);
-}
-```
-
-* 离线、预填充未就绪、队列读空（WAV EOF、停推、硬件断流）时 `frames == 0` $\to$ 输出 `0`。
-* 只要从 `FrameRing` 读到了真实帧（含部分短读、或调用方刻意推送的全零静音包），`frames != 0` $\to$ 输出 `1`。
-
----
-
-### 4.3 `Convert` 三态早退优化（`plugins/convert.h` & `plugins/convert.cpp`）
-
-`Convert` 内部可能包含有状态的 96 抽头 `SincResampler`（历史缓冲 `history_` 保存最近 $96$ 帧输入样本）。为避免硬截断尾音与脏历史残留，采用**三态早退**策略：
-
-1. **成员变量（`plugins/convert.h`）**：新增 `std::size_t tail_remaining_ = 0;`（单位：输入帧数）。
-2. **生命周期清零**：
-   * `Convert::prepare(BlockPeriod)`：仅在全部缓冲与 `resampler_.prepare()` 成功后，将 `tail_remaining_ = 0;` 与新缓冲一同提交（维持准备失败保留旧状态的强异常安全）。
-   * `Convert::reset()`：在 `resampler_.reset();` 后同步执行 `tail_remaining_ = 0;`。
-3. **`Convert::process()` 实现**：
-
-```cpp
-void Convert::process(const ProcessContext &context) noexcept
-{
-    const auto input = context.inputs[0];
-    const auto output = context.outputs[0];
-
-    if (context.has_input(0))
-    {
-        tail_remaining_ = resampler_.tail_frames(); // 同采样率为 0，跨采样率为 96
-    }
-    else if (tail_remaining_ > 0)
-    {
-        // 冲刷 FIR 拖尾：继续消费上游保证为零的输入块，并维持输出活跃位为 1
-        tail_remaining_ -= std::min(tail_remaining_, input.frames());
-        context.set_output_active(0, true);
-    }
-    else
-    {
-        // 空块早退：history_ 已完全归零，直接按字节清零输出并跳过编解码与卷积
-        const auto bytes = output.byte_view();
-        if (!bytes.empty())
-            std::memset(bytes.data(), 0, bytes.size());
-        return;
-    }
-
-    // 原有 same_spec_ 直通 / decode_pcm / process_tick / encode_pcm 逻辑保持不变
-    ...
-}
-```
-
-#### 数值等价性与零相位漂移证明
-
-* **比特级等价**：`SincResampler` 的滤波窗口长度 `taps` $= 96$ 帧，且 `resampler_.tail_frames()` 返回的正是 `taps`（同采样率时返回 $0$）。在输入变为 `0` 后，冲刷阶段累计喂入并经 `remember()` 移入 `history_` 的零输入帧数 $\ge 96$，故进入早退态时 `history_` 内每个浮点样本严格等于 `0.0f`。后续全零历史与全零输入的卷积结果与 `std::memset(0)` **比特级完全一致**（AEReborn 支持的全部 6 种样本格式均以全零字节表示静音）。
-* **零相位漂移**：`SincResampler::process_tick()` 每拍的分数相位完全由 `(context.block_period, context.tick_position)` 无状态直接算出，不依赖跨拍相位累加器。因此空闲期间跳过 `process_tick()` 不会产生任何相位偏移，数据恢复时首拍即无缝衔接。
-
----
-
-### 4.4 `Matrix` 空块与零增益早退（`plugins/matrix.cpp`）
-
-在 `Matrix::process()` 中补齐两处极简逻辑：
-
-```cpp
-void Matrix::process(const ProcessContext &context) noexcept
-{
-    const auto &output_block = context.outputs[0];
-    const auto output = output_block.f32p_view();
-    const auto frames = output.frames();
-    if (frames == 0)
-        return;
-
-    const auto target = target_.load(std::memory_order_acquire);
-    if (!context.has_input(0))
-    {
-        output.clear();
-        gain_ = target;
-        return;
-    }
-
-    const bool steady = gain_ == target;
-    if (steady && target == 0)
-    {
-        output.clear();
-        context.set_output_active(0, false);
-        return;
-    }
-    ...
-```
-
-* **无输入早退**：跳过全部声道矩阵乘加和斜坡计算，同时将 `gain_` 同步到 `target`。这样在静音期间修改目标增益，待音频恢复时直接按新增益生效，不会出现意外的瞬态斜坡。
-* **稳态零增益关断**：增益已平滑淡出并稳定在 `0.0f` 时，主动将 `output_active` 设为 `0`（淡出过渡拍仍保持 `1`，确保淡出尾音完整传播），下游混音器或未来的 `PriorityMixer` 可立即感知支路已关断。
-
----
-
-### 4.5 `Mixer` 跳过空闲支路与汇聚传播（`plugins/mixer.cpp`）
-
-```cpp
-void Mixer::process(const ProcessContext &context) noexcept
-{
-    const auto output = context.outputs[0].f32p_view();
-    const auto frames = output.frames();
-    if (frames == 0)
-        return;
-
-    output.clear();
-    bool active = false;
-    for (std::size_t i = 0; i < inputs_.size(); ++i)
-    {
-        if (muted_[i].load(std::memory_order_acquire) || !context.has_input(i))
-            continue;
-        active = true;
-        const auto input = context.inputs[i].f32p_view();
-        for (std::size_t ch = 0; ch < output.channels(); ++ch)
-        {
-            auto *dst = output.channel(ch);
-            const auto *src = input.channel(ch);
-            for (std::size_t frame = 0; frame < frames; ++frame)
-                dst[frame] += src[frame];
-        }
-    }
-    context.set_output_active(0, active);
-}
-```
-
-* 当混音器挂接了 8--16 路待机槽位（例如路线 A 动态网络/剪辑总线）而仅 1--2 路活跃时，其余空槽在外层循环直接跳过，彻底消除无效内存读取与浮点加法。
-
----
-
-### 4.6 对未来插件的承接与规范
-
-1. **`PriorityMixer`（优先级自动闪避）**：
-   * 默认直接消费 `context.has_input(i)` + `hold_ms` 判定各路输入是否活跃：用户推流/播文件期间自动压低低优先级（含全零静音段，绝不误恢复），停推或 WAV EOF 排空过 `hold_ms` 后自动平滑恢复，彻底免除手动状态切换。
-2. **未来有状态 DSP 插件（IIR 滤波、混响、LMS 滤波等）**：
-   * 遵循与 `Convert` 相同的三态早退模式：在输入变空后等待尾音能量衰减至噪声底以下（或固定冲刷拍数）时，将内部递归状态清零并放行 `output_active = 0`，既节省空闲 CPU，又彻底杜绝次正规浮点数（如 $10^{-39}$ 级状态）引发的 CPU 飙升。
-
----
-
-## 5. 逐文件改动清单与分阶段实施顺序
-
-| 阶段 | 涉及文件 | 具体改动 |
-| --- | --- | --- |
-| **阶段 1：核心传播骨架** | `core/types.h`、`core/engine.cpp` | 1. `ProcessContext` 增加 `input_active`、`output_active`、`has_input()`、`set_output_active()`；<br>2. `Plan` 增加 3 个预分配扁平数组，`bind_blocks()` 绑定 `input_sources`，`Plan::render()` 实现自动接力与默认传播 |
-| **阶段 2：插件标识与早退** | `plugins/endpoint.cpp`、`plugins/convert.h/.cpp`、`plugins/matrix.cpp`、`plugins/mixer.cpp` | 1. `Capture::process()` 按 `frames != 0` 写入活跃位；<br>2. `Convert` 实现 `tail_remaining_` 三态早退并在 `prepare()`/`reset()` 复位；<br>3. `Matrix` 补无输入早退与稳态零增益置 `0`；<br>4. `Mixer` 跳过空闲输入并汇聚写输出活跃位 |
-| **阶段 3：测试与文档同步** | `tests/`（核心、DSP、路由、回归用例）、`AudioEngine_Outline.md` | 1. 新增活跃位传播、拖尾冲刷、比特级等价与 `Playback` 连续性专项测试；<br>2. 确认 Debug & Release 全量 CTest（含 `regression` 零堆分配检查）全绿；<br>3. 在 `AudioEngine_Outline.md` 第 3 节补充 `ProcessContext` 活跃位契约说明 |
-
----
-
-## 6. 验收测试矩阵
-
-| 测试项 | 场景与断言要点 |
-| --- | --- |
-| **1. 核心传播与默认透传** | ① 未连接端口、被 `set_paused(true)` 排除的上游端口到达下游时 `has_input() == false`；<br>② 源节点（`Tone`）默认输出 `1`，不改代码的自定义透传 `NodeT<1, 1>` 自动把上游 `0`/`1` 传给下游；<br>③ 既有直接构造 4 字段 `ProcessContext` 的单测编译与行为完全无回归 |
-| **2. `Capture` 真静音 vs. 无数据区分** | ① `Capture` 离线、预填充中、队列读空时 `output_active == 0`；<br>② 经 `PushSource` 推入全 `0.0f` PCM 包时，消费该包的 tick `output_active == 1`，队列播空后的下一拍立刻变为 `0`；<br>③ `WavCapture` 播放期间持续为 `1`，EOF 排空下线后自动变为 `0` |
-| **3. `Convert` 拖尾冲刷与比特级等价** | ① 48 kHz $\to$ 16 kHz（与 16 kHz $\to$ 48 kHz）链路，喂入脉冲/正弦信号后令输入变 `0`：验证拖尾冲刷期间（累计输入零帧达到 96 前）`output_active` 保持 `1` 且输出非零尾音；冲刷结束后立刻切为 `0` 且输出全零；<br>② 对比“开启早退”与“持续喂零强制全算”的输出序列，逐样本比特级一致；<br>③ 早退若干拍后恢复信号输入，验证输出相位与连续参考信号严丝合缝，无跳变或历史残留 |
-| **4. `Matrix` 与 `Mixer` 早退传播** | ① `Matrix` 输入为空时跳过处理并同步 `gain_ = target`；`set_gain(0.0f)` 淡出拍保持 `1`，下一稳态零增益拍输出 `0`；<br>② `Mixer` 两路输入（一路活跃一路空）：静音活跃路后输出立刻变 `0`，取消静音变回 `1` |
-| **5. `Playback` 连续性回归** | 上游全为空块（`active == 0`）时，绑定 `WavPlayback` 持续录制若干 tick，验证落盘帧数与时间线完全连续、未少写帧 |
-| **6. 零堆分配与回归验收** | Debug & Release 全量 CTest 通过，特别是 `regression.render_and_passive_io_without_heap` 确认新增 3 个扁平数组与早退路径在运行期零堆分配 |
 ===== AudioEngine_Outline.md =====
 # AEReborn：音频引擎框架草案
 
@@ -388,7 +24,7 @@ void Mixer::process(const ProcessContext &context) noexcept
 Engine 只处理 Node、Port、Connection 三个核心概念。它拥有节点和连接，校验图、准备缓冲并按依赖顺序执行节点；不需要识别节点的具体业务角色。
 
 ```text
-Node A 的 OPort ── Connection ──> Node B 的 IPort
+Node A 的输出端口 ── Connection ──> Node B 的输入端口
 ```
 
 | 对象 | 定位 |
@@ -397,9 +33,9 @@ Node A 的 OPort ── Connection ──> Node B 的 IPort
 | Port | 节点上的多声道音频入口或出口，固定声明采样率、声道数和格式 |
 | Connection | 将上游输出零拷贝地借给同规格的下游输入，只读 |
 
-使用 `engine.connect(OPORT(source, 0), IPORT(destination, 0))` 将源节点的第一个输出连到目标节点的第一个输入。`IPORT()` 和 `OPORT()` 接受节点 ID 和从零开始的端口下标，`connect()` 校验下标。`PortSpec` 固定声明采样率、声道数和 `SampleFormat`。连接两端的规格必须完全一致，规格冲突抛出 `Error(FormatMismatch)`。需要转换时显式插入 Convert。输入端口已由其他来源占用时抛出 `Error(InputBusy)`，多路求和使用 Mixer 的不同输入。没有连接的输入得到该格式的零值静音。
+使用 `engine.connect(source, mix[1])` 将源节点的第一个输出连到混音器的第二个输入。`connect(from, to)` 分别按输出和输入方向校验下标，无效端口抛出 `Error(RetCode::EPORT)`。`PortSpec` 固定声明采样率、声道数和 `SampleFormat`。连接两端的规格必须完全一致，规格冲突抛出 `Error(RetCode::INVFMT)`。需要转换时显式插入 Convert。输入端口已由其他来源占用时抛出 `Error(RetCode::EINPUTBUSY)`，多路求和使用 Mixer 的不同输入。没有连接的输入得到该格式的零值静音。
 一个 Port 表示一组声道，声道间的选择、复制和合并由 Matrix 表达。
-`NodeId` 标识图中的节点，替换节点实例时 ID 继续有效。`ConnId` 标识一次连接，重新连接相同端口会生成新的 ID。原型采用进程内不复用的唯一 ID。Node 不持有其他 Node 的共享所有权，也不各自维护连接列表或调度循环。
+`NodeId` 的高 48 位保存节点编号，低 16 位保存从零开始的端口下标。节点句柄等同于第 0 号端口。`0xFFFF` 标识越界端口，每个方向最多可声明 65535 个端口。删除、替换、暂停和节点查询接收下标为零的句柄，下标非零时抛出 `Error(RetCode::EPORT)`。`base()` 可从端口句柄取得节点句柄。替换节点实例时编号继续有效。`ConnId` 标识一次连接，重新连接相同端口会生成新的 ID。Node 不持有其他 Node 的共享所有权，也不各自维护连接列表或调度循环。
 
 Source、Processor、Mixer、Sink 是具体节点的用途。Convert 负责格式与采样率转换。Mixer、Matrix 和 Tone 使用 planar float，算法节点可以声明自己需要的 PCM 格式。I/O 测试经 Capture、Playback 与实际后端交换音频，也可使用 Tone 生成可预测的信号。
 
@@ -415,7 +51,7 @@ PCM 适配器和固定端口数量的自定义节点通常继承 `NodeT<I, O>`�
 
 ### 从输出创建输入：直接复用端口
 
-任何 `OPort` 都能继续连接到其他节点。Bus 可提供 PreEffects、PostEffects、PostFader 等命名输出位置，第一版先提供最终输出。
+任何输出端口都能继续连接到其他节点。Bus 可提供 PreEffects、PostEffects、PostFader 等命名输出位置，第一版先提供最终输出。
 需要取得总线音频时，从相应输出连接普通 Sink；需要其他数据规格时连接 Convert，再由算法节点或 Playback 消费结果。图核心不提供独立的端口订阅机制。
 编译器保证一个节点每个渲染块只执行一次，同一输出供多个下游只读使用；需要修改数据的下游使用自己的工作缓冲。
 
@@ -432,7 +68,7 @@ Engine 持有编辑图和渲染计划。`commit()` 按依赖排序，从无输�
 
 `ProcessContext` 提供 `block_period`、`tick_position`、`inputs` 和 `outputs`。`IBBlock` 和 `OBBlock` 分别是只读和可写的 `ByteBlock`，携带缓冲地址、端口规格和本周期实际帧数。`byte_view()` 按原格式借用字节，适用于所有格式。`f32p_view()` 用于 F32P 端口，返回 `FloatBlock` 的只读或可写形式 `IFBlock` / `OFBlock`，声道步长为本周期的实际帧数。`FloatBlock` 也可借用插件工作区的分声道浮点样本，此时声道步长可以大于实际帧数。端口提供的视图只在 `process()` 调用内有效，节点必须写满自己的输出。
 
-`ProcessContext::has_input(port)` 返回该输入在本周期是否需要作为活跃块处理。非活跃块保证以零字节填满，未连接输入和来自暂停节点的输入均为非活跃。源交付的全零样本和 DSP 尾音可以是活跃块。每个周期开始时，引擎将所有输出预设为活跃，因为节点可能在输入为空时继续产生音频。能保证某个输出已填满零字节的节点，可调用 `set_output_active(port, false)` 让下游跳过样本计算。标志视图同样只在本次调用内有效。直接用四个字段构造 `ProcessContext` 时，`has_input()` 返回 true，设置输出标志无效果。
+`ProcessContext::has_input(port)` 返回该输入在本周期是否需要作为活跃块处理。非活跃块保证以零字节填满，未连接输入和来自暂停节点的输入均为非活跃。源交付的全零样本和 DSP 尾音可以是活跃块。引擎在调用节点之前初始化输出标志。无输入端口的源节点默认活跃，其他节点的每个输出默认取所有输入标志的逻辑或。节点在所有输入均非活跃时若仍产生音频，包括有状态 DSP 的尾音，必须调用 `set_output_active(port, true)` 标记相应输出。能保证某个输出已填满零字节的节点，可调用 `set_output_active(port, false)` 让下游跳过样本计算。标志视图只在本次调用内有效。直接用四个字段构造 `ProcessContext` 时，`has_input()` 返回 true，设置输出标志无效果。
 
 Capture 读到至少一帧即标为活跃，短读补零。队列读空表示当前周期缺数据，网络欠载和正常结束都可能出现这一情况。Convert 在 FIR 历史冲刷完毕后才将空输入标为非活跃。Matrix 在淡出之后的稳态零增益块上标记非活跃。Mixer 只累加活跃且未静音的输入。Playback 继续逐拍入队，包括非活跃的静音块，以保持录音和设备输出的时间线。
 
@@ -444,9 +80,9 @@ Capture 读到至少一帧即标为活跃，短读补零。队列读空表示当
 
 每个运行中的 Engine 由一条内置软件时钟线程串行执行渲染。Capture 和 Playback 在图侧按每个 tick 的实际帧数交接，后端线程通过 SPSC 帧队列交接可变长度的包。队列容量由最大图块和设备单包预算决定。异步硬件以半满为预填充和漂移目标。同步文件与 Null 后端立即上线，由队列背压决定推进速度。
 
-`Engine(BlockPeriod)` 在构造时验证推进周期，支持 2、5、10、20 和 40 ms。调用方可用 `block_period()` 查询周期，节点可从 `ProcessContext` 读取周期。`tick_position()` 返回已完成的周期数，停止后重启继续计数，`reset()` 归零。每个 `process()` 收到本周期开始时的 `tick_position`。
+`Engine(BlockPeriod)` 在构造时验证推进周期。可选值为 `BlockPeriod::INR_02MS`、`INR_05MS`、`INR_10MS`、`INR_20MS` 和 `INR_40MS`。调用方可用 `block_period()` 查询周期，节点可从 `ProcessContext` 读取周期。`tick_position()` 返回已完成的周期数，停止后重启继续计数，`reset()` 归零。每个 `process()` 收到本周期开始时的 `tick_position`。
 
-端口只支持 `SampleRate` 枚举中的采样率，单位为 Hz。当前为 8000、11025、16000、22050、24000、32000、44100、48000、88200 和 96000。SampleFormat::F32P 是原生 planar float32；S16LE、S24_3LE、S24LE、S32LE、F32LE 是交错小端 PCM。连接匹配包含采样率、声道数、样本格式及其布局，不做自动协商或隐式转换。
+端口以 `BandWidth` 表示采样率，单位为 Hz。当前支持 8000、11025、16000、22050、24000、32000、44100、48000、88200 和 96000，例如 `BandWidth::CDQuality` 为 44100 Hz，`BandWidth::Full` 为 48000 Hz。`SampleFormat::F32P` 是原生平面 float32。`S16LE`、`S24_3LE`、`S24LE`、`S32LE` 和 `F32LE` 是交错小端 PCM。连接匹配包含采样率、声道数、样本格式及其布局。
 
 每个端口按累计时间的向上取整差值计算本周期实际帧数。2 ms 下，48 kHz 每块固定 96 帧，44.1 kHz 按 89、88、88、88、88 帧循环。44.1 kHz / 5 ms 为 221、220 帧交替。`PortSpec::max_frames()` 用于容量，`frames()` 和 `frame_position()` 用于实际块与该端口的样本时间。不同采样率端口仍由同一个基础周期驱动。Convert 将分数相位对齐到共享 tick，运行中新增或替换节点不会另起采样时钟。
 
@@ -502,9 +138,11 @@ Engine 停止会等待图处理退出。后端停止时唤醒阻塞的异步 I/O
 
 Mixer 显式求和，Matrix 负责声道映射与增益。两者都只支持 F32P，采样率由构造参数固定，并不要求整张图使用同一采样率。Mixer 每个输入与输出的规格相同；Matrix 的输入、输出声道数可不同，采样率保持一致。
 
-Matrix 的行是目标声道，列是源声道，系数可用于选取、复制、合并和相位反转。全局增益与矩阵在同一遍采样处理中完成，增益在下一个有帧的处理块内线性过渡到目标值。Mixer 对每个输入独立静音，每个有帧的块读取一次设置并跳过已静音的输入。静音、零增益或零系数都跳过源样本，避免未使用的 NaN / Inf 污染输出。
+Matrix 的行是目标声道，列是源声道，系数可用于选取、复制、合并和相位反转。全局增益与矩阵在同一遍采样处理中完成，增益在下一个有帧的处理块内线性过渡到目标值。
 
-总线可以由 Mixer、Matrix 和效果节点组成，不增加核心基类。Voice、Music、Alert 等抑制策略由后续插件产生增益目标，Engine 不识别角色或策略。
+Mixer 支持 1 到 64 路输入，每路默认未静音、为普通优先级。任一未静音的高优先级输入活跃时，普通输入在一个块内淡出至零。全部高优先级输入失去活跃状态或被静音后，普通输入在一个块内恢复至原音量。多路活跃的高优先级输入直接求和。刻意交付的全零音频仍会触发压制。普通输入即使暂时无数据也会跟随当前压制状态，在压制期间恢复供帧时从静音开始。静音、稳态压制和斜坡精确到达零增益时跳过相应源样本。
+
+总线可以由 Mixer、Matrix 和效果节点组成。输入优先级由应用设置，Mixer 根据输入活动标志进行裁决。
 
 ## 7. 时钟运行 API
 
@@ -512,7 +150,7 @@ Matrix 的行是目标声道，列是源声道，系数可用于选取、复制�
 
 ### 固定能力与连接检查
 
-插件通过不可变的 inputs()/outputs() 声明实际端口规格。构造端口规格时显式传入 `PortSpec(sample_rate, channels, format)` 的三个参数。Mixer、Matrix、Tone 显式声明 F32P 端口。特殊算法声明其支持的固定 PCM 规格，Engine 在 `connect()` 时检查两端，节点在准备阶段验证资源条件。本版不增加动态能力列表或格式协商协议。
+插件通过不可变的 inputs()/outputs() 声明实际端口规格。构造端口规格时显式传入 `PortSpec(bandwidth, channels, format)` 的三个参数。Mixer、Matrix、Tone 显式声明 F32P 端口。特殊算法声明其支持的固定 PCM 规格，Engine 在 `connect()` 时检查两端，节点在准备阶段验证资源条件。本版不增加动态能力列表或格式协商协议。
 
 每个输入最多一个来源；同一输出可供多个下游只读使用。需要多路混音必须显式创建 Mixer 的多个输入。连接不包含增益、静音或矩阵，也不增加转换器。
 
@@ -531,14 +169,14 @@ Tone / BUS（48k F32P）
 | 插件 | 端口 | 配置与职责 |
 | --- | --- | --- |
 | Convert(input_spec, output_spec) | (1,1) | 支持上述全部格式的转换和图内固定比例重采样，两端声道数须相同 |
-| Mixer(rate, channels, inputs) | (N,1) | 相同 F32P 规格显式求和；set_muted(index, bool) 控制单个输入 |
+| Mixer(rate, channels, inputs) | (N,1)，1 ≤ N ≤ 64 | 相同 F32P 规格求和。用 `set_muted(index, bool)` 控制静音，用 `set_high_priority(index, bool)` 设置优先级 |
 | Matrix(rate, input_channels, output_channels, coefficients, gain) | (1,1) | F32P 声道映射与增益；行对应输出、列对应输入，系数固定；set_gain() 更新增益 |
 | Matrix(rate, channels, gain) | (1,1) | 使用恒等声道映射，仅控制增益 |
 | Capture(rate, channels, io_period) | (0,1) | 接收外部写入的 F32P 帧，按 tick 向图交付并补足静音 |
 | Playback(rate, channels, io_period) | (1,0) | 逐 tick 将图帧写入 F32P 队列，供外部消费者读取 |
 | Tone(rate, channels, frequency, amplitude) | (0,1) | 按端口样本时间生成 F32P 正弦波 |
 
-控制接口通过 `aereborn::Error` 报告失败，调用方可用 `code()` 获取 `ErrorCode`。内置插件在构造时验证固定端口与参数，规格错误使用 `InvalidArg`，容量超限使用 `TooLarge`。节点用 `prepare(BlockPeriod)` 准备工作区和处理状态。标准库的分配和线程创建异常，以及自定义节点异常，直接传播给调用方。
+控制接口通过 `aereborn::Error` 报告失败，调用方可用 `code()` 获取 `RetCode::Code`。内置插件在构造时验证固定端口与参数，规格错误使用 `RetCode::EPARAM`，容量超限使用 `RetCode::TOOLARGE`。节点用 `prepare(BlockPeriod)` 准备工作区和处理状态。标准库的分配和线程创建异常，以及自定义节点异常，直接传播给调用方。
 
 图内 Convert 与后端共用 core 的 PCM 编解码和 SincResampler 实现，各自持有处理状态。固定同采样率下，相同规格按字节直通，F32P 与交错 PCM 互转直接读写端口缓冲，两条路径的准备都无需堆分配。同采样率的不同交错 PCM 格式互转共用一块解码缓冲。重采样准备滤波器和历史样本，仅在输入为交错 PCM 时分配解码缓冲，仅在输出为交错 PCM 时分配重采样输出缓冲。
 
@@ -547,42 +185,43 @@ Tone / BUS（48k F32P）
 ### 运行控制与缓冲交接
 
 - 图编辑修改草稿。`commit()` 准备并提交新计划。停机时立即生效，运行时等待时钟在块边界接管。旧计划由调用线程释放，此时首个新块的处理可能仍在进行。草稿无变动时直接返回，准备失败时保留当前计划。
-- `replace_node()` 要求输入、输出的数量及完整规格相同，布局不同时抛出 `Error(FormatMismatch)`。设备格式变化时重新准备设备侧转换。新包长超出原周期预算时，用同端口规格的新节点替换并提交，保留 NodeId 和图连接。逻辑端口规格变化时修改相应连线。
+- `replace_node()` 要求输入、输出的数量及完整规格相同，布局不同时抛出 `Error(RetCode::INVFMT)`。设备格式变化时重新准备设备侧转换。新包长超出原周期预算时，用同端口规格的新节点替换并提交，保留 NodeId 和图连接。逻辑端口规格变化时修改相应连线。
 - `set_paused()` 通过计划移除或恢复节点及相关连接，未改动实例保留状态。暂停导致某个输入失去来源时，该输入得到静音。需要平滑暂停时，先将 Matrix 增益淡出至零，再提交暂停。
-- `Matrix::set_gain()` 和 `Mixer::set_muted()` 使用原子变量，可与 `process()` 并发调用。处理块读取当前设置。控制侧从 `Engine::node()` 借用草稿节点指针，须在节点被移除或替换前结束使用，最长有效期到 Engine 析构。
-- 图提交并准备端点后，`ActiveBackend::bind(endpoint)` 协商 PCM 规格和单包预算 `io_period()`，`start()` 在工作线程上初始化。`ActiveBackend` 和 `PassiveBackend` 共用 `Backend` 的端点占用与 PCM 转换，并可通过 `Backend&` 统一启停与查询。端点已经被占用时抛出 `Error(Busy)`。绑定失败释放资源和占用。设备启动失败时先回收工作线程，再向控制调用方抛出设备错误。
+- `Matrix::set_gain()`、`Mixer::set_muted()` 和 `Mixer::set_high_priority()` 可与 `process()` 并发调用。每个有帧的块各读取一次 Mixer 的静音和优先级掩码。可用 `muted()` 和 `high_priority()` 查询设置，用 `suppressed()` 查询最近一个有帧的块中哪些活跃且未静音的输入处于淡出或稳态压制。Mixer 的 `reset()` 清除处理状态和压制报告，保留静音和优先级设置。控制侧从 `Engine::node()` 借用草稿节点指针，须在节点被移除或替换前结束使用，最长有效期到 Engine 析构。
+- 图提交并准备端点后，`ActiveBackend::bind(endpoint)` 协商 PCM 规格和单包预算 `io_period()`，`start()` 在工作线程上初始化。`ActiveBackend` 和 `PassiveBackend` 共用 `Backend` 的端点占用与 PCM 转换，并可通过 `Backend&` 统一启停与查询。端点已经被占用时抛出 `Error(RetCode::BUSY)`。绑定失败释放资源和占用。设备启动失败时先回收工作线程，再向控制调用方抛出设备错误。
 - `PushSource` 绑定 `Capture`，由应用串行执行 `push(IBBlock)`、控制接口、状态查询和析构。可用单消费者指令队列执行这些操作。PCM 缓冲至少保留到 `push()` 返回。同一流的分片按顺序投递，停止接收旧流数据后再执行停机或重启。`push()` 返回本次接收的输入帧数，后续从该偏移续推。队列空位不足时可能返回零，图侧缺帧时补静音。`stop()` 丢弃未消费的帧并复位重采样器。
 - `PullSink` 同样由应用串行调用，`pull(OBBlock)` 读取 `Playback` 中当前可用的 PCM。`UsrPlayback` 由同步播放工作线程消费 `Playback` 队列。分数秒预算在构造 `Playback` 时一次向上取整为微秒，回调使用固定帧数，交付由数据就绪驱动。
 - `stop()` 下线并复位 DSP 和漂移，保留绑定和已分配工作区。同步播放先关闭图侧写入，写完已排队帧及 FIR 尾部。同步 I/O 钩子须自行完成操作。切换设备时依次调用旧后端的 `unbind()` 和新后端的 `bind(endpoint)`、`start()`。
 - 异步播放补齐设备批次的静音，后端通过 `last_error()` 返回 I/O 终止原因。异步等待和数据交接共用以最后一次 I/O 进展为起点的截止时间。主动停止可唤醒设备等待。测试通过真实的 I/O 工作线程验证设备交接。
 - `Engine::stop()` 唤醒时钟并等待在途图处理退出。先停止绑定的后端，再调用 `Engine::reset()`。在移除、替换端点或销毁 Engine 前解绑其后端。派生驱动析构时先调用 `unbind()`。
-- 调用方在控制侧串行执行控制接口和析构。同一 Engine 的时钟线程调用控制接口时抛出 `Error(Busy)`。节点需要请求修改引擎时，将操作延后投递到应用的串行执行器并直接返回，例如使用 `asio::post`。实例有效期间可并发读取 `block_period()` 与 `tick_position()`。
+- 调用方在控制侧串行执行控制接口和析构。同一 Engine 的时钟线程调用控制接口时抛出 `Error(RetCode::BUSY)`。节点需要请求修改引擎时，将操作延后投递到应用的串行执行器并直接返回，例如使用 `asio::post`。实例有效期间可并发读取 `block_period()` 与 `tick_position()`。
 - 处理路径尽量避免锁等待，禁止堆分配、释放和调用普通应用回调。异步使用块数据必须在 process() 返回前复制到后端自有缓冲。
 
 ### 运行态诊断
 
-链接 `aereborn::diag` 并包含 `diag/inspect.h`，即可在串行控制侧调用 `dump_text()` 或 `dump_dot()`。两者都支持返回字符串或写入输出流。传入需要一起检查的后端，报告会按端点关联生效节点，并列出未进入生效 Plan 的后端。队列水位为近似值，`underrun` 和 `overflow` 分别累计图侧采集缺帧和播放丢帧。`late` 是时钟跳过的周期数，`tick_us` 是最近一拍含时钟收尾的估计耗时。
+仓库内的目标链接 `aereborn::aereborn`，并通过私有头路径包含 `diag/inspect.h`，即可在串行控制侧调用 `dump_text()` 或 `dump_dot()`。两者都支持返回字符串或写入输出流。传入需要一起检查的后端，报告会按端点关联生效节点，并列出未进入生效 Plan 的后端。队列水位为近似值，`underrun` 和 `overflow` 分别累计图侧采集缺帧和播放丢帧。`late` 是时钟跳过的周期数，`tick_us` 是最近一拍含时钟收尾的估计耗时。
 
-用 `dot -Tsvg graph.dot -o graph.svg` 渲染信号流图。卡片标题显示端点状态和后端错误短码，橙色标记预填充、排空、跳拍或队列缺帧。多端口节点按插槽接线，Mixer 的静音端口置灰，对应入边用灰色虚线标识。卡片和连线直接显示关键规格，SVG 悬停可查看完整诊断详情。`io.diagnostic_reports` 检查文本和 DOT 输出，`io.endpoint_diagnostics` 检查端点计数、重启及短批次排空。
+用 `dot -Tsvg graph.dot -o graph.svg` 渲染信号流图。卡片标题显示端点状态和后端错误短码，橙色标记预填充、排空、跳拍或队列缺帧。多端口节点按插槽接线，Mixer 的静音端口和入边置灰。启用优先级时，文本报告显示 `high` 和 `suppressed`，DOT 用 `[HIGH]` 标记高优端口，用 `[SUPP]` 和琥珀色虚线标记被压制的普通端口及其入边。卡片和连线直接显示关键规格，SVG 悬停可查看完整诊断详情。`io.diagnostic_reports` 和 `io.mixer_priority_diagnostics` 检查文本和 DOT 输出，`io.endpoint_diagnostics` 检查端点计数、重启及短批次排空。
 
 ### 构建与验证
 
-项目使用 C++14。`aereborn::core` 和 `aereborn::backend` 链接 `Threads::Threads`。静态库 `aereborn::backend` 包含 `PushSource`、`PullSink`、`UsrPlayback`、Null 和 RIFF/WAVE 后端。Linux 在查找到 ALSA 开发库时编译 ALSA 后端并定义 `AEREBORN_HAS_ALSA`，Windows 编译 WASAPI 后端。只构建库可设置 `-DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF`。
+项目使用 C++14。CMake 目标 `aereborn::aereborn` 链接静态库 `aereborn`，其中包含内核、插件、后端和诊断模块。目标公开的头路径为 `include/`，可通过 `#include "audio_types.h"` 使用基础类型。库链接 `Threads::Threads`。Linux 在查找到 ALSA 开发库时编译 ALSA 后端并定义 `AEREBORN_HAS_ALSA`，Windows 编译 WASAPI 后端。只构建库可设置 `-DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF`。
 
-~~~powershell
-cmake -S . -B build -DBUILD_TESTING=ON
-cmake --build build --config Debug --parallel 4
-ctest --test-dir build -C Debug --output-on-failure
-cmake --build build --config Release --parallel 4
-ctest --test-dir build -C Release --output-on-failure
-ctest --test-dir build -C Release -L bus --output-on-failure
+~~~sh
+cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+cmake --build build/debug --config Debug --parallel 4
+ctest --test-dir build/debug -C Debug --output-on-failure
+cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build build/release --config Release --parallel 4
+ctest --test-dir build/release -C Release --output-on-failure
+ctest --test-dir build/release -C Release -L bus --output-on-failure
 ~~~
 
-测试目录和 CTest 标签使用 `core`、`dsp`、`bus`、`io`、`regression`。单独运行四声道场景可使用 `ctest --test-dir build -C Release -R '^bus.four_channel_song_archive$' --output-on-failure`。引擎测试使用内置时钟，通过测试节点在块边界与测试控制侧同步。混音、PCM 转换和重采样使用独立字节或数值参照。
+测试目录和 CTest 标签使用 `core`、`dsp`、`bus`、`io`、`regression`。单独运行四声道场景可使用 `ctest --test-dir build/release -C Release -R '^bus.four_channel_song_archive$' --output-on-failure`。引擎测试使用内置时钟，通过测试节点在块边界与测试控制侧同步。混音、PCM 转换和重采样使用独立字节或数值参照。
 
 `tests/data/` 的两份 48 kHz 双声道 WAV 短片来自《渡口》第 30 秒起的 0.5 秒和 CaliforniaHotel 第 40 秒起的 0.75 秒。四声道测试将两段音乐交错到同一个输入，生成两份 48 kHz 拆分归档和一份 44.1 kHz 混音归档。录音和分段文件在构建目录内创建，正常退出时清理。
 
-`io` 包含后端绑定、设备超时、WAV 文件和时钟漂移检查。Linux 有 ALSA 时运行两种 `plug:null` 采集和播放配置。Windows 默认验证 WASAPI 绑定失败和 Null 接管。设置 `AEREBORN_WASAPI_CAPTURE_ID` 或 `AEREBORN_WASAPI_PLAYBACK_ID` 后，可用 `ctest --test-dir build -C Release -L hardware --output-on-failure` 运行对应实机用例。后端生命周期、异步超时和 ALSA 参数见 [设备后端实施说明](AudioEngine_Backend_Plan.md)。
+`io` 包含后端绑定、设备超时、WAV 文件和时钟漂移检查。Linux 有 ALSA 时运行两种 `plug:null` 采集和播放配置。Windows 默认验证 WASAPI 绑定失败和 Null 接管。设置 `AEREBORN_WASAPI_CAPTURE_ID` 或 `AEREBORN_WASAPI_PLAYBACK_ID` 后，可用 `ctest --test-dir build/release -C Release -L hardware --output-on-failure` 运行对应实机用例。ALSA 后端的设计背景见 [ALSA 实施记录](docs/archive/aereborn_alsa.md)。
 
 MSVC Debug 的迭代器代理会在 `noexcept` 构造中分配内存，`regression` 中的分配注入和零分配检查在 Release 执行。示例由默认开启的 `BUILD_EXAMPLES` 控制。
 
@@ -610,30 +249,31 @@ MSVC Debug 的迭代器代理会在 `noexcept` 构造中分配内存，`regressi
 | 场景 | 写法 |
 | --- | --- |
 | 连接 | 单独指一个连接时用 `connection`。组合词可用 `conn`，如 `conn_id`、`conn_count`。 |
-| 端口 | 成对的类型使用等长的 `I` / `O` 方向前缀和相同的后缀，例如 `IPort` / `OPort`。 |
+| 端口 | 使用 `NodeId` 和零基下标表示端口，例如 `mix[1]`。`connect(from, to)` 按参数位置区分输出和输入。 |
 | 数据块 | 使用 `I` / `O` 表示方向，`B` / `F` 表示字节视图或浮点视图。字节块为 `IBBlock` / `OBBlock`，平面浮点块为 `IFBlock` / `OFBlock`。 |
 | 声道 | 声道循环的索引用 `ch`。声明端口时用 `channels` 表示声道数，用 `input_channels`、`output_channels` 区分方向。 |
-| 采样率 | 配置和公开接口用 `sample_rate`。重采样内部可以用常见的 DSP 记号 `src_fs`、`dst_fs`。 |
+| 采样率 | 端口规格用 `BandWidth` 类型和 `bandwidth` 字段，单位为 Hz。重采样内部可以用常见的 DSP 记号 `src_fs`、`dst_fs`。 |
 | 帧、采样点、字节 | 根据单位使用 `frames`、`samples`、`bytes`。含义可能混淆时，用 `frame_offset`、`byte_offset` 或 `period_ms` 写明单位。 |
 
 - **成对的变量保持对称。** 用同一组方向词、相同的后缀和缩写程度，例如 `src_fs` / `dst_fs`、`input_channels` / `output_channels`、`from` / `to`。同一个值在相邻函数中沿用同一术语。
 - **成对的类型和接口按长度和结构对齐。** 使用等长的区分词，其余词的位置、写法和后缀一致。例如 `NodeId` / `ConnId` 共用 `Id`，`byte_view()` / `f32p_view()` 共用 `_view`。
 - **名称反映实际的访问方式或数据格式。** `byte_view()` 表示按字节访问，`f32p_view()` 明确适用的样本格式。
 - **名字反映变量的用途。** `conn_count` 是数量，`conn_index` 是索引。短循环可以用 `i` 和 `ch`，跨多个步骤使用的变量写明角色，例如 `frame_offset`。
-- **沿用项目的拼写风格。** 局部变量、参数和函数用 `snake_case`，私有成员变量在末尾加 `_`，如 `frame_position_`。类型和枚举值通常用 `PascalCase`，例如 `ConnId`、`ErrorCode::InvalidPort`。PCM 枚举沿用 `S16LE`、`S24_3LE`、`F32LE` 这样的格式名。
+- **沿用项目的拼写风格。** 局部变量、参数和函数用 `snake_case`，私有成员变量在末尾加 `_`，如 `frame_position_`。类型和采样率枚举值用 `PascalCase`，例如 `BandWidth::CDQuality`。状态、周期和 PCM 格式使用大写名称，例如 `RetCode::EPORT`、`BlockPeriod::INR_05MS` 和 `SampleFormat::S24_3LE`。
 
 ## 2. 类型与接口
 
 - 优先复用现有类型。只有在需要表达独立的含义、约束、所有权或生命周期时才引入新类型。单纯的数量和索引使用现有整数类型。
-- 一项规格只保留一个定义来源。采样率和 PCM 格式由 `core/types.h` 提供，样本位深和存储字节数从 `SampleFormat` 推导。端口固定声明采样率、声道数和格式，Engine 只持有推进周期。普通 DSP 插件声明 F32P，特殊模块声明其实际格式，转换由 Convert 完成。
+- 一项规格只保留一个定义来源。`include/audio_types.h` 声明公共基础类型。`core/types.h` 提供内部校验和位宽计算，样本位深和存储字节数从 `SampleFormat` 推导。端口固定声明采样率、声道数和格式，Engine 只持有推进周期。普通 DSP 插件声明 F32P，特殊模块声明其实际格式，转换由 Convert 完成。
+- 节点操作接收端口下标为零的 `NodeId`。连接保留两端的端口下标，图遍历按 `base()` 取得节点句柄。
 - 函数名和参数顺序应能直接说明调用方向。底层函数、辅助记录和临时状态放在使用它们的实现范围内。对外接口集中表达调用方需要配置、传递或查询的内容。
 - 类及其公开接口在声明处使用 `///` 格式的 Doxygen 注释。用 `@brief` 说明职责，按需用 `@param`、`@return`、`@pre` 和 `@note` 记录参数、结果、前置条件及调用约定。涉及借用数据或跨线程调用时，写明有效期和线程约束。
 - 保持调用路径直接。抽取能消除重复、集中维护同一约束的逻辑，优先选用普通函数和直接的成员状态。模板用于确有编译期差异的场景，例如固定端口数量。采样率和处理周期作为运行时规格传递。
 
 ## 3. 错误处理
 
-- 控制接口用 `aereborn::Error` 报告参数、状态、容量和设备操作失败。调用方用 `Error::code()` 识别失败原因。标准库的分配和线程创建异常，以及自定义节点的异常，直接传播给调用方。
-- 后端驱动用 `RetCode` 或 `Result<T>` 报告设备状态。检查成功后再读 `value()`。在绑定和启动的控制边界使用 `or_throw()` 或 `value_or_throw()`，工作线程通过 `last_error()` 报告终止原因。`on_open()` 在控制侧运行，资源准备异常可以传播。
+- 控制接口用 `aereborn::Error` 报告参数、状态、容量和设备操作失败。调用方用 `Error::code()` 取得 `RetCode::Code`。标准库的分配和线程创建异常，以及自定义节点的异常，直接传播给调用方。
+- 后端驱动用 `RetCode` 或 `Result<T>` 报告设备状态。检查成功后再读 `value()`。在绑定和启动的控制边界使用 `throw_if_error()` 或 `value_or_throw()`，工作线程通过 `last_error()` 报告终止原因。`on_open()` 在控制侧运行，资源准备异常可以传播。
 - 工作线程的 I/O 钩子以及实时渲染、DSP、后端停止和解绑使用 `noexcept`。I/O 报告设备错误，DSP 和队列返回处理结果，内部前置条件用断言表达。
 - 在建立约束的入口做校验。连接时检查完整端口规格和输入占用，Matrix 构造时检查矩阵尺寸，绑定设备缓冲时检查长度与占用状态。处理路径直接使用已经校验和准备好的数据。
 - 资源准备成功后再发布可用状态。失败时保留有效状态，使调用方可以重试。用资源所有权和作用域清理处理失败回滚。
@@ -648,6 +288,7 @@ MSVC Debug 的迭代器代理会在 `noexcept` 构造中分配内存，`regressi
 
 - 以业务契约为准，测试负责验证契约。业务接口和分支应有明确的实际调用需求。
 - 使用 C++14。修改集中在受影响的接口和实现，沿用周围代码的风格。注释优先说明约束和原因。
+- 应用通过 `aereborn::aereborn` 链接静态库，目标公开 `include/`。库内测试和示例如需内部头文件，显式添加项目根目录作为私有头路径。
 - 沿实际调用入口验证改动。优先复用现有测试，在现有测试覆盖不到具体回归时补充用例。音频转换和图处理的边界用实际帧数、声道数和输出值验证。
 - 路由测试使用 Tone 或测试源，经 Convert、Mixer、Matrix 和测试收端验证显式图；设备交接使用 Capture / Playback。格式转换使用独立的字节参照，混音和重采样使用独立的数值参照。测试按职责分组、每个场景独立注册到 CTest；共用准备和断言工具，不复制路由驱动逻辑。
 
@@ -663,30 +304,31 @@ MSVC Debug 的迭代器代理会在 `noexcept` 构造中分配内存，`regressi
 | 场景 | 写法 |
 | --- | --- |
 | 连接 | 单独指一个连接时用 `connection`。组合词可用 `conn`，如 `conn_id`、`conn_count`。 |
-| 端口 | 成对的类型使用等长的 `I` / `O` 方向前缀和相同的后缀，例如 `IPort` / `OPort`。 |
+| 端口 | 使用 `NodeId` 和零基下标表示端口，例如 `mix[1]`。`connect(from, to)` 按参数位置区分输出和输入。 |
 | 数据块 | 使用 `I` / `O` 表示方向，`B` / `F` 表示字节视图或浮点视图。字节块为 `IBBlock` / `OBBlock`，平面浮点块为 `IFBlock` / `OFBlock`。 |
 | 声道 | 声道循环的索引用 `ch`。声明端口时用 `channels` 表示声道数，用 `input_channels`、`output_channels` 区分方向。 |
-| 采样率 | 配置和公开接口用 `sample_rate`。重采样内部可以用常见的 DSP 记号 `src_fs`、`dst_fs`。 |
+| 采样率 | 端口规格用 `BandWidth` 类型和 `bandwidth` 字段，单位为 Hz。重采样内部可以用常见的 DSP 记号 `src_fs`、`dst_fs`。 |
 | 帧、采样点、字节 | 根据单位使用 `frames`、`samples`、`bytes`。含义可能混淆时，用 `frame_offset`、`byte_offset` 或 `period_ms` 写明单位。 |
 
 - **成对的变量保持对称。** 用同一组方向词、相同的后缀和缩写程度，例如 `src_fs` / `dst_fs`、`input_channels` / `output_channels`、`from` / `to`。同一个值在相邻函数中沿用同一术语。
 - **成对的类型和接口按长度和结构对齐。** 使用等长的区分词，其余词的位置、写法和后缀一致。例如 `NodeId` / `ConnId` 共用 `Id`，`byte_view()` / `f32p_view()` 共用 `_view`。
 - **名称反映实际的访问方式或数据格式。** `byte_view()` 表示按字节访问，`f32p_view()` 明确适用的样本格式。
 - **名字反映变量的用途。** `conn_count` 是数量，`conn_index` 是索引。短循环可以用 `i` 和 `ch`，跨多个步骤使用的变量写明角色，例如 `frame_offset`。
-- **沿用项目的拼写风格。** 局部变量、参数和函数用 `snake_case`，私有成员变量在末尾加 `_`，如 `frame_position_`。类型和枚举值通常用 `PascalCase`，例如 `ConnId`、`ErrorCode::InvalidPort`。PCM 枚举沿用 `S16LE`、`S24_3LE`、`F32LE` 这样的格式名。
+- **沿用项目的拼写风格。** 局部变量、参数和函数用 `snake_case`，私有成员变量在末尾加 `_`，如 `frame_position_`。类型和采样率枚举值用 `PascalCase`，例如 `BandWidth::CDQuality`。状态、周期和 PCM 格式使用大写名称，例如 `RetCode::EPORT`、`BlockPeriod::INR_05MS` 和 `SampleFormat::S24_3LE`。
 
 ## 2. 类型与接口
 
 - 优先复用现有类型。只有在需要表达独立的含义、约束、所有权或生命周期时才引入新类型。单纯的数量和索引使用现有整数类型。
-- 一项规格只保留一个定义来源。采样率和 PCM 格式由 `core/types.h` 提供，样本位深和存储字节数从 `SampleFormat` 推导。端口固定声明采样率、声道数和格式，Engine 只持有推进周期。普通 DSP 插件声明 F32P，特殊模块声明其实际格式，转换由 Convert 完成。
+- 一项规格只保留一个定义来源。`include/audio_types.h` 声明公共基础类型。`core/types.h` 提供内部校验和位宽计算，样本位深和存储字节数从 `SampleFormat` 推导。端口固定声明采样率、声道数和格式，Engine 只持有推进周期。普通 DSP 插件声明 F32P，特殊模块声明其实际格式，转换由 Convert 完成。
+- 节点操作接收端口下标为零的 `NodeId`。连接保留两端的端口下标，图遍历按 `base()` 取得节点句柄。
 - 函数名和参数顺序应能直接说明调用方向。底层函数、辅助记录和临时状态放在使用它们的实现范围内。对外接口集中表达调用方需要配置、传递或查询的内容。
 - 类及其公开接口在声明处使用 `///` 格式的 Doxygen 注释。用 `@brief` 说明职责，按需用 `@param`、`@return`、`@pre` 和 `@note` 记录参数、结果、前置条件及调用约定。涉及借用数据或跨线程调用时，写明有效期和线程约束。
 - 保持调用路径直接。抽取能消除重复、集中维护同一约束的逻辑，优先选用普通函数和直接的成员状态。模板用于确有编译期差异的场景，例如固定端口数量。采样率和处理周期作为运行时规格传递。
 
 ## 3. 错误处理
 
-- 控制接口用 `aereborn::Error` 报告参数、状态、容量和设备操作失败。调用方用 `Error::code()` 识别失败原因。标准库的分配和线程创建异常，以及自定义节点的异常，直接传播给调用方。
-- 后端驱动用 `RetCode` 或 `Result<T>` 报告设备状态。检查成功后再读 `value()`。在绑定和启动的控制边界使用 `or_throw()` 或 `value_or_throw()`，工作线程通过 `last_error()` 报告终止原因。`on_open()` 在控制侧运行，资源准备异常可以传播。
+- 控制接口用 `aereborn::Error` 报告参数、状态、容量和设备操作失败。调用方用 `Error::code()` 取得 `RetCode::Code`。标准库的分配和线程创建异常，以及自定义节点的异常，直接传播给调用方。
+- 后端驱动用 `RetCode` 或 `Result<T>` 报告设备状态。检查成功后再读 `value()`。在绑定和启动的控制边界使用 `throw_if_error()` 或 `value_or_throw()`，工作线程通过 `last_error()` 报告终止原因。`on_open()` 在控制侧运行，资源准备异常可以传播。
 - 工作线程的 I/O 钩子以及实时渲染、DSP、后端停止和解绑使用 `noexcept`。I/O 报告设备错误，DSP 和队列返回处理结果，内部前置条件用断言表达。
 - 在建立约束的入口做校验。连接时检查完整端口规格和输入占用，Matrix 构造时检查矩阵尺寸，绑定设备缓冲时检查长度与占用状态。处理路径直接使用已经校验和准备好的数据。
 - 资源准备成功后再发布可用状态。失败时保留有效状态，使调用方可以重试。用资源所有权和作用域清理处理失败回滚。
@@ -701,6 +343,7 @@ MSVC Debug 的迭代器代理会在 `noexcept` 构造中分配内存，`regressi
 
 - 以业务契约为准，测试负责验证契约。业务接口和分支应有明确的实际调用需求。
 - 使用 C++14。修改集中在受影响的接口和实现，沿用周围代码的风格。注释优先说明约束和原因。
+- 应用通过 `aereborn::aereborn` 链接静态库，目标公开 `include/`。库内测试和示例如需内部头文件，显式添加项目根目录作为私有头路径。
 - 沿实际调用入口验证改动。优先复用现有测试，在现有测试覆盖不到具体回归时补充用例。音频转换和图处理的边界用实际帧数、声道数和输出值验证。
 - 路由测试使用 Tone 或测试源，经 Convert、Mixer、Matrix 和测试收端验证显式图；设备交接使用 Capture / Playback。格式转换使用独立的字节参照，混音和重采样使用独立的数值参照。测试按职责分组、每个场景独立注册到 CTest；共用准备和断言工具，不复制路由驱动逻辑。
 
@@ -717,33 +360,46 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Threads REQUIRED)
 
-add_library(aereborn_core STATIC
+add_library(aereborn STATIC
     core/engine.cpp
-    core/os.cpp
     core/resampler.cpp
     core/types.cpp
-)
-add_library(aereborn::core ALIAS aereborn_core)
-
-target_include_directories(aereborn_core
-    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}"
-)
-target_link_libraries(aereborn_core PRIVATE Threads::Threads)
-
-add_library(aereborn_plugins STATIC
     plugins/convert.cpp
     plugins/endpoint.cpp
     plugins/matrix.cpp
     plugins/mixer.cpp
+    backend/backend.cpp
+    backend/null_backend.cpp
+    backend/pull_sink.cpp
+    backend/push_source.cpp
+    backend/usr_playback.cpp
+    backend/wav_backend.cpp
+    backend/wav_file.cpp
+    diag/inspect.cpp
 )
-add_library(aereborn::plugins ALIAS aereborn_plugins)
-target_link_libraries(aereborn_plugins PUBLIC aereborn::core)
+add_library(aereborn::aereborn ALIAS aereborn)
 
-add_subdirectory(backend)
+target_include_directories(aereborn
+    PUBLIC  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+target_compile_features(aereborn PUBLIC cxx_std_14)
+target_link_libraries(aereborn PRIVATE Threads::Threads)
 
-add_library(aereborn_diag STATIC diag/inspect.cpp)
-add_library(aereborn::diag ALIAS aereborn_diag)
-target_link_libraries(aereborn_diag PUBLIC aereborn::backend)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(ALSA QUIET)
+    if(ALSA_FOUND)
+        target_sources(aereborn PRIVATE backend/alsa_backend.cpp)
+        target_link_libraries(aereborn PRIVATE ALSA::ALSA)
+        target_compile_definitions(aereborn PUBLIC AEREBORN_HAS_ALSA=1)
+        message(STATUS "AEReborn found the ALSA library at ${ALSA_LIBRARY}")
+    else()
+        message(STATUS "AEReborn skipped ALSA because its development library or headers were not found")
+    endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    target_sources(aereborn PRIVATE backend/wasapi_backend.cpp)
+    target_link_libraries(aereborn PRIVATE ole32 uuid)
+endif()
 
 include(CTest)
 option(BUILD_EXAMPLES "Build AEReborn examples" ON)
@@ -938,7 +594,7 @@ class Buffer
     /// @brief Set the workspace dimensions and zero its samples.
     /// @param channels Number of channels.
     /// @param capacity_frames Frame capacity per channel.
-    /// @throws Error InvalidArg for a zero dimension, or TooLarge if storage would exceed its limit.
+    /// @throws Error RetCode::EPARAM for a zero dimension, or RetCode::TOOLARGE if storage would exceed its limit.
     /// @note Allocate in prepare(). Allocation failure propagates as an exception.
     void resize(std::size_t channels, std::size_t capacity_frames);
 
@@ -983,14 +639,34 @@ thread_local const Engine *clock_engine = nullptr;
 BlockPeriod checked_period(BlockPeriod period)
 {
     if (!is_block_period(period))
-        throw Error(ErrorCode::InvalidArg);
+        throw Error(RetCode::EPARAM);
     return period;
 }
 
-std::uint64_t next_identifier() noexcept
+void require_base_node_id(NodeId id)
+{
+    if (id.port() != 0)
+        throw Error(RetCode::EPORT);
+}
+
+std::size_t checked_port_index(NodeId port, std::size_t count)
+{
+    const auto index = port.port();
+    if (index >= count)
+        throw Error(RetCode::EPORT);
+    return index;
+}
+
+std::uint64_t next_identifier()
 {
     static std::atomic<std::uint64_t> next{1};
-    return next.fetch_add(1, std::memory_order_relaxed);
+    auto id = next.load(std::memory_order_relaxed);
+    do
+    {
+        if (id > NodeId::max_node)
+            throw Error(RetCode::TOOLARGE);
+    } while (!next.compare_exchange_weak(id, id + 1, std::memory_order_relaxed));
+    return id;
 }
 
 bool same_ports(View<const PortSpec> a, View<const PortSpec> b) noexcept
@@ -1014,7 +690,7 @@ struct PoolSize
         const auto units = pool_units_per_channel(spec.format, spec.max_frames(period));
         const auto available = unconnected ? limit - outputs : limit - outputs - silence;
         if (spec.channels > available / units)
-            throw Error(ErrorCode::TooLarge);
+            throw Error(RetCode::TOOLARGE);
         const auto size = spec.channels * units;
         if (unconnected)
             silence = std::max(silence, size);
@@ -1048,15 +724,6 @@ struct NodeEntry
         : id(id), node(std::move(instance)), inputs(inputs), outputs(outputs)
     {
     }
-    View<const PortSpec> ports(IPort) const noexcept
-    {
-        return inputs;
-    }
-    View<const PortSpec> ports(OPort) const noexcept
-    {
-        return outputs;
-    }
-
     const NodeId id;
     std::unique_ptr<Node> node;
     const View<const PortSpec> inputs;
@@ -1085,18 +752,22 @@ class Engine::Graph
     NodeId add_node(std::unique_ptr<Node> instance)
     {
         if (!instance)
-            throw Error(ErrorCode::InvalidArg);
+            throw Error(RetCode::EPARAM);
         const auto inputs = instance->inputs();
         const auto outputs = instance->outputs();
         if (inputs.empty() && outputs.empty())
-            throw Error(ErrorCode::InvalidArg);
+            throw Error(RetCode::EPARAM);
         for (const auto ports : {inputs, outputs})
+        {
+            if (ports.size() > NodeId::invalid_port)
+                throw Error(RetCode::TOOLARGE);
             for (const auto &port : ports)
                 if (!port.valid())
-                    throw Error(ErrorCode::InvalidArg);
+                    throw Error(RetCode::EPARAM);
+        }
 
-        std::vector<OPort> links(inputs.size());
-        const NodeId id{next_identifier()};
+        std::vector<NodeId> links(inputs.size());
+        const auto id = NodeId::make(next_identifier());
         auto entry = std::make_shared<NodeEntry>(id, std::move(instance), inputs, outputs);
         nodes_.emplace(id, DraftNode{std::move(entry), std::move(links)});
         dirty_ = true;
@@ -1107,7 +778,7 @@ class Engine::Graph
     {
         const auto found = find_node(id);
         for (auto it = connections_.begin(); it != connections_.end();)
-            if (it->second.from.node == id || it->second.to.node == id)
+            if (it->second.from.base() == id || it->second.to.base() == id)
                 it = erase_connection(it);
             else
                 ++it;
@@ -1119,12 +790,12 @@ class Engine::Graph
     {
         const auto found = find_node(id);
         if (!replacement)
-            throw Error(ErrorCode::InvalidArg);
+            throw Error(RetCode::EPARAM);
         const auto inputs = replacement->inputs();
         const auto outputs = replacement->outputs();
         auto &current = found->second.entry;
         if (!same_ports(current->inputs, inputs) || !same_ports(current->outputs, outputs))
-            throw Error(ErrorCode::FormatMismatch);
+            throw Error(RetCode::INVFMT);
         auto entry = std::make_shared<NodeEntry>(id, std::move(replacement), inputs, outputs);
         dirty_ = true;
         current = std::move(entry);
@@ -1143,17 +814,19 @@ class Engine::Graph
         return found->second.entry->node.get();
     }
 
-    ConnId connect(OPort from, IPort to)
+    ConnId connect(NodeId from, NodeId to)
     {
-        const auto &source = port_owner(from);
-        auto &destination = port_owner(to);
-        if (source.entry->outputs[from.index] != destination.entry->inputs[to.index])
-            throw Error(ErrorCode::FormatMismatch);
-        auto &input = destination.inputs[to.index];
-        if (input.node)
-            throw Error(input == from ? ErrorCode::DuplicateConn : ErrorCode::InputBusy);
-        if (would_cycle(from.node, to.node))
-            throw Error(ErrorCode::Cycle);
+        const auto &source = *find_node(from.base())->second.entry;
+        const auto output_index = checked_port_index(from, source.outputs.size());
+        auto &destination = find_node(to.base())->second;
+        const auto input_index = checked_port_index(to, destination.inputs.size());
+        if (source.outputs[output_index] != destination.entry->inputs[input_index])
+            throw Error(RetCode::INVFMT);
+        auto &input = destination.inputs[input_index];
+        if (input)
+            throw Error(input == from ? RetCode::DUPLICATE : RetCode::EINPUTBUSY);
+        if (would_cycle(source.id, destination.entry->id))
+            throw Error(RetCode::CYCLE);
         const ConnId id{next_identifier()};
         connections_.emplace(id, ConnectionPorts{from, to});
         input = from;
@@ -1165,7 +838,7 @@ class Engine::Graph
     {
         const auto found = connections_.find(id);
         if (found == connections_.end())
-            throw Error(ErrorCode::UnknownConn);
+            throw Error(RetCode::ECONN);
         erase_connection(found);
         dirty_ = true;
     }
@@ -1181,7 +854,7 @@ class Engine::Graph
         for (const auto &item : connections_)
         {
             const auto &connection = item.second;
-            if (node_index.count(connection.from.node) && node_index.count(connection.to.node))
+            if (node_index.count(connection.from.base()) && node_index.count(connection.to.base()))
                 topology.connections.push_back({item.first, connection.from, connection.to});
         }
         return topology;
@@ -1213,13 +886,13 @@ class Engine::Graph
     struct DraftNode
     {
         std::shared_ptr<NodeEntry> entry;
-        std::vector<OPort> inputs;
+        std::vector<NodeId> inputs;
         bool paused = false;
     };
     struct ConnectionPorts
     {
-        OPort from;
-        IPort to;
+        NodeId from;
+        NodeId to;
     };
     using Nodes = std::map<NodeId, DraftNode>;
     using Connections = std::map<ConnId, ConnectionPorts>;
@@ -1228,17 +901,8 @@ class Engine::Graph
     {
         const auto found = nodes_.find(id);
         if (found == nodes_.end())
-            throw Error(ErrorCode::UnknownNode);
+            throw Error(RetCode::ENODE);
         return found;
-    }
-
-    template <class Port> DraftNode &port_owner(Port port)
-    {
-        const auto found = find_node(port.node);
-        const auto ports = found->second.entry->ports(port);
-        if (port.index >= ports.size())
-            throw Error(ErrorCode::InvalidPort);
-        return found->second;
     }
 
     bool would_cycle(NodeId from, NodeId to) const
@@ -1252,8 +916,11 @@ class Engine::Graph
             if (id == to)
                 return true;
             for (const auto input : nodes_.find(id)->second.inputs)
-                if (input.node && visited.insert(input.node).second)
-                    stack.push_back(input.node);
+            {
+                const auto upstream = input.base();
+                if (upstream && visited.insert(upstream).second)
+                    stack.push_back(upstream);
+            }
         }
 
         return false;
@@ -1262,7 +929,7 @@ class Engine::Graph
     Connections::iterator erase_connection(Connections::iterator connection) noexcept
     {
         const auto to = connection->second.to;
-        nodes_.find(to.node)->second.inputs[to.index] = {};
+        nodes_.find(to.base())->second.inputs[to.port()] = {};
         return connections_.erase(connection);
     }
 
@@ -1272,9 +939,9 @@ class Engine::Graph
             return;
 
         for (const auto input : draft.inputs)
-            if (input.node)
+            if (input)
             {
-                const auto &source = nodes_.find(input.node)->second;
+                const auto &source = nodes_.find(input.base())->second;
                 if (!source.paused)
                     visit(source, topology, node_index);
             }
@@ -1285,8 +952,8 @@ class Engine::Graph
         // An absent source is unconnected or was excluded by pause.
         for (const auto input : draft.inputs)
         {
-            const auto source = input.node ? node_index.find(input.node) : node_index.end();
-            topology.links.push_back(source == node_index.end() ? Link{} : Link{source->second, input.index});
+            const auto source = input ? node_index.find(input.base()) : node_index.end();
+            topology.links.push_back(source == node_index.end() ? Link{} : Link{source->second, input.port()});
         }
     }
 
@@ -1416,7 +1083,7 @@ class Engine::Runner
             for (const auto &entry : current_->owners)
                 if (entry->id == id)
                     return entry->node.get();
-        throw Error(ErrorCode::UnknownNode);
+        throw Error(RetCode::ENODE);
     }
 
     /// @brief Reset nodes held by the current plan after removal or replacement in the draft.
@@ -1478,17 +1145,23 @@ class Engine::Runner
                     refresh_frames(output);
             }
 
-            // Leave slot zero inactive for all inputs without a source.
-            std::fill(output_active.begin() + 1, output_active.end(), std::uint8_t{1});
             for (const auto &step : steps)
             {
+                std::uint8_t active = step.input_count == 0;
                 for (std::size_t i = step.first_input; i < step.first_input + step.input_count; ++i)
-                    input_active[i] = output_active[input_sources[i]];
+                {
+                    const auto flag = output_active[input_sources[i]];
+                    input_active[i] = flag;
+                    active |= flag;
+                }
 
+                const auto output_flags = port_range(output_active.data() + 1, step.first_output, step.output_count);
+                for (auto &flag : output_flags)
+                    flag = active != 0;
                 step.node->process({period, tick, port_range(inputs.data(), step.first_input, step.input_count),
                                     port_range(outputs.data(), step.first_output, step.output_count),
                                     port_range(input_active.data(), step.first_input, step.input_count),
-                                    port_range(output_active.data() + 1, step.first_output, step.output_count)});
+                                    output_flags});
             }
         }
 
@@ -1517,10 +1190,10 @@ class Engine::Runner
     {
         const auto period_ms = static_cast<std::uint32_t>(period);
         const auto fractional = [period_ms](PortSpec spec) {
-            return (static_cast<std::uint32_t>(spec.sample_rate) * period_ms) % 1000 != 0;
+            return (static_cast<std::uint32_t>(spec.bandwidth) * period_ms) % 1000 != 0;
         };
         if (topology.nodes.size() > plan.steps.max_size())
-            throw Error(ErrorCode::TooLarge);
+            throw Error(RetCode::TOOLARGE);
         const auto max_inputs = std::min({plan.inputs.max_size(), plan.input_active.max_size(),
                                           plan.input_sources.max_size()});
         const auto max_outputs = std::min(plan.outputs.max_size(), plan.output_active.max_size() - 1);
@@ -1530,7 +1203,7 @@ class Engine::Runner
             const auto inputs = entry->inputs;
             const auto outputs = entry->outputs;
             if (inputs.size() > max_inputs - layout.input_count || outputs.size() > max_outputs - layout.output_count)
-                throw Error(ErrorCode::TooLarge);
+                throw Error(RetCode::TOOLARGE);
             plan.steps.push_back(
                 {entry->node.get(), layout.input_count, inputs.size(), layout.output_count, outputs.size()});
 
@@ -1619,7 +1292,7 @@ Engine::~Engine() = default;
 void Engine::require_control_thread() const
 {
     if (clock_engine == this)
-        throw Error(ErrorCode::Busy);
+        throw Error(RetCode::BUSY);
 }
 
 bool Engine::tick() noexcept
@@ -1644,28 +1317,32 @@ NodeId Engine::insert_node(std::unique_ptr<Node> instance)
 void Engine::remove_node(NodeId id)
 {
     require_control_thread();
+    require_base_node_id(id);
     graph_->remove_node(id);
 }
 
 void Engine::replace_node(NodeId id, std::unique_ptr<Node> replacement)
 {
     require_control_thread();
+    require_base_node_id(id);
     graph_->replace_node(id, std::move(replacement));
 }
 
 void Engine::set_paused(NodeId id, bool paused)
 {
     require_control_thread();
+    require_base_node_id(id);
     graph_->set_paused(id, paused);
 }
 
 Node *Engine::node(NodeId id)
 {
     require_control_thread();
+    require_base_node_id(id);
     return graph_->node(id);
 }
 
-ConnId Engine::connect(OPort from, IPort to)
+ConnId Engine::connect(NodeId from, NodeId to)
 {
     require_control_thread();
     return graph_->connect(from, to);
@@ -1694,9 +1371,9 @@ void Engine::start()
 {
     require_control_thread();
     if (state_ == State::Running)
-        throw Error(ErrorCode::Busy);
+        throw Error(RetCode::BUSY);
     if (state_ == State::Unprepared)
-        throw Error(ErrorCode::NotReady);
+        throw Error(RetCode::ESTATE);
     clock_->start(*this);
     state_ = State::Running;
 }
@@ -1715,7 +1392,7 @@ void Engine::reset()
 {
     require_control_thread();
     if (state_ == State::Running)
-        throw Error(ErrorCode::Busy);
+        throw Error(RetCode::BUSY);
     runner_->reset(*graph_);
     graph_->reset_nodes();
     position_.store(0, std::memory_order_release);
@@ -1756,6 +1433,7 @@ View<const Connection> Engine::plan_connections() const
 const Node *Engine::plan_node(NodeId node_id) const
 {
     require_control_thread();
+    require_base_node_id(node_id);
     return runner_->node(node_id);
 }
 
@@ -1781,7 +1459,7 @@ namespace aereborn
 
 /// @brief Owns an audio graph and advances it on an internal software clock.
 /// @note Serialize control calls, including node lookup, and destruction on the control side.
-/// Control calls from this engine's clock thread throw Error with code Busy.
+/// Control calls from this engine's clock thread throw Error with code RetCode::BUSY.
 /// Node callbacks must defer control requests and return without waiting for them.
 /// block_period() and tick_position() may run concurrently while the Engine is alive.
 class Engine
@@ -1797,7 +1475,7 @@ class Engine
 
     /// @brief Construct an engine with an empty draft graph.
     /// @param block_period Fixed duration of each tick.
-    /// @throws Error InvalidArg if the period is unsupported.
+    /// @throws Error RetCode::EPARAM if the period is unsupported.
     explicit Engine(BlockPeriod block_period);
 
     /// @brief Stop the clock and release all plans and nodes.
@@ -1809,7 +1487,8 @@ class Engine
     /// @brief Add a node to the draft graph.
     /// @param instance Node to transfer to the engine. The call consumes it on success or failure.
     /// @return The new node ID.
-    /// @throws Error InvalidArg for a null node or invalid port layout.
+    /// @throws Error RetCode::EPARAM for a null node or invalid port layout, or RetCode::TOOLARGE
+    /// if the port count or identifier space exceeds capacity.
     NodeId add_node(std::unique_ptr<Node> instance);
 
     /// @brief Construct a node and add it to the draft graph.
@@ -1826,27 +1505,28 @@ class Engine
 
     /// @brief Remove a node and its connections from the draft graph.
     /// @param node_id ID of the node to remove.
-    /// @throws Error UnknownNode if the draft has no such node.
+    /// @throws Error RetCode::EPORT for a nonzero port, or RetCode::ENODE for an absent node.
     void remove_node(NodeId node_id);
 
     /// @brief Replace a draft node while preserving its ID and connections.
     /// @param node_id ID of the node to replace.
     /// @param replacement New instance with identical port specifications in the same order.
     /// The call consumes it on success or failure.
-    /// @throws Error UnknownNode for an absent node, InvalidArg for a null replacement,
-    /// or FormatMismatch for a different port layout.
+    /// @throws Error RetCode::EPORT for a nonzero port, RetCode::ENODE for an absent node,
+    /// RetCode::EPARAM for a null replacement,
+    /// or RetCode::INVFMT for a different port layout.
     void replace_node(NodeId node_id, std::unique_ptr<Node> replacement);
 
     /// @brief Stage a local pause or resume for the next submitted plan.
     /// @param node_id ID of the node to pause or resume.
     /// @param paused True to exclude the node from the next plan, false to make it eligible again.
-    /// @throws Error UnknownNode if the draft has no such node.
+    /// @throws Error RetCode::EPORT for a nonzero port, or RetCode::ENODE for an absent node.
     void set_paused(NodeId node_id, bool paused);
 
     /// @brief Look up a node in the draft graph.
     /// @param node_id ID of the node to look up.
     /// @return A borrowed node pointer.
-    /// @throws Error UnknownNode if the draft has no such node.
+    /// @throws Error RetCode::EPORT for a nonzero port, or RetCode::ENODE for an absent node.
     /// @note The pointer is valid until removal, replacement, or Engine destruction.
     /// Follow the node's own contract for concurrent access during rendering.
     Node *node(NodeId node_id);
@@ -1855,13 +1535,13 @@ class Engine
     /// @tparam T Node type to cast the result to.
     /// @param node_id ID of the node to look up.
     /// @return A borrowed pointer.
-    /// @throws Error UnknownNode if the draft has no such node, or InvalidType if the cast fails.
+    /// @throws Error As documented for node(NodeId), or RetCode::ETYPE if the cast fails.
     /// @note The pointer follows the same lifetime and access rules as node(NodeId).
     template <class T> T *node(NodeId node_id)
     {
         auto *typed_node = dynamic_cast<T *>(node(node_id));
         if (!typed_node)
-            throw Error(ErrorCode::InvalidType);
+            throw Error(RetCode::ETYPE);
         return typed_node;
     }
 
@@ -1869,13 +1549,14 @@ class Engine
     /// @param from Source output port.
     /// @param to Destination input port, which can have only one source.
     /// @return The new connection ID.
-    /// @throws Error If graph validation fails.
+    /// @throws Error RetCode::EPORT if either port is unavailable in the requested direction,
+    /// or another status if graph validation fails.
     /// @note Port specifications must match, and the connection must leave the graph acyclic.
-    ConnId connect(OPort from, IPort to);
+    ConnId connect(NodeId from, NodeId to);
 
     /// @brief Remove a connection from the draft graph.
     /// @param conn_id ID returned by connect().
-    /// @throws Error UnknownConn if the connection is absent.
+    /// @throws Error RetCode::ECONN if the connection is absent.
     void disconnect(ConnId conn_id);
 
     /// @brief Prepare the draft and make it the current render plan.
@@ -1885,16 +1566,16 @@ class Engine
     void commit();
 
     /// @brief Start the software clock with the current plan and tick position.
-    /// @throws Error NotReady before the first successful commit, or Busy if already running.
+    /// @throws Error RetCode::ESTATE before the first successful commit, or RetCode::BUSY if already running.
     /// @note Thread creation exceptions propagate and leave the engine ready to retry.
     void start();
 
     /// @brief Stop the clock and wait for any in-flight block.
-    /// @throws Error Busy if called from this engine's clock thread.
+    /// @throws Error RetCode::BUSY if called from this engine's clock thread.
     void stop();
 
     /// @brief Reset nodes and the tick position while stopped.
-    /// @throws Error Busy while running.
+    /// @throws Error RetCode::BUSY while running.
     /// @note Resets each node instance held by the draft or current plan once and sets the next tick to zero.
     void reset();
 
@@ -1934,7 +1615,7 @@ class Engine
     View<const Connection> plan_connections() const;
 
     /// @brief Borrow a committed node instance, with the same lifetime as plan_nodes().
-    /// @throws Error UnknownNode if the node is outside the current plan.
+    /// @throws Error RetCode::EPORT for a nonzero port, or RetCode::ENODE for a node outside the plan.
     /// @note Follow the node's own contract for access during rendering.
     const Node *plan_node(NodeId node_id) const;
 
@@ -2123,7 +1804,8 @@ class Node
     /// @brief Process one block and write every output sample in its declared format.
     /// @param context Current period, tick position, port blocks, and per-port activity flags.
     /// @pre Preparation has succeeded.
-    /// @note Outputs default to active. Mark an output inactive only when its block is filled with zero bytes.
+    /// @note Sources default to active. Other nodes' outputs default to the logical OR of their inputs.
+    /// Mark an output active if it produces audio with all inputs inactive. Inactive outputs must be filled with zero bytes.
     /// @note The context and its views are valid only during this call. Keep processing
     /// free of heap allocation and deallocation, blocking I/O, and logging.
     /// Avoid lock waits where possible.
@@ -2168,93 +1850,6 @@ template <std::size_t I, std::size_t O> class NodeT : public Node
 } // namespace aereborn
 
 #endif // AEREBORN_CORE_GRAPH_H
-
-===== core/os.cpp =====
-#include "os.h"
-
-#if LINUX_OS_ENVIRONMENT || defined(__APPLE__)
-#include <pthread.h>
-#include <sched.h>
-#elif WINDOWS_OS_ENVIRONMENT
-#include <windows.h>
-#endif
-
-namespace aereborn
-{
-
-void configure_audio_thread(const char *name) noexcept
-{
-#if LINUX_OS_ENVIRONMENT || defined(__APPLE__)
-    const auto thread = pthread_self();
-#if LINUX_OS_ENVIRONMENT
-    pthread_setname_np(thread, name);
-    constexpr auto policy = SCHED_RR;
-    const auto priority = sched_get_priority_max(policy) - 1;
-#else
-    pthread_setname_np(name);
-    constexpr auto policy = SCHED_FIFO;
-    const auto priority = sched_get_priority_min(policy);
-#endif
-    if (priority >= 0)
-    {
-        sched_param params{};
-        params.sched_priority = priority;
-        pthread_setschedparam(thread, policy, &params);
-    }
-#elif WINDOWS_OS_ENVIRONMENT
-    const auto thread = GetCurrentThread();
-    SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL);
-    using SetDescription = HRESULT(WINAPI *)(HANDLE, PCWSTR);
-    const auto kernel = GetModuleHandleW(L"Kernel32.dll");
-    if (kernel)
-    {
-        if (const auto set_name = reinterpret_cast<SetDescription>(GetProcAddress(kernel, "SetThreadDescription")))
-        {
-            constexpr int capacity = 16;
-            wchar_t wide_name[capacity];
-            if (MultiByteToWideChar(CP_UTF8, 0, name, -1, wide_name, capacity))
-                set_name(thread, wide_name);
-        }
-    }
-#else
-    (void)name;
-#endif
-}
-
-} // namespace aereborn
-
-===== core/os.h =====
-#ifndef AEREBORN_CORE_OS_H
-#define AEREBORN_CORE_OS_H
-
-#if defined(_WIN32) || defined(_WIN64)
-#include <sdkddkver.h>
-#if _WIN32_WINNT >= 0x0600 // Windows Vista
-#define WINDOWS_OS_ENVIRONMENT 1
-#else
-#define WINDOWS_OS_ENVIRONMENT 0
-#endif
-#else
-#define WINDOWS_OS_ENVIRONMENT 0
-#endif
-
-#if defined(__linux__) || defined(__linux) || defined(linux)
-#define LINUX_OS_ENVIRONMENT 1
-#else
-#define LINUX_OS_ENVIRONMENT 0
-#endif
-
-namespace aereborn
-{
-
-/// @brief Set the calling thread's name and request the platform's audio scheduling priority.
-/// @param name Null-terminated UTF-8 thread name. Use at most 15 bytes for portability.
-/// @note The thread keeps its existing scheduling policy and priority if the OS rejects the request.
-void configure_audio_thread(const char *name) noexcept;
-
-} // namespace aereborn
-
-#endif
 
 ===== core/resampler.cpp =====
 #include "resampler.h"
@@ -2518,22 +2113,22 @@ bool valid_offset(double offset) noexcept
     return offset >= 0.0 && offset < 0.5;
 }
 
-bool needs_filter(SampleRate src_fs, SampleRate dst_fs, double offset) noexcept
+bool needs_filter(BandWidth src_fs, BandWidth dst_fs, double offset) noexcept
 {
     return src_fs != dst_fs || offset > 0;
 }
 
-double nominal_step(SampleRate src_fs, SampleRate dst_fs) noexcept
+double nominal_step(BandWidth src_fs, BandWidth dst_fs) noexcept
 {
     return static_cast<double>(static_cast<std::uint32_t>(src_fs)) / static_cast<std::uint32_t>(dst_fs);
 }
 
-std::size_t workspace_bound(SampleRate src_fs, SampleRate dst_fs, std::size_t frames, double offset, bool bound_input)
+std::size_t workspace_bound(BandWidth src_fs, BandWidth dst_fs, std::size_t frames, double offset, bool bound_input)
 {
-    if (!is_sample_rate(src_fs) || !is_sample_rate(dst_fs) || !valid_offset(offset))
-        throw Error(ErrorCode::InvalidArg);
+    if (!is_bandwidth(src_fs) || !is_bandwidth(dst_fs) || !valid_offset(offset))
+        throw Error(RetCode::EPARAM);
     if (frames > frame_limit)
-        throw Error(ErrorCode::TooLarge);
+        throw Error(RetCode::TOOLARGE);
     if (!frames || !needs_filter(src_fs, dst_fs, offset))
         return frames;
 
@@ -2556,7 +2151,7 @@ std::size_t workspace_bound(SampleRate src_fs, SampleRate dst_fs, std::size_t fr
     }
     const auto rounded = std::ceil(scaled);
     if (rounded >= static_cast<long double>(frame_limit))
-        throw Error(ErrorCode::TooLarge);
+        throw Error(RetCode::TOOLARGE);
     return static_cast<std::size_t>(rounded) + 1;
 }
 } // namespace
@@ -2582,10 +2177,10 @@ void SincResampler::Position::advance(std::uint64_t step, std::uint64_t unit) no
     fraction = next % unit;
 }
 
-void SincResampler::prepare(std::size_t channels, SampleRate src_fs, SampleRate dst_fs, double offset)
+void SincResampler::prepare(std::size_t channels, BandWidth src_fs, BandWidth dst_fs, double offset)
 {
-    if (!channels || !is_sample_rate(src_fs) || !is_sample_rate(dst_fs) || !valid_offset(offset))
-        throw Error(ErrorCode::InvalidArg);
+    if (!channels || !is_bandwidth(src_fs) || !is_bandwidth(dst_fs) || !valid_offset(offset))
+        throw Error(RetCode::EPARAM);
 
     Buffer history;
     std::vector<float> kernel;
@@ -2703,12 +2298,12 @@ SincResampler::Transfer SincResampler::run(IFBlock input, OFBlock output, Positi
     return result;
 }
 
-std::size_t SincResampler::max_output_frames(SampleRate src_fs, SampleRate dst_fs, std::size_t frames, double offset)
+std::size_t SincResampler::max_output_frames(BandWidth src_fs, BandWidth dst_fs, std::size_t frames, double offset)
 {
     return workspace_bound(src_fs, dst_fs, frames, offset, false);
 }
 
-std::size_t SincResampler::max_input_frames(SampleRate src_fs, SampleRate dst_fs, std::size_t frames, double offset)
+std::size_t SincResampler::max_input_frames(BandWidth src_fs, BandWidth dst_fs, std::size_t frames, double offset)
 {
     return workspace_bound(src_fs, dst_fs, frames, offset, true);
 }
@@ -2728,12 +2323,6 @@ namespace aereborn
 {
 
 constexpr std::uint64_t max_clock_drift_ppm = 2000;
-
-/// @brief Check whether format is a supported interleaved little-endian PCM format.
-constexpr bool is_interleaved_pcm(SampleFormat format) noexcept
-{
-    return format != SampleFormat::F32P && sample_bytes(format) != 0;
-}
 
 /// @brief Decode interleaved PCM frames into planar F32P samples.
 /// @pre is_interleaved_pcm(input.spec().format), matching channels and frames, non-overlapping buffers.
@@ -2755,7 +2344,7 @@ class SincResampler
 
     /// @brief Prepare filter kernel and history for channels, rates, and rate offset in [0, 0.5).
     /// @note Replaces filter storage and resets state on success; failure preserves previous state.
-    void prepare(std::size_t channels, SampleRate src_fs, SampleRate dst_fs, double max_rate_offset = 0.0);
+    void prepare(std::size_t channels, BandWidth src_fs, BandWidth dst_fs, double max_rate_offset = 0.0);
 
     /// @brief Zero input frames sufficient to flush the FIR history at end of stream.
     std::size_t tail_frames() const noexcept;
@@ -2782,12 +2371,12 @@ class SincResampler
     Transfer process(IFBlock input, OFBlock output, double rate_scale = 1.0) noexcept;
 
     /// @brief Bound streaming output for the given input batch and rate offset.
-    /// @throws Error InvalidArg for invalid rates or offset, or TooLarge for an unsupported frame count.
-    static std::size_t max_output_frames(SampleRate src_fs, SampleRate dst_fs, std::size_t input_frames,
+    /// @throws Error RetCode::EPARAM for invalid rates or offset, or RetCode::TOOLARGE for an unsupported frame count.
+    static std::size_t max_output_frames(BandWidth src_fs, BandWidth dst_fs, std::size_t input_frames,
                                          double max_rate_offset = 0.0);
     /// @brief Bound streaming input for the given output batch and rate offset.
-    /// @throws Error InvalidArg for invalid rates or offset, or TooLarge for an unsupported frame count.
-    static std::size_t max_input_frames(SampleRate src_fs, SampleRate dst_fs, std::size_t output_frames,
+    /// @throws Error RetCode::EPARAM for invalid rates or offset, or RetCode::TOOLARGE for an unsupported frame count.
+    static std::size_t max_input_frames(BandWidth src_fs, BandWidth dst_fs, std::size_t output_frames,
                                         double max_rate_offset = 0.0);
 
   private:
@@ -2803,8 +2392,8 @@ class SincResampler
 
     bool need_fir_ = false;
     std::size_t channels_ = 0;
-    SampleRate src_fs_{};
-    SampleRate dst_fs_{};
+    BandWidth src_fs_{};
+    BandWidth dst_fs_{};
     double nominal_ = 0.0;
     double max_rate_offset_ = 0.0;
     Position position_;
@@ -2820,6 +2409,7 @@ class SincResampler
 #ifndef AEREBORN_CORE_RETCODE_H
 #define AEREBORN_CORE_RETCODE_H
 
+#include "audio_types.h"
 #include <cassert>
 #include <stdexcept>
 #include <string>
@@ -2829,128 +2419,25 @@ class SincResampler
 namespace aereborn
 {
 
-enum class ErrorCode
-{
-    Ok = 0,
-
-    // Validation and capacity
-    InvalidArg,
-    InvalidPort,
-    InvalidType,
-    TooLarge,
-
-    // Lifecycle and concurrency
-    NotReady,
-    Busy,
-
-    // Graph topology and format
-    UnknownNode,
-    UnknownConn,
-    DuplicateConn,
-    InputBusy,
-    Cycle,
-    FormatMismatch,
-
-    // External I/O and device status
-    IoFailed,
-    DeviceLost,
-    EndOfStream,
-    Cancelled,
-    Timeout
-};
-
-/// @brief Non-throwing status used by backend operations.
-class RetCode
-{
-  public:
-    constexpr RetCode(ErrorCode code = ErrorCode::Ok) noexcept : code_(code)
-    {
-    }
-    constexpr explicit operator bool() const noexcept
-    {
-        return code_ == ErrorCode::Ok;
-    }
-    constexpr ErrorCode code() const noexcept
-    {
-        return code_;
-    }
-    friend constexpr bool operator==(RetCode lhs, RetCode rhs) noexcept
-    {
-        return lhs.code_ == rhs.code_;
-    }
-    friend constexpr bool operator!=(RetCode lhs, RetCode rhs) noexcept
-    {
-        return lhs.code_ != rhs.code_;
-    }
-    const char *message() const noexcept
-    {
-        switch (code_)
-        {
-        case ErrorCode::Ok:
-            return "Success";
-        case ErrorCode::InvalidArg:
-            return "Invalid argument";
-        case ErrorCode::InvalidPort:
-            return "Port index is out of range";
-        case ErrorCode::InvalidType:
-            return "Node has a different type";
-        case ErrorCode::TooLarge:
-            return "Requested capacity exceeds the supported size";
-        case ErrorCode::NotReady:
-            return "Object is not prepared, committed, or bound";
-        case ErrorCode::Busy:
-            return "The current execution context or state prevents this operation";
-        case ErrorCode::UnknownNode:
-            return "Node does not belong to this engine or was removed";
-        case ErrorCode::UnknownConn:
-            return "Connection does not exist";
-        case ErrorCode::DuplicateConn:
-            return "These ports are already connected";
-        case ErrorCode::InputBusy:
-            return "Input already has a source (use a mixer for multiple sources)";
-        case ErrorCode::Cycle:
-            return "Connection would create a feedback cycle";
-        case ErrorCode::FormatMismatch:
-            return "Formats or port layouts do not match";
-        case ErrorCode::IoFailed:
-            return "I/O operation failed";
-        case ErrorCode::DeviceLost:
-            return "Audio device is no longer available";
-        case ErrorCode::EndOfStream:
-            return "End of stream";
-        case ErrorCode::Cancelled:
-            return "I/O operation was cancelled";
-        case ErrorCode::Timeout:
-            return "I/O operation timed out";
-        }
-        return "Unknown error code";
-    }
-
-    /// @brief Throw Error if this code represents a failure.
-    void or_throw() const;
-
-  private:
-    ErrorCode code_;
-};
-
 /// @brief Exception for AEReborn control-side validation and operation failures.
 class Error : public std::runtime_error
 {
   public:
-    explicit Error(ErrorCode code) : std::runtime_error(RetCode(code).message()), code_(code) {}
-    Error(ErrorCode code, const char *detail) : std::runtime_error(detail), code_(code) {}
-    Error(ErrorCode code, const std::string &detail) : std::runtime_error(detail), code_(code) {}
+    explicit Error(RetCode code) : std::runtime_error(code.what()), code_(code) {}
+    Error(RetCode code, const char *detail) : std::runtime_error(detail), code_(code) {}
+    Error(RetCode code, const std::string &detail) : std::runtime_error(detail), code_(code) {}
 
-    ErrorCode code() const noexcept { return code_; }
+    RetCode::Code code() const noexcept { return code_.code(); }
 
   private:
-    ErrorCode code_;
+    RetCode code_;
 };
 
-inline void RetCode::or_throw() const
+/// @brief Throw Error if the operation did not return OK.
+inline void throw_if_error(RetCode code)
 {
-    if (!*this)
-        throw Error(code_);
+    if (!code)
+        throw Error(code);
 }
 
 /// @brief Status or value for backend operations. Check the status before reading the value.
@@ -2964,7 +2451,7 @@ template <class T> class Result
     {
         assert(!code);
     }
-    Result(ErrorCode code) noexcept(std::is_nothrow_default_constructible<T>::value) : Result(RetCode(code))
+    Result(RetCode::Code code) noexcept(std::is_nothrow_default_constructible<T>::value) : Result(RetCode(code))
     {
     }
     RetCode ret_code() const noexcept
@@ -2994,7 +2481,7 @@ template <class T> class Result
     /// @brief Move out the result or throw Error on failure.
     T value_or_throw() &&
     {
-        ret_code_.or_throw();
+        throw_if_error(ret_code_);
         return std::move(value_);
     }
 
@@ -3042,9 +2529,9 @@ namespace aereborn
 void Buffer::resize(std::size_t channels, std::size_t capacity_frames)
 {
     if (channels == 0 || capacity_frames == 0)
-        throw Error(ErrorCode::InvalidArg);
+        throw Error(RetCode::EPARAM);
     if (channels > samples_.max_size() / capacity_frames)
-        throw Error(ErrorCode::TooLarge);
+        throw Error(RetCode::TOOLARGE);
     const auto sample_count = channels * capacity_frames;
     const auto retained_samples = std::min(samples_.size(), sample_count);
     samples_.resize(sample_count);
@@ -3063,27 +2550,13 @@ void Buffer::clear() noexcept
     std::fill(samples_.begin(), samples_.end(), 0.0f);
 }
 
-std::size_t PortSpec::max_frames(BlockPeriod period) const noexcept
-{
-    const auto units = std::uint64_t{static_cast<std::uint32_t>(sample_rate)} * static_cast<std::uint32_t>(period);
-    return static_cast<std::size_t>((units + 999) / 1000);
-}
+constexpr std::uint64_t NodeId::port_mask;
+constexpr std::uint64_t NodeId::max_node;
+constexpr std::size_t NodeId::invalid_port;
 
-std::size_t PortSpec::frames(BlockPeriod period, std::uint64_t tick) const noexcept
+bool PortSpec::valid() const noexcept
 {
-    const auto units = std::uint64_t{static_cast<std::uint32_t>(sample_rate)} * static_cast<std::uint32_t>(period);
-    const auto fraction = units % 1000;
-    if (fraction == 0)
-        return static_cast<std::size_t>(units / 1000);
-    const auto start = (tick % 1000) * fraction;
-    return static_cast<std::size_t>(units / 1000 + (start + fraction + 999) / 1000 - (start + 999) / 1000);
-}
-
-std::uint64_t PortSpec::frame_position(BlockPeriod period, std::uint64_t tick) const noexcept
-{
-    const auto units = std::uint64_t{static_cast<std::uint32_t>(sample_rate)} * static_cast<std::uint32_t>(period);
-    // Split whole seconds from the remainder to avoid multiplying tick by the sample rate.
-    return (tick / 1000) * units + ((tick % 1000) * units + 999) / 1000;
+    return is_bandwidth(bandwidth) && channels > 0 && sample_bytes(format) != 0;
 }
 
 } // namespace aereborn
@@ -3092,73 +2565,37 @@ std::uint64_t PortSpec::frame_position(BlockPeriod period, std::uint64_t tick) c
 #ifndef AEREBORN_CORE_TYPES_H
 #define AEREBORN_CORE_TYPES_H
 
+#include "audio_types.h"
 #include "block.h"
 #include <cstdint>
 
 namespace aereborn
 {
 
-/// @brief Supported sample rates, in hertz.
-enum class SampleRate : std::uint32_t
+constexpr bool is_bandwidth(BandWidth bandwidth) noexcept
 {
-    Hz8000 = 8000,
-    Hz11025 = 11025,
-    Hz16000 = 16000,
-    Hz22050 = 22050,
-    Hz24000 = 24000,
-    Hz32000 = 32000,
-    Hz44100 = 44100,
-    Hz48000 = 48000,
-    Hz88200 = 88200,
-    Hz96000 = 96000
-};
-
-/// @brief Supported durations of one engine tick, in milliseconds.
-enum class BlockPeriod : std::uint32_t
-{
-    Ms02 = 2,
-    Ms05 = 5,
-    Ms10 = 10,
-    Ms20 = 20,
-    Ms40 = 40
-};
-
-/// @brief Sample storage format, including channel layout and byte order.
-///
-/// F32P stores native planar float32. All other formats store interleaved
-/// little-endian PCM.
-enum class SampleFormat
-{
-    F32P,
-    S16LE,
-    S24_3LE, ///< Signed 24-bit PCM packed into three bytes per sample.
-    S24LE,   ///< Signed 24-bit PCM stored in a four-byte slot per sample.
-    S32LE,
-    F32LE
-};
-
-constexpr bool is_sample_rate(SampleRate sample_rate) noexcept
-{
-    switch (sample_rate)
+    switch (bandwidth)
     {
-    case SampleRate::Hz8000:
-    case SampleRate::Hz11025:
-    case SampleRate::Hz16000:
-    case SampleRate::Hz22050:
-    case SampleRate::Hz24000:
-    case SampleRate::Hz32000:
-    case SampleRate::Hz44100:
-    case SampleRate::Hz48000:
-    case SampleRate::Hz88200:
-    case SampleRate::Hz96000:
+    case BandWidth::Narrow:
+    case BandWidth::QuarterCD:
+    case BandWidth::Wide:
+    case BandWidth::HalfCD:
+    case BandWidth::SemiSuperWide:
+    case BandWidth::SuperWideband:
+    case BandWidth::CDQuality:
+    case BandWidth::Full:
+    case BandWidth::DoubleCD:
+    case BandWidth::UltraFull:
         return true;
+    case BandWidth::Unknown:
+        break;
     }
     return false;
 }
 constexpr bool is_block_period(BlockPeriod period) noexcept
 {
-    return period == BlockPeriod::Ms02 || period == BlockPeriod::Ms05 || period == BlockPeriod::Ms10 ||
-           period == BlockPeriod::Ms20 || period == BlockPeriod::Ms40;
+    return period == BlockPeriod::INR_02MS || period == BlockPeriod::INR_05MS || period == BlockPeriod::INR_10MS ||
+           period == BlockPeriod::INR_20MS || period == BlockPeriod::INR_40MS;
 }
 constexpr unsigned int sample_bits(SampleFormat format) noexcept
 {
@@ -3181,56 +2618,16 @@ constexpr std::size_t sample_bytes(SampleFormat format) noexcept
     return format == SampleFormat::S24LE ? 4 : sample_bits(format) / 8;
 }
 
-/// @brief Fixed sample rate, channel count, and format declared by a port.
-///
-/// Connections require all three fields to match. Each frame contains one sample
-/// per channel.
-struct PortSpec
+/// @brief Check whether format is a supported interleaved little-endian PCM format.
+constexpr bool is_interleaved_pcm(SampleFormat format) noexcept
 {
-    /// @brief Construct an empty placeholder with no valid rate or channel count.
-    constexpr PortSpec() noexcept = default;
+    return format != SampleFormat::F32P && sample_bytes(format) != 0;
+}
 
-    /// @brief Specify the sample layout of one port.
-    /// @param sample_rate Port sample rate in hertz.
-    /// @param channels Number of channels per frame.
-    /// @param format Sample representation and layout.
-    constexpr PortSpec(SampleRate sample_rate, std::size_t channels, SampleFormat format) noexcept
-        : channels(channels), sample_rate(sample_rate), format(format)
-    {
-    }
-    constexpr bool valid() const noexcept
-    {
-        return is_sample_rate(sample_rate) && channels > 0 && sample_bytes(format) != 0;
-    }
-    constexpr bool operator==(const PortSpec &other) const noexcept
-    {
-        return sample_rate == other.sample_rate && channels == other.channels && format == other.format;
-    }
-    constexpr bool operator!=(const PortSpec &other) const noexcept
-    {
-        return !(*this == other);
-    }
-
-    /// @brief Return the maximum frame count in one block for buffer sizing.
-    /// @param period Duration of the engine tick.
-    std::size_t max_frames(BlockPeriod period) const noexcept;
-
-    /// @brief Return the actual frame count for a tick.
-    /// @param period Duration of the engine tick.
-    /// @param tick Zero-based tick position.
-    /// @note The count is the difference between two consecutive frame positions.
-    std::size_t frames(BlockPeriod period, std::uint64_t tick) const noexcept;
-
-    /// @brief Return the zero-based frame position at the start of a tick.
-    /// @param period Duration of the engine tick.
-    /// @param tick Zero-based tick position.
-    /// @note Fractional frame positions round up.
-    std::uint64_t frame_position(BlockPeriod period, std::uint64_t tick) const noexcept;
-
-    std::size_t channels = 0;
-    SampleRate sample_rate{};
-    SampleFormat format{};
-};
+inline bool valid_pcm_spec(PortSpec spec) noexcept
+{
+    return spec.format != SampleFormat::F32P && spec.valid();
+}
 
 /// @brief Borrow audio through a byte view carrying the port specification and frame count.
 /// @tparam Byte Use std::uint8_t for writable bytes or const std::uint8_t for read-only bytes.
@@ -3284,29 +2681,6 @@ template <class Byte> class ByteBlock
 using IBBlock = ByteBlock<const std::uint8_t>;
 using OBBlock = ByteBlock<std::uint8_t>;
 
-/// @brief Stable identity of a node in the graph, including across instance replacement.
-/// @note Zero is the empty ID. The engine resolves nonzero IDs against the graph.
-struct NodeId
-{
-    std::uint64_t value = 0;
-    constexpr explicit operator bool() const noexcept
-    {
-        return value != 0;
-    }
-    constexpr bool operator==(NodeId other) const noexcept
-    {
-        return value == other.value;
-    }
-    constexpr bool operator!=(NodeId other) const noexcept
-    {
-        return !(*this == other);
-    }
-    constexpr bool operator<(NodeId other) const noexcept
-    {
-        return value < other.value;
-    }
-};
-
 /// @brief Identity assigned to one connection when it is created.
 /// @note Zero is the empty ID. Reconnecting the same ports creates a new ID.
 struct ConnId
@@ -3330,42 +2704,12 @@ struct ConnId
     }
 };
 
-/// @brief Address of an input port in the graph.
-struct IPort
-{
-    NodeId node;           ///< Node that declares the port.
-    std::size_t index = 0; ///< Zero-based input port index.
-    constexpr bool operator==(IPort other) const noexcept
-    {
-        return node == other.node && index == other.index;
-    }
-    constexpr bool operator!=(IPort other) const noexcept
-    {
-        return !(*this == other);
-    }
-};
-
-/// @brief Address of an output port in the graph.
-struct OPort
-{
-    NodeId node;           ///< Node that declares the port.
-    std::size_t index = 0; ///< Zero-based output port index.
-    constexpr bool operator==(OPort other) const noexcept
-    {
-        return node == other.node && index == other.index;
-    }
-    constexpr bool operator!=(OPort other) const noexcept
-    {
-        return !(*this == other);
-    }
-};
-
 /// @brief Directed connection in a committed render plan.
 struct Connection
 {
     ConnId id;
-    OPort from;
-    IPort to;
+    NodeId from;
+    NodeId to;
 };
 
 /// @brief Timing, port blocks, and activity flags passed to a node for one process call.
@@ -3378,7 +2722,7 @@ struct ProcessContext
     View<const IBBlock> inputs;              ///< Read-only input blocks in port index order.
     View<const OBBlock> outputs;             ///< Output blocks with writable samples in port index order.
     View<const std::uint8_t> input_active{}; ///< Per-input flags. Zero guarantees a zero-filled block.
-    View<std::uint8_t> output_active{};      ///< Per-output flags, initially active in the graph.
+    View<std::uint8_t> output_active{};      ///< Per-output flags initialized by the engine.
 
     /// @brief Check whether the input block should be processed as active.
     /// @pre index is a valid input port index.
@@ -3400,11 +2744,6 @@ struct ProcessContext
 
 } // namespace aereborn
 
-/// @brief Address an input port by node ID and zero-based index.
-#define IPORT(node_id, port_index) ::aereborn::IPort{(node_id), (port_index)}
-/// @brief Address an output port by node ID and zero-based index.
-#define OPORT(node_id, port_index) ::aereborn::OPort{(node_id), (port_index)}
-
 #endif
 
 ===== plugins/convert.cpp =====
@@ -3420,18 +2759,19 @@ Convert::Convert(PortSpec input, PortSpec output)
     : NodeT({input}, {output}), same_spec_(input == output)
 {
     if (!input.valid() || !output.valid() || input.channels != output.channels)
-        throw Error(ErrorCode::InvalidArg, "Invalid converter port specifications");
+        throw Error(RetCode::EPARAM, "Invalid converter port specifications");
 }
 
 void Convert::prepare(BlockPeriod period)
 {
     if (!is_block_period(period))
-        throw Error(ErrorCode::InvalidArg);
+        throw Error(RetCode::EPARAM);
     if (same_spec_)
         return;
     const auto input = inputs()[0], output = outputs()[0];
-    const auto in_pcm = is_interleaved_pcm(input.format), out_pcm = is_interleaved_pcm(output.format);
-    const auto fir = input.sample_rate != output.sample_rate;
+    const auto in_pcm = input.format != SampleFormat::F32P;
+    const auto out_pcm = output.format != SampleFormat::F32P;
+    const auto fir = input.bandwidth != output.bandwidth;
     Buffer decoded, resampled;
     if (in_pcm && (fir || out_pcm))
         decoded.resize(input.channels, input.max_frames(period));
@@ -3439,7 +2779,7 @@ void Convert::prepare(BlockPeriod period)
     {
         if (out_pcm)
             resampled.resize(output.channels, output.max_frames(period));
-        resampler_.prepare(input.channels, input.sample_rate, output.sample_rate);
+        resampler_.prepare(input.channels, input.bandwidth, output.bandwidth);
     }
     decoded_ = std::move(decoded);
     resampled_ = std::move(resampled);
@@ -3470,8 +2810,8 @@ void Convert::process(const ProcessContext &context) noexcept
         return;
     }
 
-    const auto in_pcm = is_interleaved_pcm(input.spec().format);
-    const auto out_pcm = is_interleaved_pcm(output.spec().format);
+    const auto in_pcm = input.spec().format != SampleFormat::F32P;
+    const auto out_pcm = output.spec().format != SampleFormat::F32P;
     const auto fir = resampler_.needs_fir();
     IFBlock source;
     if (in_pcm)
@@ -3525,16 +2865,17 @@ class Convert final : public NodeT<1, 1>
     /// @brief Construct a converter with fixed input and output specifications.
     /// @param input Source sample format, sample rate, and channel count.
     /// @param output Destination specification with the same channel count.
-    /// @throws Error InvalidArg If either spec is invalid or the channel counts differ.
+    /// @throws Error RetCode::EPARAM If either spec is invalid or the channel counts differ.
     Convert(PortSpec input, PortSpec output);
 
     /// @brief Prepare conversion buffers and reset the resampler for the graph period.
     /// @param period Graph block period used to size the buffers.
-    /// @throws Error InvalidArg for an unsupported period, or TooLarge if a buffer exceeds its limit.
+    /// @throws Error RetCode::EPARAM for an unsupported period, or RetCode::TOOLARGE if a buffer exceeds its limit.
     /// @note A failed preparation preserves the existing buffers and resampler state.
     void prepare(BlockPeriod period) override;
 
     /// @copydoc Node::process
+    /// @pre The blocks match the declared port specifications.
     /// @note Resampling aligns its fractional phase to the graph tick.
     void process(const ProcessContext &context) noexcept override;
 
@@ -3568,11 +2909,11 @@ namespace
 constexpr unsigned graph_open = 1u;
 constexpr unsigned graph_active = 2u;
 
-PortSpec endpoint_spec(SampleRate rate, std::size_t channels, std::chrono::microseconds io_period)
+PortSpec endpoint_spec(BandWidth rate, std::size_t channels, std::chrono::microseconds io_period)
 {
     const PortSpec spec(rate, channels, SampleFormat::F32P);
     if (!spec.valid() || io_period.count() <= 0)
-        throw Error(ErrorCode::InvalidArg, "Invalid endpoint port or I/O period");
+        throw Error(RetCode::EPARAM, "Invalid endpoint port or I/O period");
     return spec;
 }
 
@@ -3580,23 +2921,23 @@ void prepare_ring(FrameRing &ring, PortSpec spec, BlockPeriod period, std::chron
                   BlockPeriod &prepared_period, bool in_use)
 {
     if (!is_block_period(period))
-        throw Error(ErrorCode::InvalidArg);
+        throw Error(RetCode::EPARAM);
     if (period == prepared_period)
         return;
     if (in_use)
-        throw Error(ErrorCode::Busy);
+        throw Error(RetCode::BUSY);
     const auto graph_frames = spec.max_frames(period);
-    const auto rate = static_cast<std::uint32_t>(spec.sample_rate);
+    const auto rate = static_cast<std::uint32_t>(spec.bandwidth);
     const auto us = static_cast<std::uint64_t>(io_period.count());
     if (us > std::numeric_limits<std::uint64_t>::max() / rate)
-        throw Error(ErrorCode::TooLarge);
+        throw Error(RetCode::TOOLARGE);
     // Round up at the slowest allowed device clock to cover the largest logical batch.
     constexpr auto effective_second = 1000000 - max_clock_drift_ppm;
     const auto units = us * rate;
     const auto device_frames = units / effective_second + (units % effective_second != 0);
     const auto capacity = std::max<std::uint64_t>(8 * graph_frames, 2 * device_frames + 4 * graph_frames);
     if (capacity > std::numeric_limits<std::size_t>::max())
-        throw Error(ErrorCode::TooLarge);
+        throw Error(RetCode::TOOLARGE);
     ring.prepare(spec.channels, static_cast<std::size_t>(capacity));
     prepared_period = period;
 }
@@ -3634,7 +2975,7 @@ bool prefill_ready(const FrameRing &ring, std::atomic<bool> &primed, std::size_t
 }
 } // namespace
 
-Capture::Capture(SampleRate rate, std::size_t channels, std::chrono::microseconds io_period)
+Capture::Capture(BandWidth rate, std::size_t channels, std::chrono::microseconds io_period)
     : NodeT({}, {endpoint_spec(rate, channels, io_period)}), io_period_(io_period)
 {
 }
@@ -3680,7 +3021,7 @@ void Capture::close() noexcept
     primed_.store(false, std::memory_order_release);
 }
 
-Playback::Playback(SampleRate rate, std::size_t channels, std::chrono::microseconds io_period)
+Playback::Playback(BandWidth rate, std::size_t channels, std::chrono::microseconds io_period)
     : NodeT({endpoint_spec(rate, channels, io_period)}, {}), io_period_(io_period)
 {
 }
@@ -3756,12 +3097,12 @@ class Capture final : public NodeT<0, 1>
     /// @param rate Graph-side sample rate.
     /// @param channels Number of output channels.
     /// @param io_period Maximum duration of one external batch, used to size the queue.
-    /// @throws Error InvalidArg If the port specification is invalid or the I/O period is nonpositive.
-    Capture(SampleRate rate, std::size_t channels, std::chrono::microseconds io_period);
+    /// @throws Error RetCode::EPARAM If the port specification is invalid or the I/O period is nonpositive.
+    Capture(BandWidth rate, std::size_t channels, std::chrono::microseconds io_period);
 
     /// @brief Prepare the queue for the graph period on the control side.
     /// @param period Graph block period.
-    /// @throws Error InvalidArg for an unsupported period, Busy if changing it while bound, or TooLarge if the
+    /// @throws Error RetCode::EPARAM for an unsupported period, RetCode::BUSY if changing it while bound, or RetCode::TOOLARGE if the
     /// queue exceeds its capacity limit.
     void prepare(BlockPeriod period) override;
 
@@ -3843,12 +3184,12 @@ class Playback final : public NodeT<1, 0>
     /// @param rate Graph-side sample rate.
     /// @param channels Number of input channels.
     /// @param io_period Maximum duration of one external batch, used to size the queue.
-    /// @throws Error InvalidArg If the port specification is invalid or the I/O period is nonpositive.
-    Playback(SampleRate rate, std::size_t channels, std::chrono::microseconds io_period);
+    /// @throws Error RetCode::EPARAM If the port specification is invalid or the I/O period is nonpositive.
+    Playback(BandWidth rate, std::size_t channels, std::chrono::microseconds io_period);
 
     /// @brief Prepare the queue for the graph period on the control side.
     /// @param period Graph block period.
-    /// @throws Error InvalidArg for an unsupported period, Busy if changing it while bound, or TooLarge if the
+    /// @throws Error RetCode::EPARAM for an unsupported period, RetCode::BUSY if changing it while bound, or RetCode::TOOLARGE if the
     /// queue exceeds its capacity limit.
     void prepare(BlockPeriod period) override;
 
@@ -3980,31 +3321,31 @@ void apply_ramping_gain(float *dst, const float *src, std::size_t frames, float 
 }
 } // namespace
 
-Matrix::Matrix(SampleRate rate, std::size_t channels, float gain)
+Matrix::Matrix(BandWidth rate, std::size_t channels, float gain)
     : NodeT({PortSpec(rate, channels, SampleFormat::F32P)}, {PortSpec(rate, channels, SampleFormat::F32P)}),
       target_(gain), gain_(gain)
 {
     if (!inputs()[0].valid() || !std::isfinite(gain))
-        throw Error(ErrorCode::InvalidArg, "Invalid matrix specification");
+        throw Error(RetCode::EPARAM, "Invalid matrix specification");
 }
-Matrix::Matrix(SampleRate rate, std::size_t input_channels, std::size_t output_channels, View<const float> coefficients,
+Matrix::Matrix(BandWidth rate, std::size_t input_channels, std::size_t output_channels, View<const float> coefficients,
                float gain)
     : NodeT({PortSpec(rate, input_channels, SampleFormat::F32P)},
             {PortSpec(rate, output_channels, SampleFormat::F32P)}),
       target_(gain), gain_(gain)
 {
     if (!inputs()[0].valid() || !outputs()[0].valid() || !std::isfinite(gain))
-        throw Error(ErrorCode::InvalidArg, "Invalid matrix specification");
+        throw Error(RetCode::EPARAM, "Invalid matrix specification");
     if (output_channels > coefficients_.max_size() / input_channels)
-        throw Error(ErrorCode::TooLarge, "Channel matrix exceeds supported size");
+        throw Error(RetCode::TOOLARGE, "Channel matrix exceeds supported size");
     if (coefficients.size() != input_channels * output_channels)
-        throw Error(ErrorCode::InvalidArg, "Channel matrix dimensions do not match coefficients");
+        throw Error(RetCode::EPARAM, "Channel matrix dimensions do not match coefficients");
     for (const auto value : coefficients)
         if (!std::isfinite(value))
-            throw Error(ErrorCode::InvalidArg, "Matrix coefficients must be finite");
+            throw Error(RetCode::EPARAM, "Matrix coefficients must be finite");
     coefficients_.assign(coefficients.begin(), coefficients.end());
 }
-Matrix::Matrix(SampleRate rate, std::size_t input_channels, std::size_t output_channels,
+Matrix::Matrix(BandWidth rate, std::size_t input_channels, std::size_t output_channels,
                std::initializer_list<float> coefficients, float gain)
     : Matrix(rate, input_channels, output_channels, {coefficients.begin(), coefficients.size()}, gain)
 {
@@ -4012,7 +3353,7 @@ Matrix::Matrix(SampleRate rate, std::size_t input_channels, std::size_t output_c
 void Matrix::set_gain(float gain)
 {
     if (!std::isfinite(gain))
-        throw Error(ErrorCode::InvalidArg);
+        throw Error(RetCode::EPARAM);
     target_.store(gain, std::memory_order_release);
 }
 float Matrix::gain() const noexcept
@@ -4112,8 +3453,8 @@ class Matrix final : public NodeT<1, 1>
     /// @param rate Sample rate of both ports.
     /// @param channels Channel count of both ports.
     /// @param gain Initial finite linear gain.
-    /// @throws Error InvalidArg If the port specification is invalid or gain is not finite.
-    Matrix(SampleRate rate, std::size_t channels, float gain = 1.0f);
+    /// @throws Error RetCode::EPARAM If the port specification is invalid or gain is not finite.
+    Matrix(BandWidth rate, std::size_t channels, float gain = 1.0f);
 
     /// @brief Construct a channel map from a row-major matrix.
     /// @param rate Sample rate of both ports.
@@ -4122,19 +3463,19 @@ class Matrix final : public NodeT<1, 1>
     /// @param coefficients Finite coefficients in output-channel order, one row per output.
     /// @param gain Initial finite linear gain.
     /// @note The constructor copies the coefficients. Keep the view valid until it returns.
-    /// @throws Error InvalidArg For invalid port specs, mismatched dimensions, or nonfinite coefficients or gain.
-    /// @throws Error TooLarge If the matrix exceeds the supported storage size.
-    Matrix(SampleRate rate, std::size_t input_channels, std::size_t output_channels, View<const float> coefficients,
+    /// @throws Error RetCode::EPARAM For invalid port specs, mismatched dimensions, or nonfinite coefficients or gain.
+    /// @throws Error RetCode::TOOLARGE If the matrix exceeds the supported storage size.
+    Matrix(BandWidth rate, std::size_t input_channels, std::size_t output_channels, View<const float> coefficients,
            float gain = 1.0f);
 
     /// @brief Construct a row-major channel map from an initializer list.
     /// @note Uses the same dimensions, validation, and copying rules as the view overload.
-    Matrix(SampleRate rate, std::size_t input_channels, std::size_t output_channels,
+    Matrix(BandWidth rate, std::size_t input_channels, std::size_t output_channels,
            std::initializer_list<float> coefficients, float gain = 1.0f);
 
     /// @brief Set the requested linear gain.
     /// @param gain New finite gain target.
-    /// @throws Error InvalidArg if the gain is not finite.
+    /// @throws Error RetCode::EPARAM if the gain is not finite.
     /// @note Safe to call concurrently with process(). A nonempty block reaches its sampled target on its final frame.
     void set_gain(float gain);
 
@@ -4169,21 +3510,73 @@ namespace aereborn
 {
 namespace
 {
-PortSpec mixer_output(SampleRate rate, std::size_t channels, std::size_t inputs)
+PortSpec mixer_output(BandWidth rate, std::size_t channels, std::size_t inputs)
 {
     const PortSpec spec(rate, channels, SampleFormat::F32P);
     if (!spec.valid() || inputs == 0)
-        throw Error(ErrorCode::InvalidArg, "Mixer needs valid ports and at least one input");
-    if (inputs > std::vector<PortSpec>{}.max_size())
-        throw Error(ErrorCode::TooLarge);
+        throw Error(RetCode::EPARAM, "Mixer needs valid ports and at least one input");
+    if (inputs > Mixer::max_inputs)
+        throw Error(RetCode::TOOLARGE);
     return spec;
 }
+
+constexpr std::uint64_t input_bit(std::size_t input) noexcept
+{
+    return std::uint64_t{1} << input;
+}
+
+std::uint64_t checked_bit(std::size_t input, std::size_t count)
+{
+    if (input >= count)
+        throw Error(RetCode::EPORT);
+    return input_bit(input);
+}
+
+void set_bit(std::atomic<std::uint64_t> &mask, std::uint64_t bit, bool enabled) noexcept
+{
+    if (enabled)
+        mask.fetch_or(bit, std::memory_order_release);
+    else
+        mask.fetch_and(~bit, std::memory_order_release);
+}
+
+void accumulate_unity(OFBlock output, IFBlock input) noexcept
+{
+    const auto frames = output.frames();
+    for (std::size_t ch = 0; ch < output.channels(); ++ch)
+    {
+        auto *dst = output.channel(ch);
+        const auto *src = input.channel(ch);
+        for (std::size_t frame = 0; frame < frames; ++frame)
+            dst[frame] += src[frame];
+    }
+}
+
+template <bool FadeOut>
+void accumulate_ramp(OFBlock output, IFBlock input, double scale) noexcept
+{
+    const auto last = output.frames() - 1;
+    for (std::size_t ch = 0; ch < output.channels(); ++ch)
+    {
+        auto *dst = output.channel(ch);
+        const auto *src = input.channel(ch);
+        for (std::size_t frame = 0; frame < last; ++frame)
+        {
+            const auto step = FadeOut ? last - frame : frame + 1;
+            dst[frame] += src[frame] * static_cast<float>(step * scale);
+        }
+        // The final frame reaches unity on fade-in. At zero gain no source read is needed.
+        if (!FadeOut)
+            dst[last] += src[last];
+    }
+}
 } // namespace
-Mixer::Mixer(SampleRate rate, std::size_t channels, std::size_t inputs)
+
+constexpr std::size_t Mixer::max_inputs;
+
+Mixer::Mixer(BandWidth rate, std::size_t channels, std::size_t inputs)
     : output_(mixer_output(rate, channels, inputs)), inputs_(inputs, output_)
 {
-    for (std::size_t i = 0; i < inputs; ++i)
-        muted_.emplace_back(false);
 }
 View<const PortSpec> Mixer::inputs() const noexcept
 {
@@ -4195,39 +3588,105 @@ View<const PortSpec> Mixer::outputs() const noexcept
 }
 void Mixer::set_muted(std::size_t input, bool muted)
 {
-    if (input >= inputs_.size())
-        throw Error(ErrorCode::InvalidPort);
-    muted_[input].store(muted, std::memory_order_release);
+    set_bit(muted_, checked_bit(input, inputs_.size()), muted);
 }
+
 bool Mixer::muted(std::size_t input) const
 {
-    if (input >= inputs_.size())
-        throw Error(ErrorCode::InvalidPort);
-    return muted_[input].load(std::memory_order_acquire);
+    const auto bit = checked_bit(input, inputs_.size());
+    return (muted_.load(std::memory_order_acquire) & bit) != 0;
 }
+
+void Mixer::set_high_priority(std::size_t input, bool high)
+{
+    set_bit(high_, checked_bit(input, inputs_.size()), high);
+}
+
+bool Mixer::high_priority(std::size_t input) const
+{
+    const auto bit = checked_bit(input, inputs_.size());
+    return (high_.load(std::memory_order_acquire) & bit) != 0;
+}
+
+bool Mixer::suppressed(std::size_t input) const
+{
+    const auto bit = checked_bit(input, inputs_.size());
+    return (suppressed_.load(std::memory_order_relaxed) & bit) != 0;
+}
+
+void Mixer::prepare(BlockPeriod)
+{
+    reset();
+}
+
+void Mixer::reset() noexcept
+{
+    was_suppressed_ = 0;
+    suppressed_.store(0, std::memory_order_relaxed);
+}
+
 void Mixer::process(const ProcessContext &context) noexcept
 {
     const auto output = context.outputs[0].f32p_view();
     const auto frames = output.frames();
     if (frames == 0)
         return;
-    output.clear();
-    bool active = false;
-    for (std::size_t i = 0; i < inputs_.size(); ++i)
+
+    const auto muted = muted_.load(std::memory_order_acquire);
+    const auto high = high_.load(std::memory_order_acquire);
+    const auto candidates = high & ~muted;
+    const auto count = inputs_.size();
+    std::uint64_t suppress = 0;
+    if (candidates)
     {
-        if (muted_[i].load(std::memory_order_acquire) || !context.has_input(i))
-            continue;
-        active = true;
-        const auto input = context.inputs[i].f32p_view();
-        for (std::size_t ch = 0; ch < output.channels(); ++ch)
+        const auto normal = (~std::uint64_t{0} >> (max_inputs - count)) & ~high;
+        if (normal)
         {
-            auto *dst = output.channel(ch);
-            const auto *src = input.channel(ch);
-            for (std::size_t frame = 0; frame < frames; ++frame)
-                dst[frame] += src[frame];
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                if ((candidates & input_bit(i)) && context.has_input(i))
+                {
+                    suppress = normal;
+                    break;
+                }
+            }
         }
     }
-    context.set_output_active(0, active);
+
+    const auto steady_suppressed = was_suppressed_ & suppress;
+    const auto fading = was_suppressed_ ^ suppress;
+    double scale = 0.0;
+    output.clear();
+    bool emitted = false;
+    std::uint64_t suppressed = 0;
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        const auto bit = input_bit(i);
+        if (!context.has_input(i) || (muted & bit))
+            continue;
+        suppressed |= suppress & bit;
+        if (steady_suppressed & bit)
+            continue;
+
+        emitted = true;
+        const auto input = context.inputs[i].f32p_view();
+        if (!(fading & bit))
+        {
+            accumulate_unity(output, input);
+            continue;
+        }
+        if (scale == 0.0)
+            scale = 1.0 / frames;
+        if (suppress & bit)
+            accumulate_ramp<true>(output, input, scale);
+        else
+            accumulate_ramp<false>(output, input, scale);
+    }
+    if (was_suppressed_ | suppress)
+        suppressed_.store(suppressed, std::memory_order_relaxed);
+    // Align offline normal inputs with the current suppression before they return.
+    was_suppressed_ = suppress;
+    context.set_output_active(0, emitted);
 }
 } // namespace aereborn
 
@@ -4236,25 +3695,28 @@ void Mixer::process(const ProcessContext &context) noexcept
 #define AEREBORN_PLUGINS_MIXER_H
 #include "core/graph.h"
 #include <atomic>
-#include <deque>
+#include <cstdint>
 #include <vector>
 namespace aereborn
 {
-/// @brief Mix a fixed number of inputs into one F32P output.
+/// @brief Mix F32P inputs with optional high-priority suppression.
 /// @note All ports have the same sample rate, channel count, and format.
+/// @note Any active, unmuted high-priority input suppresses normal inputs over one block.
 class Mixer final : public Node
 {
   public:
+    static constexpr std::size_t max_inputs = 64;
+
     /// @copydoc Node::type_name
     const char *type_name() const noexcept override { return "Mixer"; }
 
-    /// @brief Construct a mixer with all inputs unmuted.
+    /// @brief Construct a mixer with all inputs unmuted at normal priority.
     /// @param rate Sample rate of every port.
     /// @param channels Channel count of every port.
-    /// @param inputs Number of input ports.
-    /// @throws Error InvalidArg If the port specification is invalid or inputs is zero.
-    /// @throws Error TooLarge if the input count exceeds storage limits.
-    Mixer(SampleRate rate, std::size_t channels, std::size_t inputs);
+    /// @param inputs Number of input ports in [1, max_inputs].
+    /// @throws Error RetCode::EPARAM If the port specification is invalid or inputs is zero.
+    /// @throws Error RetCode::TOOLARGE if inputs exceeds max_inputs.
+    Mixer(BandWidth rate, std::size_t channels, std::size_t inputs);
 
     /// @copydoc Node::inputs
     /// @note The view borrows port specifications from this mixer and remains valid until destruction.
@@ -4266,25 +3728,56 @@ class Mixer final : public Node
     /// @brief Set whether one input is muted.
     /// @param input Zero-based input port index.
     /// @param muted True to mute the input, false to unmute it.
-    /// @throws Error InvalidPort if the index is out of range.
-    /// @note Safe to call concurrently with process(). Each non-empty input block uses one mute value.
+    /// @throws Error RetCode::EPORT if the index is out of range.
+    /// @note Safe to call concurrently with process(). Each nonempty block reads one mute mask.
     void set_muted(std::size_t input, bool muted);
 
     /// @brief Read the requested mute state of one input.
     /// @param input Zero-based input port index.
     /// @return The mute value.
-    /// @throws Error InvalidPort if the index is out of range.
+    /// @throws Error RetCode::EPORT if the index is out of range.
     /// @note Safe to call concurrently with set_muted() and process().
     bool muted(std::size_t input) const;
 
+    /// @brief Set whether an input has high priority.
+    /// @param input Zero-based input port index.
+    /// @param high True for high priority, false for normal priority.
+    /// @throws Error RetCode::EPORT if the index is out of range.
+    /// @note Safe to call concurrently with process(). High-priority inputs mix together.
+    void set_high_priority(std::size_t input, bool high);
+
+    /// @brief Read the requested priority of an input.
+    /// @param input Zero-based input port index.
+    /// @return True if the input has high priority.
+    /// @throws Error RetCode::EPORT if the index is out of range.
+    /// @note Safe to call concurrently with set_high_priority() and process().
+    bool high_priority(std::size_t input) const;
+
+    /// @brief Report whether an active, unmuted input was suppressed in the latest nonempty block.
+    /// @param input Zero-based input port index.
+    /// @return True during the fade-out and steady suppression blocks.
+    /// @throws Error RetCode::EPORT if the index is out of range.
+    /// @note Safe to call concurrently with process().
+    bool suppressed(std::size_t input) const;
+
+    /// @brief Initialize runtime suppression state on the control thread.
+    void prepare(BlockPeriod period) override;
+
     /// @copydoc Node::process
-    /// @note Sums unmuted inputs, leaving silence when every input is muted.
+    /// @note Each nonempty block reads the mute and priority masks once.
     void process(const ProcessContext &context) noexcept override;
+
+    /// @brief Clear runtime suppression while keeping the requested mute and priority settings.
+    /// @pre Serialize with process().
+    void reset() noexcept override;
 
   private:
     const PortSpec output_;
     const std::vector<PortSpec> inputs_;
-    std::deque<std::atomic<bool>> muted_;
+    std::atomic<std::uint64_t> muted_{0};
+    std::atomic<std::uint64_t> high_{0};
+    std::atomic<std::uint64_t> suppressed_{0};
+    std::uint64_t was_suppressed_ = 0;
 };
 } // namespace aereborn
 #endif
@@ -4307,7 +3800,7 @@ class Meter final : public NodeT<1, 0>
 {
   public:
     explicit Meter(std::atomic<float> &level)
-        : NodeT({PortSpec(SampleRate::Hz48000, 1, SampleFormat::F32P)}, {}), level_(level)
+        : NodeT({PortSpec(BandWidth::Full, 1, SampleFormat::F32P)}, {}), level_(level)
     {
     }
     void process(const ProcessContext &context) noexcept override
@@ -4328,14 +3821,14 @@ int main()
     try
     {
         std::atomic<float> level{0};
-        Engine engine(BlockPeriod::Ms05);
-        const auto tone = engine.emplace_node<Tone>(SampleRate::Hz48000, 1);
-        const auto mix = engine.emplace_node<Mixer>(SampleRate::Hz48000, 1, 1);
-        const auto matrix = engine.emplace_node<Matrix>(SampleRate::Hz48000, 1);
+        Engine engine(BlockPeriod::INR_05MS);
+        const auto tone = engine.emplace_node<Tone>(BandWidth::Full, 1);
+        const auto mix = engine.emplace_node<Mixer>(BandWidth::Full, 1, 1);
+        const auto matrix = engine.emplace_node<Matrix>(BandWidth::Full, 1);
         const auto sink = engine.emplace_node<Meter>(level);
-        engine.connect(OPORT(tone, 0), IPORT(mix, 0));
-        engine.connect(OPORT(mix, 0), IPORT(matrix, 0));
-        engine.connect(OPORT(matrix, 0), IPORT(sink, 0));
+        engine.connect(tone, mix);
+        engine.connect(mix, matrix);
+        engine.connect(matrix, sink);
         auto *gain = engine.node<Matrix>(matrix);
         engine.commit();
         engine.start();
@@ -4365,7 +3858,8 @@ int main()
 
 ===== examples/CMakeLists.txt =====
 add_executable(clocked_graph clocked_graph.cpp)
-target_link_libraries(clocked_graph PRIVATE aereborn::plugins aereborn_test_plugins)
+target_link_libraries(clocked_graph PRIVATE aereborn_test_plugins)
+target_include_directories(clocked_graph PRIVATE "${PROJECT_SOURCE_DIR}")
 
 ===== backend/alsa_backend.cpp =====
 #include "alsa_backend.h"
@@ -4386,7 +3880,7 @@ namespace
 
 RetCode alsa_error(int error) noexcept
 {
-    return error == -ENODEV || error == -ENXIO || error == -ENOENT ? ErrorCode::DeviceLost : ErrorCode::IoFailed;
+    return error == -ENODEV || error == -ENXIO || error == -ENOENT ? RetCode::DEVLOST : RetCode::IOFAILED;
 }
 
 std::string normalize_device_name(std::string card, unsigned int device)
@@ -4414,7 +3908,7 @@ Result<PortSpec> AlsaBackend::configure_pcm(snd_pcm_t *handle, bool mmap, PortSp
     if (snd_pcm_hw_params_any(handle, hw) < 0 ||
         snd_pcm_hw_params_set_access(handle, hw, access) < 0 ||
         snd_pcm_hw_params_set_channels(handle, hw, static_cast<unsigned>(logical.channels)) < 0)
-        return ErrorCode::FormatMismatch;
+        return RetCode::INVFMT;
 
     const std::pair<snd_pcm_format_t, SampleFormat> formats[] = {
         {SND_PCM_FORMAT_FLOAT_LE, SampleFormat::F32LE}, {SND_PCM_FORMAT_S32_LE, SampleFormat::S32LE},
@@ -4428,11 +3922,11 @@ Result<PortSpec> AlsaBackend::configure_pcm(snd_pcm_t *handle, bool mmap, PortSp
             break;
         }
 
-    auto hz = static_cast<unsigned>(logical.sample_rate);
-    if (!is_interleaved_pcm(format) || snd_pcm_hw_params_set_rate_near(handle, hw, &hz, nullptr) < 0 ||
-        !is_sample_rate(static_cast<SampleRate>(hz)))
-        return ErrorCode::FormatMismatch;
-    const auto rate = static_cast<SampleRate>(hz);
+    auto hz = static_cast<unsigned>(logical.bandwidth);
+    if (format == SampleFormat::F32P || snd_pcm_hw_params_set_rate_near(handle, hw, &hz, nullptr) < 0 ||
+        !is_bandwidth(static_cast<BandWidth>(hz)))
+        return RetCode::INVFMT;
+    const auto rate = static_cast<BandWidth>(hz);
     const auto budget = frames_in_period(rate, duration);
     if (!budget)
         return budget.ret_code();
@@ -4440,7 +3934,7 @@ Result<PortSpec> AlsaBackend::configure_pcm(snd_pcm_t *handle, bool mmap, PortSp
     auto period = static_cast<snd_pcm_uframes_t>(budget.value());
     int period_dir = -1;
     if (snd_pcm_hw_params_set_period_size_near(handle, hw, &period, &period_dir) < 0)
-        return ErrorCode::FormatMismatch;
+        return RetCode::INVFMT;
 
     // Keep the period constraints for the buffer-size fallback.
     snd_pcm_hw_params_t *buffer_params;
@@ -4450,15 +3944,15 @@ Result<PortSpec> AlsaBackend::configure_pcm(snd_pcm_t *handle, bool mmap, PortSp
     if (snd_pcm_hw_params_set_periods_near(handle, hw, &periods, nullptr) < 0)
     {
         if (period > std::numeric_limits<snd_pcm_uframes_t>::max() / 2)
-            return ErrorCode::TooLarge;
+            return RetCode::TOOLARGE;
         auto buffer_frames = 2 * period;
         hw = buffer_params;
         if (snd_pcm_hw_params_set_buffer_size_near(handle, hw, &buffer_frames) < 0)
-            return ErrorCode::FormatMismatch;
+            return RetCode::INVFMT;
     }
     const auto rc = snd_pcm_hw_params(handle, hw);
     if (rc == -EINVAL || rc == -ENOSYS || rc == -EOPNOTSUPP)
-        return ErrorCode::FormatMismatch;
+        return RetCode::INVFMT;
     if (rc < 0)
         return alsa_error(rc);
     set_device_max_frames(std::min<std::size_t>(period, budget.value()));
@@ -4468,7 +3962,7 @@ Result<PortSpec> AlsaBackend::configure_pcm(snd_pcm_t *handle, bool mmap, PortSp
 Result<PortSpec> AlsaBackend::on_open(bool capture, PortSpec logical, std::chrono::microseconds duration)
 {
     if (logical.channels > std::numeric_limits<unsigned>::max())
-        return ErrorCode::TooLarge;
+        return RetCode::TOOLARGE;
     snd_pcm_t *handle = nullptr;
     const auto rc = snd_pcm_open(&handle, device_.c_str(), capture ? SND_PCM_STREAM_CAPTURE : SND_PCM_STREAM_PLAYBACK,
                                  SND_PCM_NONBLOCK);
@@ -4478,7 +3972,7 @@ Result<PortSpec> AlsaBackend::on_open(bool capture, PortSpec logical, std::chron
 
     auto mmap = use_mmap_;
     auto spec = configure_pcm(handle, mmap, logical, duration);
-    if (mmap && spec.ret_code() == ErrorCode::FormatMismatch)
+    if (mmap && spec.ret_code() == RetCode::INVFMT)
     {
         mmap = false;
         spec = configure_pcm(handle, mmap, logical, duration);
@@ -4490,7 +3984,7 @@ Result<PortSpec> AlsaBackend::on_open(bool capture, PortSpec logical, std::chron
     snd_pcm_sw_params_t *sw;
     snd_pcm_sw_params_alloca(&sw);
     if (snd_pcm_sw_params_current(handle, sw) < 0 || snd_pcm_sw_params_set_avail_min(handle, sw, frames) < 0)
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     if (!capture)
     {
         snd_pcm_uframes_t boundary = 0;
@@ -4498,20 +3992,20 @@ Result<PortSpec> AlsaBackend::on_open(bool capture, PortSpec logical, std::chron
             snd_pcm_sw_params_set_silence_threshold(handle, sw, 0) < 0 ||
             snd_pcm_sw_params_get_boundary(sw, &boundary) < 0 ||
             snd_pcm_sw_params_set_silence_size(handle, sw, boundary) < 0)
-            return ErrorCode::IoFailed;
+            return RetCode::IOFAILED;
     }
     if (snd_pcm_sw_params(handle, sw) < 0)
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
 
     const auto count = snd_pcm_poll_descriptors_count(handle);
     if (count <= 0)
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     std::vector<pollfd> descriptors(static_cast<std::size_t>(count) + 1);
     if (snd_pcm_poll_descriptors(handle, descriptors.data(), count) != count)
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     const auto wake = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (wake < 0)
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
 
     descriptors.back() = {wake, POLLIN, 0};
     poll_ = std::move(descriptors);
@@ -4528,7 +4022,7 @@ RetCode AlsaBackend::on_start() noexcept
         bytes = ::read(poll_.back().fd, &signal, sizeof(signal));
     while (bytes < 0 && errno == EINTR);
     if (bytes < 0 && errno != EAGAIN)
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     return prepare_stream();
 }
 
@@ -4580,7 +4074,7 @@ RetCode AlsaBackend::recover(int error) noexcept
             if (resumed >= 0)
                 return {};
             if (resumed == -ENODEV || resumed == -ENXIO)
-                return ErrorCode::DeviceLost;
+                return RetCode::DEVLOST;
             if (resumed != -EAGAIN || attempt == resume_attempts)
                 break;
 
@@ -4589,11 +4083,11 @@ RetCode AlsaBackend::recover(int error) noexcept
                 rc = ::poll(&cancel, 1, std::min(50, remaining_io_ms()));
             while (rc < 0 && errno == EINTR);
             if (rc < 0)
-                return ErrorCode::IoFailed;
+                return RetCode::IOFAILED;
             if (cancel.revents & POLLIN)
-                return ErrorCode::Cancelled;
+                return RetCode::CANCELLED;
             if (!remaining_io_ms())
-                return ErrorCode::Timeout;
+                return RetCode::TIMEOUT;
         }
     }
     else if (error != -EPIPE)
@@ -4607,23 +4101,23 @@ RetCode AlsaBackend::wait_ready() noexcept
     {
         const auto timeout = remaining_io_ms();
         if (!timeout)
-            return ErrorCode::Timeout;
+            return RetCode::TIMEOUT;
         const auto rc = ::poll(poll_.data(), poll_.size(), timeout);
         if (!rc)
-            return ErrorCode::Timeout;
+            return RetCode::TIMEOUT;
         if (rc < 0)
         {
             if (errno == EINTR)
                 continue;
-            return ErrorCode::IoFailed;
+            return RetCode::IOFAILED;
         }
         if (poll_.back().revents & POLLIN)
-            return ErrorCode::Cancelled;
+            return RetCode::CANCELLED;
         unsigned short events = 0;
         const auto code = snd_pcm_poll_descriptors_revents(pcm_, poll_.data(), poll_.size() - 1, &events);
         if ((events & (POLLHUP | POLLNVAL)) ||
             ((code < 0 || (events & POLLERR)) && snd_pcm_state(pcm_) == SND_PCM_STATE_DISCONNECTED))
-            return ErrorCode::DeviceLost;
+            return RetCode::DEVLOST;
         if (code < 0)
             return alsa_error(code);
         if (events & (POLLIN | POLLOUT | POLLERR))
@@ -4773,13 +4267,23 @@ class AlsaBackend final : public ActiveBackend
 ===== backend/backend.cpp =====
 #include "backend.h"
 
-#include "core/os.h"
+#include "audio_types.h"
 #include "core/retcode.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <limits>
+
+#if LINUX_OS_ENVIRONMENT || defined(__APPLE__)
+#include <pthread.h>
+#include <sched.h>
+#elif WINDOWS_OS_ENVIRONMENT
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace aereborn
 {
@@ -4792,6 +4296,47 @@ using Microseconds = std::chrono::microseconds;
 
 constexpr double ppm_per_unit = 1000000.0;
 constexpr double max_asrc_correction = max_clock_drift_ppm / ppm_per_unit;
+
+/// @brief Name the calling worker and request the platform's audio scheduling priority.
+/// @param name Null-terminated UTF-8 thread name of at most 15 bytes.
+void configure_audio_thread(const char *name) noexcept
+{
+#if LINUX_OS_ENVIRONMENT || defined(__APPLE__)
+    const auto thread = pthread_self();
+#if LINUX_OS_ENVIRONMENT
+    pthread_setname_np(thread, name);
+    constexpr auto policy = SCHED_RR;
+    const auto priority = sched_get_priority_max(policy) - 1;
+#else
+    pthread_setname_np(name);
+    constexpr auto policy = SCHED_FIFO;
+    const auto priority = sched_get_priority_min(policy);
+#endif
+    if (priority >= 0)
+    {
+        sched_param params{};
+        params.sched_priority = priority;
+        pthread_setschedparam(thread, policy, &params);
+    }
+#elif WINDOWS_OS_ENVIRONMENT
+    const auto thread = GetCurrentThread();
+    SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL);
+    using SetDescription = HRESULT(WINAPI *)(HANDLE, PCWSTR);
+    const auto kernel = GetModuleHandleW(L"Kernel32.dll");
+    if (kernel)
+    {
+        if (const auto set_name = reinterpret_cast<SetDescription>(GetProcAddress(kernel, "SetThreadDescription")))
+        {
+            constexpr int capacity = 16;
+            wchar_t wide_name[capacity];
+            if (MultiByteToWideChar(CP_UTF8, 0, name, -1, wide_name, capacity))
+                set_name(thread, wide_name);
+        }
+    }
+#else
+    (void)name;
+#endif
+}
 
 } // namespace
 
@@ -4813,30 +4358,30 @@ void Backend::claim(Playback &endpoint)
 template <class Endpoint> void Backend::claim_endpoint(Endpoint &endpoint, Endpoint *&slot)
 {
     if (capture_ || playback_)
-        throw Error(ErrorCode::Busy);
+        throw Error(RetCode::BUSY);
     if (!endpoint.capacity())
-        throw Error(ErrorCode::NotReady);
+        throw Error(RetCode::ESTATE);
     if (endpoint.backend_bound_.exchange(true, std::memory_order_acq_rel))
-        throw Error(ErrorCode::Busy);
+        throw Error(RetCode::BUSY);
     slot = &endpoint;
 }
 
 void Backend::validate_channels(std::size_t logical_channels, std::size_t device_channels)
 {
     if (device_channels != logical_channels)
-        throw Error(ErrorCode::FormatMismatch);
+        throw Error(RetCode::INVFMT);
 }
 
-void Backend::prepare(PortSpec logical, SampleRate device_rate, double max_rate_offset)
+void Backend::prepare(PortSpec logical, BandWidth device_rate, double max_rate_offset)
 {
     const auto frames = device_max_frames_;
     const auto capture = is_capture();
-    const auto src_fs = capture ? device_rate : logical.sample_rate;
-    const auto dst_fs = capture ? logical.sample_rate : device_rate;
+    const auto src_fs = capture ? device_rate : logical.bandwidth;
+    const auto dst_fs = capture ? logical.bandwidth : device_rate;
     const auto logical_frames = capture ? SincResampler::max_output_frames(src_fs, dst_fs, frames, max_rate_offset)
                                         : SincResampler::max_input_frames(src_fs, dst_fs, frames, max_rate_offset);
     if (logical_frames > target_frames())
-        throw Error(ErrorCode::TooLarge);
+        throw Error(RetCode::TOOLARGE);
 
     resampler_.prepare(logical.channels, src_fs, dst_fs, max_rate_offset);
     if (resampler_.needs_fir())
@@ -4983,25 +4528,25 @@ OBBlock Backend::encode_from_playback(IFBlock input, OBBlock output, double scal
     return encoded;
 }
 
-Result<std::size_t> Backend::frames_in_period(SampleRate rate, std::chrono::microseconds period) noexcept
+Result<std::size_t> Backend::frames_in_period(BandWidth rate, std::chrono::microseconds period) noexcept
 {
     constexpr std::uint64_t micros_per_second = 1000000;
     const auto hz = static_cast<std::uint32_t>(rate);
     const auto micros = static_cast<std::uint64_t>(period.count());
     const auto frames = (micros / micros_per_second) * hz + (micros % micros_per_second) * hz / micros_per_second;
     if (frames > std::numeric_limits<std::size_t>::max())
-        return ErrorCode::TooLarge;
+        return RetCode::TOOLARGE;
     if (!frames)
-        return ErrorCode::InvalidArg;
+        return RetCode::EPARAM;
     return static_cast<std::size_t>(frames);
 }
 
 void PassiveBackend::start()
 {
     if (!bound())
-        throw Error(ErrorCode::NotReady);
+        throw Error(RetCode::ESTATE);
     if (running_)
-        throw Error(ErrorCode::Busy);
+        throw Error(RetCode::BUSY);
     open_queue(false);
     running_ = true;
 }
@@ -5047,15 +4592,15 @@ template <class Endpoint> void ActiveBackend::bind_endpoint(Endpoint &endpoint)
     const auto device = on_open(is_capture(), logical, period).value_or_throw();
     const auto frames = device_max_frames();
     if (!valid_pcm_spec(device) || !frames)
-        throw Error(ErrorCode::InvalidArg);
+        throw Error(RetCode::EPARAM);
     validate_channels(logical.channels, device.channels);
-    if (frames > frames_in_period(device.sample_rate, period).value_or_throw())
-        throw Error(ErrorCode::TooLarge);
+    if (frames > frames_in_period(device.bandwidth, period).value_or_throw())
+        throw Error(RetCode::TOOLARGE);
 
-    prepare(logical, device.sample_rate, async_ ? max_asrc_correction : 0.0);
+    prepare(logical, device.bandwidth, async_ ? max_asrc_correction : 0.0);
     const auto width = sample_bytes(device.format);
     if (frames > device_bytes_.max_size() / device.channels / width)
-        throw Error(ErrorCode::TooLarge);
+        throw Error(RetCode::TOOLARGE);
     // Allocate the byte buffer last. A failed resize leaves it empty.
     device_bytes_.resize(frames * device.channels * width);
 
@@ -5094,9 +4639,9 @@ int ActiveBackend::remaining_io_ms() const noexcept
 void ActiveBackend::start()
 {
     if (!bound())
-        throw Error(ErrorCode::NotReady);
+        throw Error(RetCode::ESTATE);
     if (running())
-        throw Error(ErrorCode::Busy);
+        throw Error(RetCode::BUSY);
     if (worker_.joinable())
         worker_.join();
     last_error_.store({}, std::memory_order_release);
@@ -5128,7 +4673,7 @@ void ActiveBackend::start()
     lock.unlock();
     if (!start_result)
         worker_.join();
-    start_result.or_throw();
+    throw_if_error(start_result);
 }
 
 void ActiveBackend::stop() noexcept
@@ -5178,18 +4723,18 @@ void ActiveBackend::go_offline(RetCode error) noexcept
 
 void ActiveBackend::record_io_error(RetCode error) noexcept
 {
-    if (!error && error != ErrorCode::Cancelled)
+    if (!error && error != RetCode::CANCELLED)
         last_error_.store(error, std::memory_order_release);
 }
 
 Result<std::size_t> ActiveBackend::on_read(OBBlock) noexcept
 {
-    return ErrorCode::InvalidArg;
+    return RetCode::EPARAM;
 }
 
 RetCode ActiveBackend::on_write(IBBlock) noexcept
 {
-    return ErrorCode::InvalidArg;
+    return RetCode::EPARAM;
 }
 
 RetCode ActiveBackend::on_write_silence(OBBlock scratch) noexcept
@@ -5214,7 +4759,7 @@ void ActiveBackend::ASRC::reset() noexcept
 }
 
 void ActiveBackend::ASRC::update(std::size_t queued_before, std::size_t queued_after, std::size_t target_frames,
-                           SampleRate logical_rate, std::size_t device_frames, SampleRate device_rate) noexcept
+                           BandWidth logical_rate, std::size_t device_frames, BandWidth device_rate) noexcept
 {
     constexpr double filter_seconds = 0.25;
     constexpr double proportional_gain = 0.5;
@@ -5247,7 +4792,7 @@ RetCode ActiveBackend::transfer_capture(std::size_t &device_frames) noexcept
         return read.ret_code();
     device_frames = read.value();
     if (device_frames > batch.frames())
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     if (!device_frames)
         return {};
 
@@ -5256,8 +4801,8 @@ RetCode ActiveBackend::transfer_capture(std::size_t &device_frames) noexcept
     const auto queued_before = primed ? available() : 0;
     decode_to_capture(device_block(device_frames), asrc_.scale());
     if (primed)
-        asrc_.update(queued_before, available(), target_frames(), logical_spec().sample_rate,
-                     device_frames, batch.spec().sample_rate);
+        asrc_.update(queued_before, available(), target_frames(), logical_spec().bandwidth,
+                     device_frames, batch.spec().bandwidth);
     return {};
 }
 
@@ -5268,7 +4813,7 @@ Result<std::size_t> ActiveBackend::next_playback_batch() noexcept
         return batch;
     const auto frames = batch.value();
     if (!frames || frames > device_max_frames())
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     return batch;
 }
 
@@ -5305,8 +4850,8 @@ RetCode ActiveBackend::transfer_playback_async(std::size_t &device_frames) noexc
                             ? emit_playback(logical.subblock(0, received), device_frames, scale)
                             : on_write_silence(device_block(device_frames));
     if (result && primed)
-        asrc_.update(queued_before, available(), target_frames(), logical_spec().sample_rate,
-                     device_frames, device_spec().sample_rate);
+        asrc_.update(queued_before, available(), target_frames(), logical_spec().bandwidth,
+                     device_frames, device_spec().bandwidth);
     return result;
 }
 
@@ -5322,7 +4867,7 @@ RetCode ActiveBackend::run_sync_capture() noexcept
         std::size_t frames = 0;
         const auto result = transfer_capture(frames);
         if (!result)
-            return result == ErrorCode::EndOfStream ? drain_capture() : result;
+            return result == RetCode::EOS ? drain_capture() : result;
         if (!frames)
             wait_backpressure();
     }
@@ -5335,7 +4880,7 @@ RetCode ActiveBackend::drain_capture() noexcept
     while (worker_state_.load(std::memory_order_acquire) == State::Running)
     {
         if (!tail && !available())
-            return ErrorCode::EndOfStream;
+            return RetCode::EOS;
         if (tail && capture_free_frames() >= logical_frames())
         {
             const auto frames = std::min(tail, device_max_frames());
@@ -5415,7 +4960,7 @@ RetCode ActiveBackend::run_async() noexcept
 
         const auto now = Clock::now();
         if (now >= io_deadline_)
-            return ErrorCode::Timeout;
+            return RetCode::TIMEOUT;
         if (frames)
             io_deadline_ = now + timeout;
     }
@@ -5496,7 +5041,7 @@ class Backend
     void claim(Capture &endpoint);
     void claim(Playback &endpoint);
     // The adapter has validated the device rate, channels, and batch size.
-    void prepare(PortSpec logical, SampleRate device_rate, double max_rate_offset);
+    void prepare(PortSpec logical, BandWidth device_rate, double max_rate_offset);
     // Publish only after the adapter has prepared all of its resources.
     void complete_binding(PortSpec device) noexcept { device_spec_ = device; }
 
@@ -5532,11 +5077,7 @@ class Backend
     std::size_t read_playback(OFBlock output) noexcept;
     OBBlock encode_from_playback(IFBlock input, OBBlock output, double scale) noexcept;
 
-    static constexpr bool valid_pcm_spec(PortSpec spec) noexcept
-    {
-        return is_sample_rate(spec.sample_rate) && spec.channels && is_interleaved_pcm(spec.format);
-    }
-    static Result<std::size_t> frames_in_period(SampleRate rate, std::chrono::microseconds period) noexcept;
+    static Result<std::size_t> frames_in_period(BandWidth rate, std::chrono::microseconds period) noexcept;
     static void validate_channels(std::size_t logical_channels, std::size_t device_channels);
 
   private:
@@ -5574,10 +5115,10 @@ class PassiveBackend : public Backend
 
         // Bound scratch size and the queue threshold for large endpoints.
         const auto period = std::min(endpoint_period(), std::chrono::microseconds(10000));
-        set_device_max_frames(frames_in_period(device.sample_rate, period).value_or_throw());
+        set_device_max_frames(frames_in_period(device.bandwidth, period).value_or_throw());
         const auto logical = endpoint.spec();
         validate_channels(logical.channels, device.channels);
-        prepare(logical, device.sample_rate, 0.0);
+        prepare(logical, device.bandwidth, 0.0);
         complete_binding(device);
         rollback.dismiss();
     }
@@ -5651,7 +5192,7 @@ class ActiveBackend : public Backend
     /// @brief Stop the stream and release worker resources after a successful on_start().
     virtual void on_stop() noexcept {}
 
-    /// @brief Wake blocked I/O hooks promptly so they return Cancelled. Idempotent and non-blocking.
+    /// @brief Wake blocked I/O hooks promptly so they return RetCode::CANCELLED. Idempotent and non-blocking.
     /// @note Called only from control-side stop() while bound; must remain safe until on_close().
     virtual void on_cancel() noexcept {}
 
@@ -5681,7 +5222,7 @@ class ActiveBackend : public Backend
         double scale() const noexcept { return 1.0 + correction.load(std::memory_order_relaxed); }
         void reset() noexcept;
         void update(std::size_t queued_before, std::size_t queued_after, std::size_t target_frames,
-                    SampleRate logical_rate, std::size_t device_frames, SampleRate device_rate) noexcept;
+                    BandWidth logical_rate, std::size_t device_frames, BandWidth device_rate) noexcept;
     };
 
     template <class Endpoint> void bind_endpoint(Endpoint &endpoint);
@@ -5718,27 +5259,6 @@ class ActiveBackend : public Backend
 
 #endif
 
-===== backend/CMakeLists.txt =====
-add_library(aereborn_backend STATIC
-    backend.cpp null_backend.cpp pull_sink.cpp push_source.cpp usr_playback.cpp wav_backend.cpp wav_file.cpp)
-add_library(aereborn::backend ALIAS aereborn_backend)
-target_link_libraries(aereborn_backend PUBLIC aereborn::plugins PRIVATE Threads::Threads)
-
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    find_package(ALSA QUIET)
-    if(ALSA_FOUND)
-        target_sources(aereborn_backend PRIVATE alsa_backend.cpp)
-        target_link_libraries(aereborn_backend PRIVATE ALSA::ALSA)
-        target_compile_definitions(aereborn_backend PUBLIC AEREBORN_HAS_ALSA=1)
-        message(STATUS "AEReborn found the ALSA library at ${ALSA_LIBRARY}")
-    else()
-        message(STATUS "AEReborn skipped ALSA because its development library or headers were not found")
-    endif()
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-    target_sources(aereborn_backend PRIVATE wasapi_backend.cpp)
-    target_link_libraries(aereborn_backend PRIVATE ole32 uuid)
-endif()
-
 ===== backend/null_backend.cpp =====
 #include "null_backend.h"
 
@@ -5750,12 +5270,12 @@ namespace aereborn
 NullBackend::NullBackend(SampleFormat format) : ActiveBackend(false), format_(format)
 {
     if (!is_interleaved_pcm(format_))
-        throw Error(ErrorCode::InvalidArg);
+        throw Error(RetCode::EPARAM);
 }
 
 Result<PortSpec> NullBackend::on_open(bool, PortSpec logical, std::chrono::microseconds period)
 {
-    const auto count = frames_in_period(logical.sample_rate, period);
+    const auto count = frames_in_period(logical.bandwidth, period);
     if (!count)
         return count.ret_code();
     logical.format = format_;
@@ -5825,7 +5345,7 @@ namespace aereborn
 PullSink::PullSink(PortSpec output_spec) : output_spec_(output_spec)
 {
     if (!valid_pcm_spec(output_spec_))
-        throw Error(ErrorCode::InvalidArg, "PullSink requires a valid interleaved PCM PortSpec");
+        throw Error(RetCode::EPARAM, "PullSink requires a valid interleaved PCM PortSpec");
 }
 
 void PullSink::bind(Playback &endpoint)
@@ -5836,13 +5356,13 @@ void PullSink::bind(Playback &endpoint)
 std::size_t PullSink::pull(OBBlock output)
 {
     if (output.spec() != output_spec_)
-        throw Error(ErrorCode::FormatMismatch, "PullSink output spec mismatch");
+        throw Error(RetCode::INVFMT, "PullSink output spec mismatch");
     const auto total_frames = output.frames();
     if (!total_frames)
         return 0;
     auto *bytes = output.byte_view().data();
     if (!bytes)
-        throw Error(ErrorCode::InvalidArg, "PullSink output data is null");
+        throw Error(RetCode::EPARAM, "PullSink output data is null");
     if (!running())
         return 0;
 
@@ -5887,7 +5407,7 @@ class PullSink final : public PassiveBackend
     /// @copydoc Backend::type_name
     const char *type_name() const noexcept override { return "PullSink"; }
 
-    /// @throws Error InvalidArg if output_spec is invalid or is not interleaved PCM.
+    /// @throws Error RetCode::EPARAM if output_spec is invalid or is not interleaved PCM.
     explicit PullSink(PortSpec output_spec);
 
     /// @brief Bind to a prepared Playback endpoint and allocate conversion buffers.
@@ -5896,7 +5416,7 @@ class PullSink final : public PassiveBackend
     /// @brief Pull available PCM without waiting for the graph to fill the queue.
     /// @param output Borrowed writable PCM storage, valid until the call returns.
     /// @return Output frames written. The unwritten suffix is left intact.
-    /// @throws Error FormatMismatch for a different PortSpec, or InvalidArg for a nonempty null buffer.
+    /// @throws Error RetCode::INVFMT for a different PortSpec, or RetCode::EPARAM for a nonempty null buffer.
     std::size_t pull(OBBlock output);
 
   private:
@@ -5918,7 +5438,7 @@ namespace aereborn
 PushSource::PushSource(PortSpec input_spec) : input_spec_(input_spec)
 {
     if (!valid_pcm_spec(input_spec_))
-        throw Error(ErrorCode::InvalidArg, "PushSource requires a valid interleaved PCM PortSpec");
+        throw Error(RetCode::EPARAM, "PushSource requires a valid interleaved PCM PortSpec");
 }
 
 void PushSource::bind(Capture &endpoint)
@@ -5929,13 +5449,13 @@ void PushSource::bind(Capture &endpoint)
 std::size_t PushSource::push(IBBlock input)
 {
     if (input.spec() != input_spec_)
-        throw Error(ErrorCode::FormatMismatch, "PushSource input spec mismatch");
+        throw Error(RetCode::INVFMT, "PushSource input spec mismatch");
     const auto total_frames = input.frames();
     if (!total_frames)
         return 0;
     const auto *bytes = input.byte_view().data();
     if (!bytes)
-        throw Error(ErrorCode::InvalidArg, "PushSource input data is null");
+        throw Error(RetCode::EPARAM, "PushSource input data is null");
     if (!running())
         return 0;
 
@@ -5979,7 +5499,7 @@ class PushSource final : public PassiveBackend
     /// @copydoc Backend::type_name
     const char *type_name() const noexcept override { return "PushSource"; }
 
-    /// @throws Error InvalidArg if input_spec is invalid or is not interleaved PCM.
+    /// @throws Error RetCode::EPARAM if input_spec is invalid or is not interleaved PCM.
     explicit PushSource(PortSpec input_spec);
     /// @brief Prepare DSP buffers and bind to a prepared Capture node.
     /// @throws Error If already bound, the endpoint is unprepared or occupied, or format validation fails.
@@ -5989,7 +5509,7 @@ class PushSource final : public PassiveBackend
     /// @param input Borrowed PCM storage, valid until the call returns.
     /// @return Input frames accepted. Resume a short write at this frame offset. Zero means no frames were accepted,
     ///         including when stopped or when the queue has less space than the FIR output bound.
-    /// @throws Error FormatMismatch for a different PortSpec, or InvalidArg for nonzero frames with a null pointer.
+    /// @throws Error RetCode::INVFMT for a different PortSpec, or RetCode::EPARAM for nonzero frames with a null pointer.
     std::size_t push(IBBlock input);
 
   private:
@@ -6012,14 +5532,14 @@ UsrPlayback::UsrPlayback(PortSpec spec, Callback callback)
     : ActiveBackend(false), spec_(spec), callback_(std::move(callback))
 {
     if (!valid_pcm_spec(spec_) || !callback_)
-        throw Error(ErrorCode::InvalidArg, "UsrPlayback requires valid interleaved PCM and a callback");
+        throw Error(RetCode::EPARAM, "UsrPlayback requires valid interleaved PCM and a callback");
 }
 
 Result<PortSpec> UsrPlayback::on_open(bool capture, PortSpec, std::chrono::microseconds target_period)
 {
     if (capture)
-        return ErrorCode::InvalidArg;
-    const auto frames = frames_in_period(spec_.sample_rate, target_period);
+        return RetCode::EPARAM;
+    const auto frames = frames_in_period(spec_.bandwidth, target_period);
     if (!frames)
         return frames.ret_code();
     set_device_max_frames(frames.value());
@@ -6055,7 +5575,7 @@ class UsrPlayback final : public ActiveBackend
 
     using Callback = std::function<void(IBBlock)>;
 
-    /// @throws Error InvalidArg if spec is not valid interleaved PCM or callback is empty.
+    /// @throws Error RetCode::EPARAM if spec is not valid interleaved PCM or callback is empty.
     UsrPlayback(PortSpec spec, Callback callback);
     ~UsrPlayback() override { unbind(); }
 
@@ -6128,12 +5648,12 @@ RetCode record_failure(WasapiBackend::Failure &failure, const char *operation, H
 {
     failure = {operation, static_cast<std::int32_t>(error)};
     if (error == AUDCLNT_E_WRONG_ENDPOINT_TYPE)
-        return ErrorCode::InvalidArg;
+        return RetCode::EPARAM;
     if (error == AUDCLNT_E_UNSUPPORTED_FORMAT)
-        return ErrorCode::FormatMismatch;
+        return RetCode::INVFMT;
     if (error == AUDCLNT_E_DEVICE_INVALIDATED || error == HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
-        return ErrorCode::DeviceLost;
-    return ErrorCode::IoFailed;
+        return RetCode::DEVLOST;
+    return RetCode::IOFAILED;
 }
 
 RetCode activate(const std::wstring &id, EDataFlow direction, Interface<IAudioClient> &client,
@@ -6250,12 +5770,12 @@ Result<PortSpec> WasapiBackend::on_open(bool capture, PortSpec logical, std::chr
     if (FAILED(rc))
         return record_failure(failure_, "IAudioClient::GetMixFormat", rc);
     const std::unique_ptr<WAVEFORMATEX, FreeComBuffer> format(format_ptr);
-    const PortSpec spec{static_cast<SampleRate>(format->nSamplesPerSec), format->nChannels, sample_format(*format)};
+    const PortSpec spec{static_cast<BandWidth>(format->nSamplesPerSec), format->nChannels, sample_format(*format)};
     if (!valid_pcm_spec(spec) || logical.channels != spec.channels ||
         format->nBlockAlign != spec.channels * sample_bytes(spec.format) ||
         sizeof(*format) + format->cbSize > format_.size())
-        return ErrorCode::FormatMismatch;
-    const auto budget = frames_in_period(spec.sample_rate, period);
+        return RetCode::INVFMT;
+    const auto budget = frames_in_period(spec.bandwidth, period);
     if (!budget)
         return budget.ret_code();
 
@@ -6267,7 +5787,7 @@ Result<PortSpec> WasapiBackend::on_open(bool capture, PortSpec logical, std::chr
     if (capture)
     {
         if (capacity > packet.max_size() / format->nBlockAlign)
-            return ErrorCode::TooLarge;
+            return RetCode::TOOLARGE;
         packet.resize(static_cast<std::size_t>(capacity) * format->nBlockAlign);
     }
 
@@ -6320,7 +5840,7 @@ RetCode WasapiBackend::on_start() noexcept
         return initialized.ret_code();
     const auto capacity = initialized.value();
     if (source && capacity > packet_.size() / format.Format.nBlockAlign)
-        return ErrorCode::TooLarge;
+        return RetCode::TOOLARGE;
     auto rc = client->SetEventHandle(ready_);
     if (FAILED(rc))
         return record_failure(failure_, "IAudioClient::SetEventHandle", rc);
@@ -6376,15 +5896,15 @@ RetCode WasapiBackend::wait() noexcept
     const HANDLE handles[] = {cancelled_, ready_};
     const auto timeout = remaining_io_ms();
     if (!timeout)
-        return ErrorCode::Timeout;
+        return RetCode::TIMEOUT;
     switch (WaitForMultipleObjects(2, handles, FALSE, static_cast<DWORD>(timeout)))
     {
-    case WAIT_OBJECT_0: return ErrorCode::Cancelled;
+    case WAIT_OBJECT_0: return RetCode::CANCELLED;
     case WAIT_OBJECT_0 + 1: return {};
-    case WAIT_TIMEOUT: return ErrorCode::Timeout;
+    case WAIT_TIMEOUT: return RetCode::TIMEOUT;
     case WAIT_FAILED:
         return record_failure(failure_, "WaitForMultipleObjects", HRESULT_FROM_WIN32(GetLastError()));
-    default: return ErrorCode::IoFailed;
+    default: return RetCode::IOFAILED;
     }
 }
 
@@ -6491,8 +6011,8 @@ WasapiBackend::WasapiBackend(std::wstring device) : ActiveBackend(true), device_
 #ifndef AEREBORN_BACKEND_WASAPI_BACKEND_H
 #define AEREBORN_BACKEND_WASAPI_BACKEND_H
 
+#include "audio_types.h"
 #include "backend.h"
-#include "core/os.h"
 
 #if WINDOWS_OS_ENVIRONMENT
 #include <array>
@@ -6594,12 +6114,12 @@ WavCapture::WavCapture(std::string path, Repeat repeats)
 Result<PortSpec> WavCapture::on_open(bool capture, PortSpec, std::chrono::microseconds period)
 {
     if (!capture)
-        return ErrorCode::InvalidArg;
+        return RetCode::EPARAM;
     const auto opened = file_.open_read(path_);
     if (!opened)
         return opened;
     const auto spec = file_.spec();
-    const auto count = frames_in_period(spec.sample_rate, period);
+    const auto count = frames_in_period(spec.bandwidth, period);
     if (!count)
         return count.ret_code();
 
@@ -6637,7 +6157,7 @@ Result<std::size_t> WavCapture::on_read(OBBlock output) noexcept
         frames += read.value();
     }
     if (!frames)
-        return ErrorCode::EndOfStream;
+        return RetCode::EOS;
     return frames;
 }
 
@@ -6650,16 +6170,16 @@ WavPlayback::WavPlayback(std::string path, SampleFormat format, std::chrono::sec
     : ActiveBackend(false), path_(std::move(path)), format_(format), segment_duration_(segment_duration)
 {
     if (segment_duration_.count() < 0)
-        throw Error(ErrorCode::InvalidArg);
+        throw Error(RetCode::EPARAM);
     if (!WavFile::supports_write_format(format_))
-        throw Error(ErrorCode::FormatMismatch);
+        throw Error(RetCode::INVFMT);
 }
 
 Result<PortSpec> WavPlayback::on_open(bool capture, PortSpec logical, std::chrono::microseconds period)
 {
     if (capture)
-        return ErrorCode::InvalidArg;
-    const auto count = frames_in_period(logical.sample_rate, period);
+        return RetCode::EPARAM;
+    const auto count = frames_in_period(logical.bandwidth, period);
     if (!count)
         return count.ret_code();
     logical.format = format_;
@@ -6668,17 +6188,17 @@ Result<PortSpec> WavPlayback::on_open(bool capture, PortSpec logical, std::chron
         const auto limit = WavFile::max_write_frames(logical);
         if (!limit)
             return limit.ret_code();
-        const auto hz = static_cast<std::uint32_t>(logical.sample_rate);
+        const auto hz = static_cast<std::uint32_t>(logical.bandwidth);
         const auto seconds = static_cast<std::uint64_t>(segment_duration_.count());
         if (seconds > limit.value() / hz)
-            return ErrorCode::TooLarge;
+            return RetCode::TOOLARGE;
         segment_frames_ = static_cast<std::size_t>(seconds * hz);
 
         segment_path_ = path_;
         const auto separator = path_.find_last_of("/\\");
         const auto name_start = separator == std::string::npos ? 0 : separator + 1;
         if (name_start == path_.size())
-            return ErrorCode::InvalidArg;
+            return RetCode::EPARAM;
         auto extension = path_.find_last_of('.');
         if (extension == std::string::npos || extension <= name_start)
         {
@@ -6700,13 +6220,13 @@ Result<PortSpec> WavPlayback::on_open(bool capture, PortSpec logical, std::chron
 RetCode WavPlayback::on_start() noexcept
 {
     const auto state = file_.status();
-    return state == ErrorCode::NotReady ? open_file(device_spec()) : state;
+    return state == RetCode::ESTATE ? open_file(device_spec()) : state;
 }
 
 void WavPlayback::on_stop() noexcept
 {
     const auto flushed = file_.flush();
-    if (flushed != ErrorCode::NotReady)
+    if (flushed != RetCode::ESTATE)
         record_io_error(flushed);
 }
 
@@ -6717,12 +6237,12 @@ RetCode WavPlayback::open_file(PortSpec spec) noexcept
     for (;;)
     {
         if (segment_index_ == std::numeric_limits<std::uint32_t>::max())
-            return ErrorCode::TooLarge;
+            return RetCode::TOOLARGE;
         auto index = ++segment_index_;
         for (auto pos = segment_number_offset_ + segment_number_width; pos != segment_number_offset_; index /= 10)
             segment_path_[--pos] = static_cast<char>('0' + index % 10);
         const auto opened = file_.open_write(segment_path_, spec, WavFile::WriteMode::Exclusive);
-        if (opened != ErrorCode::Busy)
+        if (opened != RetCode::BUSY)
             return opened;
     }
 }
@@ -6776,7 +6296,7 @@ RetCode WavPlayback::on_write(IBBlock input) noexcept
 namespace aereborn
 {
 
-/// @brief Graph-clocked RIFF/WAVE source. Reports EndOfStream when all passes have been read.
+/// @brief Graph-clocked RIFF/WAVE source. Reports RetCode::EOS when all passes have been read.
 /// @note Unsigned 8-bit PCM and 64-bit float files are exposed as F32LE.
 /// @note Restart resumes at the next file frame to read. Rebinding opens the file from the beginning.
 class WavCapture final : public ActiveBackend
@@ -6854,7 +6374,7 @@ class WavPlayback final : public ActiveBackend
 
 ===== backend/wav_file.cpp =====
 #include "wav_file.h"
-#include "core/os.h"
+#include "audio_types.h"
 
 #include <algorithm>
 #include <array>
@@ -6892,7 +6412,7 @@ std::uint32_t wav_header_size(SampleFormat format) noexcept
 bool write_header(std::FILE *file, PortSpec spec, std::uint32_t data_size) noexcept
 {
     const auto width = static_cast<std::uint16_t>(spec.channels * sample_bytes(spec.format));
-    const auto rate = static_cast<std::uint32_t>(spec.sample_rate);
+    const auto rate = static_cast<std::uint32_t>(spec.bandwidth);
     const auto floating = spec.format == SampleFormat::F32LE;
     std::array<unsigned char, 58> header;
     auto *out = header.data();
@@ -7014,10 +6534,9 @@ bool parse_format(std::FILE *file, std::uint32_t size, WaveData &data)
         tag = read_u16(fmt.data() + 24);
     }
     const auto bits = read_u16(fmt.data() + 14);
-    data.spec = {static_cast<SampleRate>(read_u32(fmt.data() + 4)), read_u16(fmt.data() + 2), wav_format(tag, bits)};
+    data.spec = {static_cast<BandWidth>(read_u32(fmt.data() + 4)), read_u16(fmt.data() + 2), wav_format(tag, bits)};
     data.frame_bytes = read_u16(fmt.data() + 12);
-    return data.spec.format != SampleFormat::F32P && data.spec.valid() &&
-           data.frame_bytes == data.spec.channels * (bits / 8);
+    return valid_pcm_spec(data.spec) && data.frame_bytes == data.spec.channels * (bits / 8);
 }
 
 RetCode parse_wav(std::FILE *file, WaveData &data)
@@ -7025,26 +6544,26 @@ RetCode parse_wav(std::FILE *file, WaveData &data)
     unsigned char header[12];
     if (!read_bytes(file, header, sizeof(header)) || std::memcmp(header, "RIFF", 4) ||
         std::memcmp(header + 8, "WAVE", 4))
-        return ErrorCode::FormatMismatch;
+        return RetCode::INVFMT;
     const auto limit = std::int64_t{8} + read_u32(header + 4);
     if (limit < 12 || !seek_bytes(file, 0, SEEK_END) || tell_bytes(file) < limit)
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
 
     bool have_format = false;
     for (std::int64_t pos = 12; pos + 8 <= limit; )
     {
         unsigned char chunk[8];
         if (!seek_bytes(file, pos, SEEK_SET) || !read_bytes(file, chunk, sizeof(chunk)))
-            return ErrorCode::IoFailed;
+            return RetCode::IOFAILED;
         const auto size = read_u32(chunk + 4);
         const auto payload = pos + 8;
         pos = payload + size + (size & 1);
         if (pos > limit)
-            return ErrorCode::IoFailed;
+            return RetCode::IOFAILED;
         if (!have_format && !std::memcmp(chunk, "fmt ", 4))
         {
             if (!parse_format(file, size, data))
-                return ErrorCode::FormatMismatch;
+                return RetCode::INVFMT;
             have_format = true;
         }
         else if (!data.offset && !std::memcmp(chunk, "data", 4))
@@ -7055,11 +6574,11 @@ RetCode parse_wav(std::FILE *file, WaveData &data)
         if (have_format && data.offset)
         {
             if (data.size % data.frame_bytes)
-                return ErrorCode::FormatMismatch;
-            return seek_bytes(file, data.offset, SEEK_SET) ? RetCode{} : RetCode{ErrorCode::IoFailed};
+                return RetCode::INVFMT;
+            return seek_bytes(file, data.offset, SEEK_SET) ? RetCode::OK : RetCode::IOFAILED;
         }
     }
-    return ErrorCode::FormatMismatch;
+    return RetCode::INVFMT;
 }
 
 float read_f64(const unsigned char *bytes) noexcept
@@ -7096,11 +6615,11 @@ WavFile::~WavFile()
 RetCode WavFile::open_read(const std::string &path) noexcept
 {
     if (file_ && writing_)
-        return ErrorCode::Busy;
+        return RetCode::BUSY;
     const auto close_input = [](std::FILE *file) noexcept { std::fclose(file); };
     std::unique_ptr<std::FILE, decltype(close_input)> file(open_file(path.c_str(), "rb"), close_input);
     if (!file)
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     WaveData data;
     const auto parsed = parse_wav(file.get(), data);
     if (!parsed)
@@ -7127,15 +6646,15 @@ Result<std::size_t> WavFile::max_write_frames(PortSpec spec) noexcept
 {
     const auto format = spec.format;
     if (!supports_write_format(format))
-        return ErrorCode::FormatMismatch;
+        return RetCode::INVFMT;
     if (!spec.valid())
-        return ErrorCode::InvalidArg;
+        return RetCode::EPARAM;
     const auto sample_width = sample_bytes(format);
-    const auto rate = static_cast<std::uint32_t>(spec.sample_rate);
+    const auto rate = static_cast<std::uint32_t>(spec.bandwidth);
     constexpr auto max_bytes = std::numeric_limits<std::uint32_t>::max();
     if (spec.channels > std::numeric_limits<std::uint16_t>::max() / sample_width ||
         spec.channels > max_bytes / sample_width / rate)
-        return ErrorCode::TooLarge;
+        return RetCode::TOOLARGE;
 
     // Leave room for the RIFF header and the pad byte of an odd data chunk.
     const auto limit = (max_bytes - (wav_header_size(format) - 8)) & ~std::uint32_t{1};
@@ -7145,19 +6664,19 @@ Result<std::size_t> WavFile::max_write_frames(PortSpec spec) noexcept
 RetCode WavFile::open_write(const std::string &path, PortSpec spec, WriteMode mode) noexcept
 {
     if (file_)
-        return ErrorCode::Busy;
+        return RetCode::BUSY;
     const auto limit = max_write_frames(spec);
     if (!limit)
         return limit.ret_code();
     const auto exclusive = mode == WriteMode::Exclusive;
     auto *file = open_file(path.c_str(), exclusive ? "wbx" : "wb");
     if (!file)
-        return exclusive && errno == EEXIST ? ErrorCode::Busy : ErrorCode::IoFailed;
+        return exclusive && errno == EEXIST ? RetCode::BUSY : RetCode::IOFAILED;
 
     if (!write_header(file, spec, 0) || std::fflush(file) != 0)
     {
         std::fclose(file);
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     }
 
     file_ = file;
@@ -7188,34 +6707,34 @@ RetCode WavFile::close() noexcept
     writing_ = false;
     spec_ = {};
     frame_count_ = position_ = 0;
-    return prior_ok && finalized && closed == 0 ? RetCode{} : RetCode{ErrorCode::IoFailed};
+    return prior_ok && finalized && closed == 0 ? RetCode::OK : RetCode::IOFAILED;
 }
 
 RetCode WavFile::flush() noexcept
 {
     if (!writing_)
-        return ErrorCode::NotReady;
-    return std::fflush(file_) != 0 || std::ferror(file_) ? RetCode{ErrorCode::IoFailed} : RetCode{};
+        return RetCode::ESTATE;
+    return std::fflush(file_) != 0 || std::ferror(file_) ? RetCode::IOFAILED : RetCode::OK;
 }
 
 RetCode WavFile::status() const noexcept
 {
     if (!file_)
-        return ErrorCode::NotReady;
-    return std::ferror(file_) ? RetCode{ErrorCode::IoFailed} : RetCode{};
+        return RetCode::ESTATE;
+    return std::ferror(file_) ? RetCode::IOFAILED : RetCode::OK;
 }
 
 RetCode WavFile::seek(std::size_t frame) noexcept
 {
     if (!file_)
-        return ErrorCode::NotReady;
+        return RetCode::ESTATE;
     if (frame > frame_count_)
-        return ErrorCode::InvalidArg;
+        return RetCode::EPARAM;
     // Allow readers to retry while preserving any write error for close().
     if (!writing_)
         std::clearerr(file_);
     if (!seek_bytes(file_, data_offset_ + frame * file_frame_bytes_, SEEK_SET))
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     position_ = frame;
     return {};
 }
@@ -7223,9 +6742,9 @@ RetCode WavFile::seek(std::size_t frame) noexcept
 Result<std::size_t> WavFile::read(OBBlock output) noexcept
 {
     if (!file_ || writing_)
-        return ErrorCode::NotReady;
+        return RetCode::ESTATE;
     if (output.spec() != spec_)
-        return ErrorCode::FormatMismatch;
+        return RetCode::INVFMT;
     const auto frames = std::min(output.frames(), frame_count_ - position_);
     if (!frames)
         return frames;
@@ -7234,7 +6753,7 @@ Result<std::size_t> WavFile::read(OBBlock output) noexcept
     if (file_frame_bytes_ == spec_.channels * sample_bytes(spec_.format))
     {
         if (!read_bytes(file_, dst, frames * file_frame_bytes_))
-            return ErrorCode::IoFailed;
+            return RetCode::IOFAILED;
     }
     else
     {
@@ -7246,7 +6765,7 @@ Result<std::size_t> WavFile::read(OBBlock output) noexcept
         {
             const auto count = std::min(samples, scratch.size() / sample_width);
             if (!read_bytes(file_, scratch.data(), count * sample_width))
-                return ErrorCode::IoFailed;
+                return RetCode::IOFAILED;
             convert_to_f32le(scratch.data(), sample_width, count, dst);
             samples -= count;
             dst += count * sizeof(float);
@@ -7259,19 +6778,19 @@ Result<std::size_t> WavFile::read(OBBlock output) noexcept
 RetCode WavFile::write(IBBlock input) noexcept
 {
     if (!writing_)
-        return ErrorCode::NotReady;
+        return RetCode::ESTATE;
     if (input.spec() != spec_)
-        return ErrorCode::FormatMismatch;
+        return RetCode::INVFMT;
     if (std::ferror(file_))
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     if (input.frames() > write_limit_ - position_)
-        return ErrorCode::TooLarge;
+        return RetCode::TOOLARGE;
     if (!input.frames())
         return {};
 
     if (std::fwrite(input.byte_view().data(), file_frame_bytes_, input.frames(), file_) != input.frames() ||
         std::ferror(file_))
-        return ErrorCode::IoFailed;
+        return RetCode::IOFAILED;
     position_ += input.frames();
     frame_count_ = std::max(frame_count_, position_);
     return {};
@@ -7304,14 +6823,14 @@ class WavFile
 
     /// @brief Open a WAV file at frame zero. Invalid input leaves the current reader usable.
     RetCode open_read(const std::string &path) noexcept;
-    /// @brief Open a file for writing. Exclusive returns Busy for an existing path.
+    /// @brief Open a file for writing. Exclusive returns RetCode::BUSY for an existing path.
     /// @pre Close the current file before opening an output.
     RetCode open_write(const std::string &path, PortSpec spec, WriteMode mode) noexcept;
     /// @brief Close the file and finalize the header when writing.
     RetCode close() noexcept;
     /// @brief Flush buffered output to the operating system and report any write error.
     RetCode flush() noexcept;
-    /// @brief Report an I/O error or NotReady if there is no open file.
+    /// @brief Report an I/O error or RetCode::ESTATE if there is no open file.
     RetCode status() const noexcept;
     /// @brief Report whether the sample format is supported for RIFF/WAVE output.
     static bool supports_write_format(SampleFormat format) noexcept;

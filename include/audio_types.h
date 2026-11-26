@@ -39,7 +39,7 @@ class RetCode
         ETYPE,        ///< Node has a different type
         ESTATE,       ///< Object is not prepared, committed, or in a valid state
         BUSY,         ///< Resource busy or control call from engine clock thread
-        EINPUTBUSY,   ///< Destination input port already has a source
+        INPUTBUSY,    ///< Destination input port already has a source
         ENODE,        ///< Node does not belong to this engine or was removed
         ECONN,        ///< Connection does not exist
         IOFAILED,     ///< Device open, file, or underlying I/O failure
@@ -78,7 +78,7 @@ class RetCode
         case ETYPE:      return "Node has a different type";
         case ESTATE:     return "Object is not prepared, committed, or bound";
         case BUSY:       return "The current execution context or state prevents this operation";
-        case EINPUTBUSY: return "Input already has a source (use a mixer for multiple sources)";
+        case INPUTBUSY:  return "Input already has a source (use a mixer for multiple sources)";
         case ENODE:      return "Node does not belong to this engine or was removed";
         case ECONN:      return "Connection does not exist";
         case IOFAILED:   return "I/O operation failed";

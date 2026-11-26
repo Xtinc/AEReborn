@@ -204,7 +204,7 @@ class Engine::Graph
             throw Error(RetCode::INVFMT);
         auto &input = destination.inputs[input_index];
         if (input)
-            throw Error(input == from ? RetCode::DUPLICATE : RetCode::EINPUTBUSY);
+            throw Error(input == from ? RetCode::DUPLICATE : RetCode::INPUTBUSY);
         if (would_cycle(source.id, destination.entry->id))
             throw Error(RetCode::CYCLE);
         const ConnId id{next_identifier()};
