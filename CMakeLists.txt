@@ -9,6 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Threads REQUIRED)
 
 add_library(aereborn STATIC
+    core/command_queue.cpp
     core/engine.cpp
     core/resampler.cpp
     core/types.cpp
@@ -24,6 +25,8 @@ add_library(aereborn STATIC
     backend/wav_backend.cpp
     backend/wav_file.cpp
     diag/inspect.cpp
+    app/audio_center.cpp
+    app/graph_service.cpp
 )
 add_library(aereborn::aereborn ALIAS aereborn)
 

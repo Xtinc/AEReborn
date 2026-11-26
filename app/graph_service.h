@@ -1,0 +1,82 @@
+#ifndef AEREBORN_APP_GRAPH_SERVICE_H
+#define AEREBORN_APP_GRAPH_SERVICE_H
+
+#include "core/engine.h"
+#include <array>
+#include <chrono>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace aereborn
+{
+
+class ActiveBackend;
+class Backend;
+class CommandQueue;
+
+/// @brief Own the graph, its public handles, and its WAV backends on the control thread.
+class GraphService
+{
+  public:
+    GraphService(CommandQueue &commands, BlockPeriod period);
+    /// @brief Unbind backends and stop the engine on the control thread.
+    ~GraphService();
+
+    NodeId create_iwav(const std::string &path, int repeat, std::chrono::microseconds io_period);
+    NodeId create_owav(const std::string &path, PortSpec spec, std::chrono::seconds segment_duration,
+                       std::chrono::microseconds io_period);
+    NodeId create_mixer(BandWidth bandwidth, std::size_t channels, std::size_t inputs);
+    NodeId create_matrix(BandWidth bandwidth, std::size_t channels, float gain);
+    NodeId create_matrix(BandWidth bandwidth, std::size_t input_channels, std::size_t output_channels,
+                         View<const float> coefficients, float gain);
+
+    void connect(NodeId from, NodeId to);
+    void disconnect(NodeId from, NodeId to);
+    void disconnect(NodeId to);
+    void remove(NodeId node);
+
+    void commit();
+    void start();
+    void stop() noexcept;
+
+    void set_paused(NodeId node, bool paused);
+    void set_gain(NodeId matrix, float gain);
+    void set_muted(NodeId mixer_port, bool muted);
+    void set_high_priority(NodeId mixer_port, bool high);
+
+    std::string dump_text() const;
+    std::string dump_dot() const;
+
+  private:
+    struct NodeRecord
+    {
+        std::unique_ptr<Backend> backend;
+        bool started_in_plan = false; // Remains true through natural EOS until the node leaves the plan or stops.
+    };
+    struct LogicalLink
+    {
+        NodeId from;
+        std::array<NodeId, 2> bridges{};
+        ConnId direct{};
+    };
+
+    std::map<NodeId, NodeRecord>::iterator add_node(std::unique_ptr<Node> node);
+    template <class Endpoint>
+    NodeId add_endpoint(std::unique_ptr<Endpoint> endpoint, std::unique_ptr<ActiveBackend> backend);
+    std::map<NodeId, NodeRecord>::iterator find_node(NodeId node);
+    PortSpec port_spec(NodeId port, bool output);
+    void disconnect_input(NodeId to, const NodeId *from);
+    void remove_bridges(const LogicalLink &link) noexcept;
+    void sync_backends();
+    std::vector<const Backend *> backends() const;
+
+    CommandQueue &commands_;
+    Engine engine_;
+    std::map<NodeId, NodeRecord> nodes_;
+    std::map<NodeId, LogicalLink> links_; // Keyed by destination input port.
+};
+
+} // namespace aereborn
+
+#endif // AEREBORN_APP_GRAPH_SERVICE_H

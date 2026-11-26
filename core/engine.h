@@ -164,6 +164,10 @@ class Engine
     /// @note Use on the serialized control side until the next plan publication or destruction.
     View<const NodeId> plan_nodes() const;
 
+    /// @brief Borrow the committed node at the given position in plan_nodes().
+    /// @pre The index is less than plan_nodes().size().
+    const Node &plan_node_at(std::size_t index) const;
+
     /// @brief Borrow committed connections, with the same lifetime as plan_nodes().
     View<const Connection> plan_connections() const;
 

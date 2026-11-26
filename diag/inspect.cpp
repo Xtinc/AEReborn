@@ -157,28 +157,50 @@ void write_node_details(std::ostream &out, const Node &node, const MixerFlags &m
     }
 }
 
-void write_backend(std::ostream &out, const Backend &backend, RetCode error)
+struct BackendStatus
 {
-    out << backend.type_name();
+    const char *name;
+    PortSpec device;
+    std::size_t max_frames;
+    ActiveBackend::State state;
+    bool active, async, fir;
+    float drift;
+    RetCode error;
+#if WINDOWS_OS_ENVIRONMENT
+    WasapiBackend::Failure failure{};
+#endif
+};
+
+BackendStatus read_backend(const Backend &backend)
+{
     const auto *active = dynamic_cast<const ActiveBackend *>(&backend);
     const auto async = active && active->is_async();
-    out << " (" << (async ? "async" : "sync") << ") state=";
-    out << (active ? state_name(active->state()) : (backend.running() ? "Running" : "Stopped"));
-    out << " dev=";
-    write_spec(out, backend.device_spec());
-    out << " max=" << backend.device_max_frames() << " fir=" << backend.uses_resampler();
-    if (async)
-        out << " drift=" << std::fixed << std::setprecision(1) << std::showpos << active->drift_ppm()
-            << std::noshowpos << "ppm";
-    out << " err=" << (error ? "OK" : error.what());
+    using State = ActiveBackend::State;
+    const auto state = active ? active->state() : (backend.running() ? State::Running : State::Stopped);
+    BackendStatus status{backend.type_name(), backend.device_spec(), backend.device_max_frames(), state,
+                         active != nullptr, async, backend.uses_resampler(), async ? active->drift_ppm() : 0.0f,
+                         backend.last_error()};
 #if WINDOWS_OS_ENVIRONMENT
     if (const auto *wasapi = dynamic_cast<const WasapiBackend *>(&backend))
-    {
-        const auto failure = wasapi->last_failure();
-        if (failure.operation)
-            out << " (" << failure.operation << " HRESULT=0x" << std::hex
-                << static_cast<std::uint32_t>(failure.hresult) << std::dec << ')';
-    }
+        status.failure = wasapi->last_failure();
+#endif
+    return status;
+}
+
+void write_backend(std::ostream &out, const BackendStatus &backend)
+{
+    out << backend.name << " (" << (backend.async ? "async" : "sync") << ") state=" << state_name(backend.state);
+    out << " dev=";
+    write_spec(out, backend.device);
+    out << " max=" << backend.max_frames << " fir=" << backend.fir;
+    if (backend.async)
+        out << " drift=" << std::fixed << std::setprecision(1) << std::showpos << backend.drift
+            << std::noshowpos << "ppm";
+    out << " err=" << (backend.error ? "OK" : backend.error.what());
+#if WINDOWS_OS_ENVIRONMENT
+    if (backend.failure.operation)
+        out << " (" << backend.failure.operation << " HRESULT=0x" << std::hex
+            << static_cast<std::uint32_t>(backend.failure.hresult) << std::dec << ')';
 #endif
 }
 
@@ -521,16 +543,12 @@ void write_dot_node(std::ostream &out, NodeId id, const Node &node, const DotNod
     end_card(out, details.str());
 }
 
-const char *write_dot_backend(std::ostream &out, const Backend &backend, RetCode error, bool detached)
+const char *write_dot_backend(std::ostream &out, const BackendStatus &backend, bool detached)
 {
-    const auto *active = dynamic_cast<const ActiveBackend *>(&backend);
-    const auto async = active && active->is_async();
-    const auto fir = backend.uses_resampler();
-    const auto state = active ? active->state() : (backend.running() ? ActiveBackend::State::Running
-                                                                    : ActiveBackend::State::Stopped);
+    const auto error = backend.error;
     const char *status = "STOP";
     auto colors = &inactive_colors;
-    switch (state)
+    switch (backend.state)
     {
     case ActiveBackend::State::Running:
         status = "RUN";
@@ -549,31 +567,31 @@ const char *write_dot_backend(std::ostream &out, const Backend &backend, RetCode
     }
     if (!error)
         colors = &error_colors;
-    begin_card(out, detached && error ? inactive_colors : *colors, backend.type_name());
+    begin_card(out, detached && error ? inactive_colors : *colors, backend.name);
     const auto badge = error ? std::string(status) : std::string("ERR: ") + error_code_name(error.code());
     write_badge(out, badge.c_str(), *colors);
     out << "</TD></TR><HR/><TR><TD ALIGN=\"LEFT\">";
-    const auto device = backend.device_spec();
+    const auto device = backend.device;
     if (device.channels)
     {
         write_short_spec(out, device);
-        out << " (max " << backend.device_max_frames() << "f)";
+        out << " (max " << backend.max_frames << "f)";
     }
     else
         out << "unbound";
-    out << "<BR ALIGN=\"LEFT\"/>" << (active ? (async ? "async" : "sync") : "passive");
-    if (fir)
+    out << "<BR ALIGN=\"LEFT\"/>" << (backend.active ? (backend.async ? "async" : "sync") : "passive");
+    if (backend.fir)
         out << " | FIR";
-    if (async)
-        out << " | drift " << std::fixed << std::setprecision(1) << std::showpos << active->drift_ppm()
+    if (backend.async)
+        out << " | drift " << std::fixed << std::setprecision(1) << std::showpos << backend.drift
             << std::noshowpos << " ppm";
     out << "</TD></TR>";
 
     std::ostringstream details;
     details.imbue(std::locale::classic());
-    write_backend(details, backend, error);
+    write_backend(details, backend);
     end_card(out, details.str());
-    return async ? "ASRC" : (fir ? "FIR" : "PCM");
+    return backend.async ? "ASRC" : (backend.fir ? "FIR" : "PCM");
 }
 
 void write_dot_engine(std::ostream &out, const Engine &engine)
@@ -601,10 +619,6 @@ void write_dot_engine(std::ostream &out, const Engine &engine)
     out << "</TR></TABLE>";
 }
 
-PortSpec connection_spec(const Engine &engine, const Connection &connection)
-{
-    return engine.plan_node(connection.from.base())->outputs()[connection.from.port()];
-}
 } // namespace
 
 std::string dump_text(const Engine &engine, View<const Backend *const> backends)
@@ -618,19 +632,23 @@ std::string dump_text(const Engine &engine, View<const Backend *const> backends)
         out << (i ? " -> [" : " [") << nodes[i].node() << ']';
 
     BackendLinks links(backends);
+    std::map<NodeId, View<const PortSpec>> outputs;
     out << "\n\nNodes:\n";
-    for (const auto id : nodes)
+    for (std::size_t i = 0; i < nodes.size(); ++i)
     {
-        const auto &node = *engine.plan_node(id);
+        const auto id = nodes[i];
+        const auto &node = engine.plan_node_at(i);
+        const auto ports = node.outputs();
+        outputs.emplace(id, ports);
         out << "  [" << id.node() << "] " << std::left << std::setw(9) << node.type_name() << std::right;
         write_ports(out, "in", node.inputs());
-        write_ports(out, "out", node.outputs());
+        write_ports(out, "out", ports);
         write_node_details(out, node, read_mixer_flags(node));
         out << '\n';
         if (const auto *backend = links.take(node))
         {
             out << "      \xE2\x94\x94\xE2\x94\x80 ";
-            write_backend(out, *backend, backend->last_error());
+            write_backend(out, read_backend(*backend));
             out << '\n';
         }
     }
@@ -640,7 +658,7 @@ std::string dump_text(const Engine &engine, View<const Backend *const> backends)
     {
         out << "  #" << connection.id.value << ": [" << connection.from.node() << "]:" << connection.from.port()
             << " -> [" << connection.to.node() << "]:" << connection.to.port() << " (";
-        write_spec(out, connection_spec(engine, connection));
+        write_spec(out, outputs.at(connection.from.base())[connection.from.port()]);
         out << ")\n";
     }
 
@@ -654,7 +672,7 @@ std::string dump_text(const Engine &engine, View<const Backend *const> backends)
                 heading_written = true;
             }
             out << "  ";
-            write_backend(out, *backend, backend->last_error());
+            write_backend(out, read_backend(*backend));
             out << '\n';
         }
     return out.str();
@@ -684,9 +702,11 @@ std::string dump_dot(const Engine &engine, View<const Backend *const> backends)
 
     BackendLinks links(backends);
     std::map<NodeId, DotNode> nodes;
-    for (const auto id : engine.plan_nodes())
+    const auto plan = engine.plan_nodes();
+    for (std::size_t i = 0; i < plan.size(); ++i)
     {
-        const auto &node = *engine.plan_node(id);
+        const auto id = plan[i];
+        const auto &node = engine.plan_node_at(i);
         const auto mixer = read_mixer_flags(node);
         const DotNode info{node.outputs(), mixer,
                            node.inputs().size() > 1 || node.outputs().size() > 1 || mixer.high || mixer.muted};
@@ -695,21 +715,21 @@ std::string dump_dot(const Engine &engine, View<const Backend *const> backends)
 
         if (const auto *backend = links.take(node))
         {
-            const auto error = backend->last_error();
+            const auto status = read_backend(*backend);
             out << "  b" << id.node();
-            const auto *mode = write_dot_backend(out, *backend, error, false);
+            const auto *mode = write_dot_backend(out, status, false);
             // A backend binds to a Capture source or a Playback sink.
             if (node.inputs().empty())
                 out << "  b" << id.node() << ":e -> n" << id.node() << ":w";
             else
                 out << "  n" << id.node() << ":e -> b" << id.node() << ":w";
-            out << " [style=dashed, color=\"" << (error ? backend_colors.border : error_colors.border)
+            out << " [style=dashed, color=\"" << (status.error ? backend_colors.border : error_colors.border)
                 << "\", label=\"" << mode << "\", tooltip=\"";
-            write_dot_escaped(out, backend->type_name());
+            write_dot_escaped(out, status.name);
             out << " | graph ";
             write_spec(out, backend->logical_spec());
             out << " | device ";
-            write_spec(out, backend->device_spec());
+            write_spec(out, status.device);
             out << "\"];\n";
         }
     }
@@ -760,7 +780,7 @@ std::string dump_dot(const Engine &engine, View<const Backend *const> backends)
                 cluster_open = true;
             }
             out << "    detached" << i;
-            write_dot_backend(out, *backend, backend->last_error(), true);
+            write_dot_backend(out, read_backend(*backend), true);
         }
     }
     if (cluster_open)

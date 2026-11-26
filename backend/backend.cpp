@@ -334,9 +334,9 @@ template <class Endpoint> void ActiveBackend::bind_endpoint(Endpoint &endpoint)
     const auto width = sample_bytes(device.format);
     if (frames > device_bytes_.max_size() / device.channels / width)
         throw Error(RetCode::TOOLARGE);
-    // Allocate the byte buffer last. A failed resize leaves it empty.
-    device_bytes_.resize(frames * device.channels * width);
-
+    std::vector<std::uint8_t> device_bytes(frames * device.channels * width);
+    throw_if_error(on_bind_ready(device));
+    device_bytes_.swap(device_bytes);
     complete_binding(device);
     last_error_.store({}, std::memory_order_release);
     rollback.dismiss();

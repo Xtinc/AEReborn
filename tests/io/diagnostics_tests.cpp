@@ -27,6 +27,17 @@ class Observer final : public NodeT<1, 0>
     void process(const ProcessContext &) noexcept override {}
 };
 
+class SampledBackend final : public Backend
+{
+  public:
+    void start() override {}
+    void stop() noexcept override {}
+    void unbind() noexcept override {}
+    bool running() const noexcept override { return ++reads == 1; }
+
+    mutable unsigned reads = 0;
+};
+
 void diagnostic_reports()
 {
     Engine engine(period);
@@ -34,6 +45,12 @@ void diagnostic_reports()
               dump_text(engine).find("Engine: Unprepared | period=5ms | tick=0 | plan_gen=0") == 0 &&
               dump_dot(engine).find(">UNPREPARED<") != std::string::npos,
           "Diagnostics work before the initial commit");
+    SampledBackend sampled;
+    const Backend *backend = &sampled;
+    const auto sampled_graph = dump_dot(engine, {&backend, 1});
+    check(sampled.reads == 1 && sampled_graph.find(">RUN<") != std::string::npos &&
+              sampled_graph.find("state=Running") != std::string::npos,
+          "A backend card and its tooltip use the same state sample");
     const PortSpec stereo_pcm(rate, 2, SampleFormat::F32LE);
     const PortSpec converted(BandWidth::Wide, 1, SampleFormat::S16LE);
     const auto capture = engine.emplace_node<Capture>(rate, 2, 5ms);

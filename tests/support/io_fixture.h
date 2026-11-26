@@ -4,26 +4,14 @@
 #include "audio_fixture.h"
 #include "backend/backend.h"
 #include "backend/wav_file.h"
-#include <chrono>
-#include <cstdio>
+#include <cstring>
 #include <string>
-#include <thread>
+#include <vector>
 
 namespace aereborn
 {
 namespace test
 {
-
-template <class Ready> void wait_for(Ready ready, const char *message)
-{
-    using namespace std::chrono;
-    const auto deadline = steady_clock::now() + seconds(3);
-    while (!ready())
-    {
-        check(steady_clock::now() < deadline, message);
-        std::this_thread::sleep_for(milliseconds(1));
-    }
-}
 
 // Observe the same queue metrics used by the backend while the test clock is parked.
 class QueueState : private Backend
@@ -45,33 +33,6 @@ inline void wait_for_playback(const Backend &sink, std::size_t frames)
     wait_for([&] { return QueueState::queued(sink) + frames <= 2 * QueueState::target(sink); },
              "Playback has room for the next graph block");
 }
-
-class TempWave
-{
-  public:
-    explicit TempWave(const char *name)
-        : stem_(std::string("aereborn-") + name + "-" +
-                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()))
-    {
-    }
-    ~TempWave()
-    {
-        for (const auto &path : paths_)
-            std::remove(path.c_str());
-    }
-    TempWave(const TempWave &) = delete;
-    TempWave &operator=(const TempWave &) = delete;
-
-    std::string path(const char *suffix = ".wav")
-    {
-        paths_.push_back(stem_ + suffix);
-        return paths_.back();
-    }
-
-  private:
-    const std::string stem_;
-    std::vector<std::string> paths_;
-};
 
 struct Pcm
 {

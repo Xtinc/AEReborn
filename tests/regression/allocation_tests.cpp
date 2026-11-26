@@ -3,10 +3,14 @@
 #include "backend/null_backend.h"
 #include "backend/pull_sink.h"
 #include "backend/push_source.h"
+#include "core/command_queue.h"
 #include "plugins/convert.h"
 #include "plugins/matrix.h"
 #include "plugins/mixer.h"
+#include "app/graph_service.h"
 #include <cstdlib>
+#include <future>
+#include <memory>
 #include <new>
 
 #if defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL != 0
@@ -72,6 +76,25 @@ template <class Operation> bool allocation_fails(int countdown, Operation operat
     }
 }
 
+void command_queue_timer_allocation_rollback()
+{
+    std::promise<void> fired;
+    auto completed = fired.get_future();
+    bool released = false;
+    CommandQueue queue;
+    const auto release = [&]() noexcept {
+        queue.cancel(1);
+        released = true;
+    };
+    auto guard = std::make_shared<ScopeExit<decltype(release)>>(release);
+    CommandQueue::Task task = [guard = std::move(guard)] { (void)guard; };
+    check(allocation_fails(0, [&] { queue.post_after(1h, std::move(task)); }),
+          "Growing the timer list propagates the injected allocation failure");
+    check(released, "The rejected task releases its capture outside the queue lock");
+    check(queue.post_after(0ms, [&] { fired.set_value(); }) == 1, "A failed registration leaves the first ID available");
+    check(completed.wait_for(3s) == std::future_status::ready, "The retried timer runs");
+}
+
 void commit_allocation_rollback()
 {
     const PortSpec output(BandWidth::Wide, 1, SampleFormat::F32P);
@@ -108,6 +131,113 @@ void commit_allocation_rollback()
         }
     }
     check(false, "All graph preparation allocations were visited");
+}
+
+void graph_service_allocation_rollback()
+{
+    TempWave files("graph-rollback");
+    const auto path = files.path();
+    CommandQueue queue;
+    queue.sync([&] {
+        GraphService graph(queue, period);
+        NodeId sink;
+        const PortSpec target(BandWidth::CDQuality, 1, SampleFormat::S16LE);
+        for (int at = 0; at < 128; ++at)
+        {
+            if (!allocation_fails(at, [&] { sink = graph.create_owav(path, target, 0s, 10ms); }))
+                break;
+            WavFile file;
+            check(file.open_read(path) == RetCode::IOFAILED, "Allocation failure must precede exclusive file creation");
+        }
+        check(static_cast<bool>(sink), "The same WAV path remains available for retry");
+
+        const auto source = graph.create_matrix(BandWidth::Full, 2, 1.0f);
+        graph.commit();
+        bool rolled_back_partial_edit = false;
+        for (int at = 0; at < 128; ++at)
+        {
+            const auto failed = allocation_fails(at, [&] { graph.connect(source, sink); });
+            const auto draft = graph.dump_text();
+            if (failed)
+                rolled_back_partial_edit |= draft.find("dirty=true") != std::string::npos;
+            graph.commit();
+            const auto plan = graph.dump_text();
+            const auto matrix = plan.find("] Matrix") != std::string::npos;
+            const auto converter = plan.find("] Convert") != std::string::npos;
+            if (failed)
+            {
+                check(!matrix && !converter, "A failed bridge never becomes part of a plan");
+                expect_error(RetCode::ECONN, [&] { graph.disconnect(sink); });
+            }
+            else
+            {
+                check(matrix && converter && rolled_back_partial_edit, "A partially applied bridge can be retried");
+                graph.disconnect(sink);
+                graph.commit();
+                check(graph.dump_text().find("] Convert") == std::string::npos, "Disconnect removes the bridge");
+                return;
+            }
+        }
+        check(false, "The bridge eventually connects after the allocation failures");
+    });
+}
+
+void graph_service_live_commit_failure()
+{
+    CommandQueue queue;
+    bool preparation_failed = false;
+    int backend_start_failures = 0;
+    for (int at = 0; at < 128; ++at)
+    {
+        TempWave files("live-commit");
+        const auto first_path = files.path("-first.wav");
+        const auto second_path = files.path("-second.wav");
+        const auto third_path = files.path("-third.wav");
+        const auto failed = queue.sync([&] {
+            GraphService graph(queue, period);
+            graph.create_owav(first_path, pcm, 0s, 10ms);
+            const auto second = graph.create_owav(second_path, pcm, 0s, 10ms);
+            const auto third = graph.create_owav(third_path, pcm, 0s, 10ms);
+            graph.set_paused(second, true);
+            graph.set_paused(third, true);
+            graph.start();
+            graph.set_paused(second, false);
+            graph.set_paused(third, false);
+
+            if (!allocation_fails(at, [&] { graph.commit(); }))
+                return false;
+            const auto after = graph.dump_text();
+            if (after.find("dirty=true") != std::string::npos)
+            {
+                preparation_failed = true;
+                check(after.find("Engine: Running") != std::string::npos, "Preparation failure keeps the old plan running");
+                graph.commit();
+            }
+            else
+            {
+                ++backend_start_failures;
+                check(after.find("Engine: Ready") != std::string::npos &&
+                          after.find("[" + std::to_string(third.node()) + "] Playback") != std::string::npos &&
+                          after.find("state=Running") == std::string::npos,
+                      "Failure after publication stops the clock and all backends and keeps the new plan");
+                graph.start();
+            }
+            const auto recovered = graph.dump_text();
+            const auto first_running = recovered.find("state=Running");
+            const auto second_running = recovered.find("state=Running", first_running + 1);
+            check(first_running != std::string::npos && second_running != std::string::npos &&
+                      recovered.find("state=Running", second_running + 1) != std::string::npos,
+                  "Retry brings up every backend");
+            return true;
+        });
+        if (!failed)
+        {
+            check(preparation_failed && backend_start_failures >= 2,
+                  "Visit preparation and both new backend starts during a live commit");
+            return;
+        }
+    }
+    check(false, "Live graph submission eventually succeeds");
 }
 
 template <class Driver, class Endpoint>
@@ -274,6 +404,10 @@ int main(int argc, char **argv)
 {
     return aereborn::test::run_tests(argc, argv, {{"commit_allocation_rollback", commit_allocation_rollback},
                                                 {"backend_allocation_rollback", backend_allocation_rollback},
+                                                {"graph_service_allocation_rollback", graph_service_allocation_rollback},
+                                                {"graph_service_live_commit_failure", graph_service_live_commit_failure},
+                                                {"command_queue_timer_allocation_rollback",
+                                                 command_queue_timer_allocation_rollback},
                                                 {"render_and_passive_io_without_heap", render_and_passive_io_without_heap},
                                                 {"active_workers_without_heap", active_workers_without_heap}});
 }

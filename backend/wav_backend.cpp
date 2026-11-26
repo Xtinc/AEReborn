@@ -23,14 +23,23 @@ WavCapture::WavCapture(std::string path, Repeat repeats)
 {
 }
 
+Result<PortSpec> WavCapture::probe() noexcept
+{
+    const auto status = file_.status();
+    const auto opened = status == RetCode::ESTATE ? file_.open_read(path_) : status;
+    if (!opened)
+        return opened;
+    return file_.spec();
+}
+
 Result<PortSpec> WavCapture::on_open(bool capture, PortSpec, std::chrono::microseconds period)
 {
     if (!capture)
         return RetCode::EPARAM;
-    const auto opened = file_.open_read(path_);
-    if (!opened)
-        return opened;
-    const auto spec = file_.spec();
+    const auto input = probe();
+    if (!input)
+        return input.ret_code();
+    const auto spec = input.value();
     const auto count = frames_in_period(spec.bandwidth, period);
     if (!count)
         return count.ret_code();
@@ -78,8 +87,10 @@ WavPlayback::WavPlayback(std::string path, SampleFormat format)
 {
 }
 
-WavPlayback::WavPlayback(std::string path, SampleFormat format, std::chrono::seconds segment_duration)
-    : ActiveBackend(false), path_(std::move(path)), format_(format), segment_duration_(segment_duration)
+WavPlayback::WavPlayback(std::string path, SampleFormat format, std::chrono::seconds segment_duration,
+                         WavFile::WriteMode write_mode)
+    : ActiveBackend(false), path_(std::move(path)), format_(format), segment_duration_(segment_duration),
+      write_mode_(write_mode)
 {
     if (segment_duration_.count() < 0)
         throw Error(RetCode::EPARAM);
@@ -122,11 +133,14 @@ Result<PortSpec> WavPlayback::on_open(bool capture, PortSpec logical, std::chron
         segment_path_.insert(segment_number_offset_, segment_number_width, '0');
         segment_index_ = 0;
     }
-    const auto opened = open_file(logical);
-    if (!opened)
-        return opened;
     set_device_max_frames(count.value());
     return logical;
+}
+
+RetCode WavPlayback::on_bind_ready(PortSpec spec) noexcept
+{
+    // Create the file only after allocation succeeds so the same path is available for a retry.
+    return open_file(spec);
 }
 
 RetCode WavPlayback::on_start() noexcept
@@ -145,7 +159,7 @@ void WavPlayback::on_stop() noexcept
 RetCode WavPlayback::open_file(PortSpec spec) noexcept
 {
     if (!segment_frames_)
-        return file_.open_write(path_, spec, WavFile::WriteMode::Truncate);
+        return file_.open_write(path_, spec, write_mode_);
     for (;;)
     {
         if (segment_index_ == std::numeric_limits<std::uint32_t>::max())

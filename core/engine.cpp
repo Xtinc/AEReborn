@@ -1,6 +1,7 @@
 #include "engine.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <limits>
@@ -457,6 +458,12 @@ class Engine::Runner
         return {current_->connections.data(), current_->connections.size()};
     }
 
+    const Node &node_at(std::size_t index) const noexcept
+    {
+        assert(current_ && index < current_->owners.size());
+        return *current_->owners[index]->node;
+    }
+
     const Node *node(NodeId id) const
     {
         if (current_)
@@ -802,6 +809,12 @@ View<const NodeId> Engine::plan_nodes() const
 {
     require_control_thread();
     return runner_->nodes();
+}
+
+const Node &Engine::plan_node_at(std::size_t index) const
+{
+    require_control_thread();
+    return runner_->node_at(index);
 }
 
 View<const Connection> Engine::plan_connections() const

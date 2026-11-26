@@ -1,0 +1,302 @@
+#include "audio_interface.h"
+#include "test_common.h"
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <fstream>
+#include <future>
+#include <iterator>
+#include <stdexcept>
+
+namespace
+{
+
+using namespace aereborn;
+using namespace aereborn::test;
+using namespace std::chrono_literals;
+using Bytes = std::vector<unsigned char>;
+
+void expect(RetCode actual, RetCode expected = RetCode::OK)
+{
+    if (actual != expected)
+        throw std::runtime_error(std::string("Expected ") + expected.what() + ", got " + actual.what());
+}
+
+Bytes read_file(const std::string &path)
+{
+    std::ifstream input(path, std::ios::binary);
+    check(static_cast<bool>(input), "Open the WAV file");
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+void write_file(const std::string &path, const Bytes &data)
+{
+    std::ofstream file(path, std::ios::binary);
+    file.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
+    file.close();
+    check(static_cast<bool>(file), "Write the WAV fixture");
+}
+
+void write_constant_stereo(const std::string &path)
+{
+    Bytes data{
+        'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ',
+        16, 0, 0, 0, 1, 0, 2, 0, 0x80, 0xbb, 0, 0, 0, 0xee, 2, 0, 4, 0, 16, 0,
+        'd', 'a', 't', 'a', 0, 0, 0, 0,
+    };
+    constexpr auto payload = 480 * 4;
+    const auto store_size = [&](std::size_t offset, std::uint32_t size) {
+        for (std::size_t i = 0; i < 4; ++i)
+            data[offset + i] = static_cast<unsigned char>(size >> (8 * i));
+    };
+    store_size(4, payload + 36);
+    store_size(40, payload);
+    data.resize(44 + payload);
+    for (std::size_t high_byte = 45; high_byte < data.size(); high_byte += 2)
+        data[high_byte] = 0x20; // Signed 16-bit sample for 0.25.
+    write_file(path, data);
+}
+
+std::uint32_t little_endian(const Bytes &data, std::size_t offset, std::size_t width)
+{
+    std::uint32_t value = 0;
+    for (std::size_t i = 0; i < width; ++i)
+        value |= static_cast<std::uint32_t>(data.at(offset + i)) << (8 * i);
+    return value;
+}
+
+Bytes read_s16(const std::string &path, std::uint32_t rate, std::size_t channels)
+{
+    const auto data = read_file(path);
+    check(data.size() >= 44 && std::string(data.begin(), data.begin() + 4) == "RIFF" &&
+              std::string(data.begin() + 8, data.begin() + 12) == "WAVE" &&
+              std::string(data.begin() + 36, data.begin() + 40) == "data",
+          "Expect a PCM RIFF/WAVE header");
+    check(little_endian(data, 20, 2) == 1 && little_endian(data, 22, 2) == channels &&
+              little_endian(data, 24, 4) == rate && little_endian(data, 34, 2) == 16,
+          "Expect the configured WAV specification");
+    check(little_endian(data, 4, 4) == data.size() - 8 && little_endian(data, 40, 4) == data.size() - 44 &&
+              (data.size() - 44) % (channels * 2) == 0,
+          "Expect finalized RIFF and data lengths");
+    return {data.begin() + 44, data.end()};
+}
+
+bool has_signal(const Bytes &data)
+{
+    return std::any_of(data.begin(), data.end(), [](unsigned char byte) { return byte != 0; });
+}
+
+std::size_t find_steady_level(const Bytes &data, std::size_t start, std::uint16_t level)
+{
+    std::size_t matching = 0;
+    for (auto sample = start; sample < data.size(); sample += 2)
+    {
+        matching = little_endian(data, sample, 2) == level ? matching + 1 : 0;
+        if (matching == 2 * 480 * 2)
+            return sample + 2;
+    }
+    throw std::runtime_error("Expected two stereo blocks at level " + std::to_string(level));
+}
+
+std::uint64_t tick(const AudioCenter &audio)
+{
+    const auto text = audio.dump_text();
+    const auto start = text.find(" | tick=");
+    check(start != std::string::npos, "Expect the current render tick in diagnostics");
+    return std::stoull(text.substr(start + 8));
+}
+
+void advance(const AudioCenter &audio, std::uint64_t blocks)
+{
+    const auto target = tick(audio) + blocks;
+    wait_for([&] { return tick(audio) >= target; }, "Wait for the expected render ticks", 4s);
+}
+
+void wav_routing_and_bridge()
+{
+    const std::string input = AEREBORN_TEST_DATA "/dukou_excerpt.wav";
+    TempWave files("audio-center-routing");
+    const auto stereo = files.path("-stereo.wav");
+    const auto mono = files.path("-mono.wav");
+    const auto upmixed = files.path("-upmixed.wav");
+    const PortSpec cd_mono{BandWidth::CDQuality, 1, SampleFormat::S16LE};
+    AudioCenter audio;
+    const auto source = audio.create_iwav(input);
+    const auto mixer = audio.create_mixer(BandWidth::Full, 2, 2);
+    const auto matrix = audio.create_matrix(BandWidth::Full, 2, 2, {1.0f, 0.0f, 0.0f, 1.0f});
+    const auto out_stereo = audio.create_owav(stereo);
+    const auto out_mono = audio.create_owav(mono, cd_mono);
+    check(source && mixer && matrix && out_stereo && out_mono, "Create all WAV routes");
+    expect(audio.connect(source, mixer[1]));
+    expect(audio.connect(mixer, matrix));
+    expect(audio.connect(matrix, out_stereo));
+    expect(audio.connect(matrix, out_mono));
+    expect(audio.start());
+    expect(audio.start(), RetCode::BUSY);
+
+    const auto text = audio.dump_text();
+    const auto bridge = text.rfind("] Matrix");
+    const auto converter = text.find("] Convert");
+    check(bridge != std::string::npos && converter != std::string::npos && bridge < converter,
+          "Downmix precedes resampling");
+    check(audio.dump_dot().find("digraph") != std::string::npos, "Expect DOT diagnostics");
+    wait_for([&] { return audio.dump_text().find("err=End of stream") != std::string::npos; },
+             "The finite input reaches EOS", 4s);
+    expect(audio.set_paused(out_stereo, true));
+    expect(audio.commit());
+    check(audio.dump_text().find("err=End of stream") != std::string::npos,
+          "A source still in the plan stays at EOS across a live commit");
+    advance(audio, 3); // Render the graph converter's tail after capture has drained.
+    expect(audio.stop());
+    expect(audio.remove(out_stereo));
+    expect(audio.remove(out_mono));
+    check(has_signal(read_s16(stereo, 48000, 2)), "Stereo branch contains audio");
+    check(has_signal(read_s16(mono, 44100, 1)), "Downmixed and resampled branch contains audio");
+
+    const auto mono_source = audio.create_iwav(mono);
+    const auto stereo_sink = audio.create_owav(upmixed);
+    check(mono_source && stereo_sink, "Create the reverse specification route");
+    expect(audio.connect(mono_source, stereo_sink));
+    expect(audio.start());
+    const auto reverse = audio.dump_text();
+    const auto upconvert = reverse.find("] Convert");
+    const auto upmix = reverse.find("] Matrix");
+    check(upconvert != std::string::npos && upmix != std::string::npos && upconvert < upmix,
+          "Mono resampling precedes channel duplication");
+    advance(audio, 6);
+    expect(audio.remove(stereo_sink));
+    const auto upmixed_pcm = read_s16(upmixed, 48000, 2);
+    check(has_signal(upmixed_pcm), "Upsampled branch contains audio");
+    for (std::size_t sample = 0; sample < upmixed_pcm.size(); sample += 4)
+        check(little_endian(upmixed_pcm, sample, 2) == little_endian(upmixed_pcm, sample + 2, 2),
+              "Upmix duplicates mono into both channels");
+}
+
+void live_control_and_cleanup()
+{
+    TempWave files("audio-center-live");
+    const auto input = files.path("-constant.wav");
+    const auto output = files.path("-live.wav");
+    const auto monitor = files.path("-monitor.wav");
+    write_constant_stereo(input);
+    AudioCenter audio;
+    const auto source = audio.create_iwav(input, -1);
+    const auto mix = audio.create_mixer(BandWidth::Full, 2, 2);
+    const auto gain = audio.create_matrix(BandWidth::Full, 2);
+    const auto other_rate = audio.create_matrix(BandWidth::CDQuality, 1);
+    const auto sink = audio.create_owav(output);
+    const auto monitor_sink = audio.create_owav(monitor);
+    check(source && mix && gain && other_rate && sink && monitor_sink, "Create the live graph");
+    expect(audio.connect(source, mix));
+    expect(audio.connect(source, mix[1]));
+    expect(audio.connect(mix, gain));
+    expect(audio.connect(gain, sink));
+    expect(audio.connect(gain, other_rate));
+    expect(audio.connect(other_rate, gain), RetCode::INPUTBUSY);
+    expect(audio.connect(gain, mix), RetCode::INPUTBUSY);
+    expect(audio.disconnect(source, mix));
+    expect(audio.connect(other_rate, mix), RetCode::CYCLE);
+    expect(audio.connect(source, mix));
+    expect(audio.connect(source, mix), RetCode::DUPLICATE);
+    expect(audio.disconnect({}, sink), RetCode::ENODE);
+    expect(audio.disconnect(gain[1], sink), RetCode::EPORT);
+    expect(audio.disconnect(gain, sink));
+    expect(audio.disconnect(sink), RetCode::ECONN);
+    expect(audio.connect(gain, sink));
+    expect(audio.connect(source, monitor_sink));
+    expect(audio.remove(mix[1]), RetCode::EPORT);
+    expect(audio.set_gain(mix, 0.5f), RetCode::ETYPE);
+    expect(audio.set_muted(mix[2], true), RetCode::EPORT);
+    expect(audio.start());
+    advance(audio, 8);
+    expect(audio.set_high_priority(mix[1], true));
+    advance(audio, 8);
+    expect(audio.set_gain(gain, 0.5f));
+    advance(audio, 8);
+    expect(audio.set_muted(mix, true));
+    expect(audio.set_muted(mix[1], true));
+    advance(audio, 8);
+    expect(audio.set_muted(mix[1], false));
+    advance(audio, 8);
+    check(audio.dump_dot().find("[HIGH]") != std::string::npos, "Report the live priority setting");
+    expect(audio.disconnect(sink));
+    expect(audio.commit());
+    advance(audio, 8);
+    expect(audio.set_paused(sink, true));
+    expect(audio.commit());
+    check(audio.dump_text().find("[" + std::to_string(sink.node()) + "] Playback") == std::string::npos,
+          "Pausing the recorder removes it from the running plan");
+    advance(audio, 5);
+    expect(audio.remove(sink));
+    const auto sound = read_s16(output, 48000, 2);
+    check(sound.size() >= 480 * 8 * 4 && has_signal(sound), "The recorder captures the routed signal");
+    auto cursor = find_steady_level(sound, 0, 16384);
+    cursor = find_steady_level(sound, cursor, 8192);
+    cursor = find_steady_level(sound, cursor, 4096);
+    cursor = find_steady_level(sound, cursor, 0);
+    find_steady_level(sound, cursor, 4096);
+    check(std::none_of(sound.end() - 480 * 4 * 4, sound.end(), [](unsigned char byte) { return byte != 0; }),
+          "Disconnect keeps recording silence through the final blocks");
+    expect(audio.remove(source)); // Unbind while the old plan still includes this endpoint.
+    expect(audio.commit());
+    expect(audio.remove(monitor_sink));
+    find_steady_level(read_s16(monitor, 48000, 2), 0, 8192);
+    check(!audio.create_iwav(output + ".missing"), "Missing input returns an empty handle");
+    expect(AudioCenter::last_error(), RetCode::IOFAILED);
+}
+
+void concurrency_and_teardown()
+{
+    const auto original = read_file(AEREBORN_TEST_DATA "/dukou_excerpt.wav");
+    TempWave files("audio-center-teardown");
+    const auto input = files.path("-existing.wav");
+    const auto output = files.path("-teardown.wav");
+    write_file(input, original);
+    {
+        AudioCenter audio;
+        const auto source = audio.create_iwav(input, -1);
+        check(!audio.create_owav(input), "Creating a WAV output must preserve the existing input path");
+        expect(AudioCenter::last_error(), RetCode::BUSY);
+        const auto matrix = audio.create_matrix(BandWidth::Full, 2);
+        const auto mixer = audio.create_mixer(BandWidth::Full, 2, 2);
+        const auto sink = audio.create_owav(output);
+        check(source && matrix && mixer && sink, "Create the teardown graph");
+        expect(audio.connect(source, matrix));
+        expect(audio.connect(matrix, mixer));
+        expect(audio.connect(mixer, sink));
+        expect(audio.start());
+        expect(audio.set_gain({}, 1.0f), RetCode::ENODE);
+        auto control = std::async(std::launch::async, [&] {
+            for (int i = 0; i < 10; ++i)
+            {
+                expect(audio.set_gain(matrix, 0.5f));
+                expect(audio.set_muted(mixer[1], i % 2 != 0));
+            }
+            expect(AudioCenter::last_error());
+        });
+        auto diagnostics = std::async(std::launch::async, [&] {
+            for (int i = 0; i < 10; ++i)
+            {
+                check(!audio.dump_text().empty(), "Concurrent diagnostics are available");
+                expect(audio.commit());
+            }
+            expect(audio.set_gain(mixer, 0.5f), RetCode::ETYPE);
+            expect(AudioCenter::last_error(), RetCode::ETYPE);
+        });
+        control.get();
+        diagnostics.get();
+        expect(AudioCenter::last_error(), RetCode::ENODE);
+        advance(audio, 8);
+    }
+    check(original == read_file(input), "Existing input is byte-for-byte unchanged");
+    check(has_signal(read_s16(output, 48000, 2)), "Destruction finalizes the active recording");
+}
+
+} // namespace
+
+int main(int argc, char **argv)
+{
+    return run_tests(argc, argv, {{"wav_routing_and_bridge", wav_routing_and_bridge},
+                                  {"live_control_and_cleanup", live_control_and_cleanup},
+                                  {"concurrency_and_teardown", concurrency_and_teardown}});
+}

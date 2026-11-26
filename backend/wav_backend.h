@@ -28,6 +28,11 @@ class WavCapture final : public ActiveBackend
     /// @brief Play once and then repeat the requested number of times.
     explicit WavCapture(std::string path, Repeat repeats);
     ~WavCapture() override { unbind(); }
+
+    /// @brief Open the input to obtain its PCM specification. The next bind reuses the reader.
+    /// @pre Call on the control side before binding.
+    Result<PortSpec> probe() noexcept;
+
     using ActiveBackend::bind;
     void bind(Playback &) = delete;
 
@@ -55,15 +60,18 @@ class WavPlayback final : public ActiveBackend
     /// @throws Error If the format is unsupported for WAV output.
     explicit WavPlayback(std::string path, SampleFormat format);
     /// @brief Record numbered segments of the given audio duration. Zero selects a single file.
+    /// @param write_mode Open mode for a single file.
     /// @note Numbered segments are created exclusively and existing numbers are skipped.
     /// @throws Error If the format is unsupported for WAV output or the duration is negative.
-    WavPlayback(std::string path, SampleFormat format, std::chrono::seconds segment_duration);
+    WavPlayback(std::string path, SampleFormat format, std::chrono::seconds segment_duration,
+                WavFile::WriteMode write_mode = WavFile::WriteMode::Truncate);
     ~WavPlayback() override { unbind(); }
     using ActiveBackend::bind;
     void bind(Capture &) = delete;
 
   private:
     Result<PortSpec> on_open(bool capture, PortSpec logical, std::chrono::microseconds period) override;
+    RetCode on_bind_ready(PortSpec spec) noexcept override;
     RetCode on_start() noexcept override;
     void on_stop() noexcept override;
     void on_close() noexcept override;
@@ -73,6 +81,7 @@ class WavPlayback final : public ActiveBackend
     std::string path_;
     const SampleFormat format_;
     const std::chrono::seconds segment_duration_;
+    const WavFile::WriteMode write_mode_;
     WavFile file_;
     std::string segment_path_;
     std::size_t segment_number_offset_ = 0;

@@ -203,6 +203,9 @@ class ActiveBackend : public Backend
     /// @note Runs on the control thread. Setup exceptions propagate after on_close() rolls back the open.
     virtual Result<PortSpec> on_open(bool capture, PortSpec logical, std::chrono::microseconds target_period) = 0;
 
+    /// @brief Finish opening the device after all binding buffers are allocated.
+    virtual RetCode on_bind_ready(PortSpec) noexcept { return {}; }
+
     /// @brief Start the stream and acquire thread-affine resources on the I/O worker.
     /// @note Synchronized with start(); on failure, roll back before returning the error.
     virtual RetCode on_start() noexcept { return {}; }

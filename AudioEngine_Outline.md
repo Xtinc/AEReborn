@@ -58,7 +58,7 @@ PCM 适配器和固定端口数量的自定义节点通常继承 `NodeT<I, O>`�
 
 ## 3. 引擎骨架
 
-`core/` 提供 Engine、Node、音频缓冲、PCM 编解码和 F32P 重采样器。`plugins/` 提供 Convert、Mixer、Matrix、Capture 和 Playback。两个端点负责经由 F32P 队列与绑定的 `Backend` 交接帧。`backend/` 的 `Backend` 统一管理设备、线程、转换工作区及漂移补偿。绑定 `Capture` 或 `Playback` 决定运行方向。依赖方向为 `backend → plugins → core`。`tests/support/` 提供缓冲夹具、测试后端和信号源 Tone。
+`core/` 提供 Engine、Node、音频缓冲、PCM 编解码、F32P 重采样器和内部控制指令队列 CommandQueue。`plugins/` 提供 Convert、Mixer、Matrix、Capture 和 Playback。两个端点负责经由 F32P 队列与绑定的 `Backend` 交接帧。`backend/` 的 `Backend` 统一管理设备、线程、转换工作区及漂移补偿。绑定 `Capture` 或 `Playback` 决定运行方向。依赖方向为 `backend → plugins → core`。`tests/support/` 提供缓冲夹具、测试后端和信号源 Tone。
 
 Engine 持有编辑图和渲染计划。`commit()` 按依赖排序，从无输出的 Sink 遍历可达节点；未连接到 Sink 的分支不执行。每个可达节点每周期只执行一次。
 
@@ -90,7 +90,12 @@ Capture 读到至少一帧即标为活跃，短读补零。队列读空表示当
 
 ### 控制与实时处理的边界
 
-应用负责串行执行 Engine 的控制操作。应用可以用 Asio strand 承载控制命令，也可以独立使用 Asio 协调网络 I/O、设备事件和恢复定时。
+调用方负责串行执行 Engine 和后端的控制操作。仓库内的组件可通过内部头文件 `core/command_queue.h` 使用 CommandQueue，在同一工作线程执行 `sync()`、`post()` 和基于单调时钟的定时任务。每批即时任务后检查一次最早到期的定时器。周期任务从当次执行结束起重新计时。
+
+`stop(on_stop)` 关闭提交和定时器取出，等待在途任务结束，排空已接收的即时任务，再由工作线程释放剩余定时回调并执行清理。定时回调在持锁取出时进入在途状态。取消和停机允许已取出的当次执行完毕。
+
+后端工作线程可异步提交控制命令。Engine 时钟和后端工作线程均应避免同步等待控制线程，因为控制操作可能正在等待这些线程退出当前处理。`post()` 可能竞争锁或分配内存，实时 `process()` 应使用预分配的事件交接。
+
 设备打开/关闭、文件访问、编解码和应用回调都在非渲染路径完成。设备必要的实时缓冲交付由平台后端封装。
 音频路径只读写已准备的缓冲，避免堆操作、锁等待、日志和应用回调。
 
@@ -192,7 +197,7 @@ Tone / BUS（48k F32P）
 - `stop()` 下线并复位 DSP 和漂移，保留绑定和已分配工作区。同步播放先关闭图侧写入，写完已排队帧及 FIR 尾部。同步 I/O 钩子须自行完成操作。切换设备时依次调用旧后端的 `unbind()` 和新后端的 `bind(endpoint)`、`start()`。
 - 异步播放补齐设备批次的静音，后端通过 `last_error()` 返回 I/O 终止原因。异步等待和数据交接共用以最后一次 I/O 进展为起点的截止时间。主动停止可唤醒设备等待。测试通过真实的 I/O 工作线程验证设备交接。
 - `Engine::stop()` 唤醒时钟并等待在途图处理退出。先停止绑定的后端，再调用 `Engine::reset()`。在移除、替换端点或销毁 Engine 前解绑其后端。派生驱动析构时先调用 `unbind()`。
-- 调用方在控制侧串行执行控制接口和析构。同一 Engine 的时钟线程调用控制接口时抛出 `Error(RetCode::BUSY)`。节点需要请求修改引擎时，将操作延后投递到应用的串行执行器并直接返回，例如使用 `asio::post`。实例有效期间可并发读取 `block_period()` 与 `tick_position()`。
+- 调用方在控制侧串行执行控制接口和析构。同一 Engine 的时钟线程调用控制接口时抛出 `Error(RetCode::BUSY)`。节点需要请求修改引擎时，通过预分配的事件交接通知控制侧，并直接返回。实例有效期间可并发读取 `block_period()` 与 `tick_position()`。
 - 处理路径尽量避免锁等待，禁止堆分配、释放和调用普通应用回调。异步使用块数据必须在 process() 返回前复制到后端自有缓冲。
 
 ### 运行态诊断
@@ -201,9 +206,17 @@ Tone / BUS（48k F32P）
 
 用 `dot -Tsvg graph.dot -o graph.svg` 渲染信号流图。卡片标题显示端点状态和后端错误短码，橙色标记预填充、排空、跳拍或队列缺帧。多端口节点按插槽接线，Mixer 的静音端口和入边置灰。启用优先级时，文本报告显示 `high` 和 `suppressed`，DOT 用 `[HIGH]` 标记高优端口，用 `[SUPP]` 和琥珀色虚线标记被压制的普通端口及其入边。卡片和连线直接显示关键规格，SVG 悬停可查看完整诊断详情。`io.diagnostic_reports` 和 `io.mixer_priority_diagnostics` 检查文本和 DOT 输出，`io.endpoint_diagnostics` 检查端点计数、重启及短批次排空。
 
+### AudioCenter
+
+应用通过 `include/audio_interface.h` 使用 `AudioCenter` 创建 WAV 输入、WAV 输出、Mixer 和 Matrix。门面将操作同步派发至控制线程，由 `app/graph_service.cpp` 管理图和后端。调用会阻塞。所有调用线程须在实例析构前结束对实例的访问。控制方法返回 `RetCode`，创建失败返回空句柄，诊断失败返回空字符串。`AudioCenter::last_error()` 返回调用线程最近一次控制或诊断操作的状态。
+
+- `connect(from, to)` 可直接连接同规格端口，规格变化时自动插入 Matrix 或 Convert。降声道先映射，升声道先重采样。单声道复制到各输出，合并为单声道时取平均，其他情况按相同下标映射并将额外输出置零。
+- 首次 `start()` 和草稿有变化时会自动提交。运行中 `commit()` 的图准备失败会保留当前计划。若新计划发布后有后端启动失败，门面停止后端和时钟并保留新计划，修复后可重新 `start()`。移除 WAV 端点会立即解绑，旧计划里仍存在的采集端点输出静音，播放端点停止接收数据。
+- 未暂停的 WAV 输出在断开上游后继续录制静音，以保留时间轴。暂停输出节点并提交会停止该后端。单文件输出在创建节点时独占打开，目标已存在时返回 `BUSY`。编号分段跳过已有文件。`stop()` 排空录音队列并保留打开的文件，移除输出或销毁实例会回填最终的 WAV 文件长度。
+
 ### 构建与验证
 
-项目使用 C++14。CMake 目标 `aereborn::aereborn` 链接静态库 `aereborn`，其中包含内核、插件、后端和诊断模块。目标公开的头路径为 `include/`，可通过 `#include "audio_types.h"` 使用基础类型。库链接 `Threads::Threads`。Linux 在查找到 ALSA 开发库时编译 ALSA 后端并定义 `AEREBORN_HAS_ALSA`，Windows 编译 WASAPI 后端。只构建库可设置 `-DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF`。
+项目使用 C++14。CMake 目标 `aereborn::aereborn` 链接静态库 `aereborn`，其中包含内核、插件、后端、诊断模块和应用门面（`app/`）。目标公开 `include/` 头路径。应用通过 `#include "audio_interface.h"` 使用 `AudioCenter`，也可通过 `#include "audio_types.h"` 单独使用基础类型。库链接 `Threads::Threads`。Linux 在查找到 ALSA 开发库时编译 ALSA 后端并定义 `AEREBORN_HAS_ALSA`，Windows 编译 WASAPI 后端。只构建库可设置 `-DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF`。
 
 ~~~sh
 cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
@@ -215,7 +228,7 @@ ctest --test-dir build/release -C Release --output-on-failure
 ctest --test-dir build/release -C Release -L bus --output-on-failure
 ~~~
 
-测试目录和 CTest 标签使用 `core`、`dsp`、`bus`、`io`、`regression`。单独运行四声道场景可使用 `ctest --test-dir build/release -C Release -R '^bus.four_channel_song_archive$' --output-on-failure`。引擎测试使用内置时钟，通过测试节点在块边界与测试控制侧同步。混音、PCM 转换和重采样使用独立字节或数值参照。
+测试目录和 CTest 标签使用 `core`、`dsp`、`bus`、`io`、`public`、`regression`。用 `ctest --test-dir build/release -C Release -L public --output-on-failure` 验证公共门面。单独运行四声道场景可使用 `ctest --test-dir build/release -C Release -R '^bus.four_channel_song_archive$' --output-on-failure`。引擎测试使用内置时钟，通过测试节点在块边界与测试控制侧同步。混音、PCM 转换和重采样使用独立字节或数值参照。
 
 `tests/data/` 的两份 48 kHz 双声道 WAV 短片来自《渡口》第 30 秒起的 0.5 秒和 CaliforniaHotel 第 40 秒起的 0.75 秒。四声道测试将两段音乐交错到同一个输入，生成两份 48 kHz 拆分归档和一份 44.1 kHz 混音归档。录音和分段文件在构建目录内创建，正常退出时清理。
 
