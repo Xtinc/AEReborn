@@ -42,9 +42,8 @@ void write_file(const std::string &path, const Bytes &data)
 void write_constant_stereo(const std::string &path)
 {
     Bytes data{
-        'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ',
-        16, 0, 0, 0, 1, 0, 2, 0, 0x80, 0xbb, 0, 0, 0, 0xee, 2, 0, 4, 0, 16, 0,
-        'd', 'a', 't', 'a', 0, 0, 0, 0,
+        'R', 'I', 'F',  'F',  0, 0, 0, 0,    'W', 'A', 'V', 'E', 'f', 'm', 't', ' ', 16,  0,   0, 0, 1, 0,
+        2,   0,   0x80, 0xbb, 0, 0, 0, 0xee, 2,   0,   4,   0,   16,  0,   'd', 'a', 't', 'a', 0, 0, 0, 0,
     };
     constexpr auto payload = 480 * 4;
     const auto store_size = [&](std::size_t offset, std::uint32_t size) {
@@ -124,18 +123,10 @@ void channel_map()
     check(sliced.coefficients() == std::vector<float>{0, 1, 0, 0, 0, 1}, "Slice preserves the selected channel order");
     const auto mono = ChannelMap::to_mono(4);
     check(mono.coefficients() == std::vector<float>{0.25f, 0.25f, 0.25f, 0.25f}, "Downmix averages all channels");
-    auto spread = ChannelMap::from_mono(3);
-    spread.clear_output(1);
-    check(spread.coefficients() == std::vector<float>{1, 0, 1}, "Broadcast copies mono and allows muting one output");
     ChannelMap replaced(3, 1);
     replaced.route(2, 0).mix({0, 1}, 0);
-    check(replaced.coefficients() == std::vector<float>{0.5f, 0.5f, 0}, "A mix replaces every weight in its output row");
-
-    auto edited = ChannelMap::identity(2);
-    edited.swap_outputs(0, 0).swap_outputs(0, 1).scale_output(1, -1.0f).route(1, 0, 0.0f).route(0, 0, 0.75f);
-    check(edited.coefficients() == std::vector<float>{0.75f, 0, -1, 0}, "Edits address weights from input to output");
-    check(edited.weight(0, 1) == -1.0f && edited.weight(2, 0) == 0.0f && edited.weight(0, 2) == 0.0f,
-          "Weight uses from-to indexing and handles out-of-range queries");
+    check(replaced.coefficients() == std::vector<float>{0.5f, 0.5f, 0},
+          "A mix replaces every weight in its output row");
 
     const std::vector<float> raw{1.0f, -0.5f};
     auto moved_from = ChannelMap::dense(2, 1, raw);
@@ -144,11 +135,6 @@ void channel_map()
     expect(moved_from.route(0, 0).status(), RetCode::EPARAM);
     check(moved_from.weight(0, 0) == 0.0f, "Moved-from maps are safe to query");
 
-    auto invalid_edit = ChannelMap::identity(2);
-    invalid_edit.mix({0, 0}, 1).clear_output(0);
-    expect(invalid_edit.status(), RetCode::EPARAM);
-    check(invalid_edit.coefficients() == std::vector<float>{1, 0, 0, 1},
-          "A rejected mix and subsequent edits leave the previous coefficients intact");
     const auto infinity = std::numeric_limits<float>::infinity();
     const auto largest = std::numeric_limits<float>::max();
     expect(ChannelMap().status(), RetCode::EPARAM);
@@ -162,18 +148,18 @@ void channel_map()
     expect(ChannelMap(2, 1).mix({}, 0).status(), RetCode::EPARAM);
     expect(ChannelMap(2, 1).mix({0, 2}, 0).status(), RetCode::EPARAM);
     expect(ChannelMap(2, 1).route(0, 0, infinity).status(), RetCode::EPARAM);
-    expect(ChannelMap::identity(1).swap_outputs(0, 1).status(), RetCode::EPARAM);
     auto overflow = ChannelMap::dense(2, 1, {1.0f, largest});
     overflow.scale_output(0, 2.0f);
     expect(overflow.status(), RetCode::EPARAM);
-    check(overflow.coefficients() == std::vector<float>{1.0f, largest}, "A scaling overflow leaves the full row intact");
+    check(overflow.coefficients() == std::vector<float>{1.0f, largest},
+          "A scaling overflow leaves the full row intact");
 
     TempWave files("channel-map");
     const auto input = files.path("-input.wav");
     const auto output = files.path("-output.wav");
     write_constant_stereo(input);
     AudioCenter audio;
-    check(!audio.create_matrix(BandWidth::Full, invalid_edit), "Invalid maps do not create nodes");
+    check(!audio.create_matrix(BandWidth::Full, ChannelMap()), "Invalid maps do not create nodes");
     expect(AudioCenter::last_error(), RetCode::EPARAM);
     check(!audio.create_matrix(BandWidth::Full, ChannelMap::identity(std::numeric_limits<std::size_t>::max())),
           "Map capacity failures do not create nodes");
@@ -182,7 +168,6 @@ void channel_map()
     ChannelMap negative(2, 1);
     negative.route(0, 0, 2.0f).mix(std::vector<std::size_t>{0, 1}, 0, -1.0f);
     const auto matrix = audio.create_matrix(BandWidth::Full, negative, 0.5f);
-    negative.clear_output(0);
     const auto sink = audio.create_owav(output, {BandWidth::Full, 1, SampleFormat::S16LE});
     check(source && matrix && sink, "Create a two-to-one route from the map");
     expect(audio.connect(source, matrix));
@@ -283,8 +268,8 @@ void live_control_and_cleanup()
     AudioCenter audio;
     const auto source = audio.create_iwav(input, -1);
     const auto mix = audio.create_mixer(BandWidth::Full, 2, 2);
-    const auto gain = audio.create_matrix(BandWidth::Full, 2);
-    const auto other_rate = audio.create_matrix(BandWidth::CDQuality, 1);
+    const auto gain = audio.create_matrix(BandWidth::Full, ChannelMap::identity(2));
+    const auto other_rate = audio.create_matrix(BandWidth::CDQuality, ChannelMap::identity(1));
     const auto sink = audio.create_owav(output);
     const auto monitor_sink = audio.create_owav(monitor);
     check(source && mix && gain && other_rate && sink && monitor_sink, "Create the live graph");
@@ -372,7 +357,7 @@ void concurrency_and_teardown()
         const auto source = audio.create_iwav(input, -1);
         check(!audio.create_owav(input), "Creating a WAV output must preserve the existing input path");
         expect(AudioCenter::last_error(), RetCode::BUSY);
-        const auto matrix = audio.create_matrix(BandWidth::Full, 2);
+        const auto matrix = audio.create_matrix(BandWidth::Full, ChannelMap::identity(2));
         const auto mixer = audio.create_mixer(BandWidth::Full, 2, 2);
         const auto sink = audio.create_owav(output);
         check(source && matrix && mixer && sink, "Create the teardown graph");
@@ -411,8 +396,9 @@ void concurrency_and_teardown()
 
 int main(int argc, char **argv)
 {
-    return run_tests(argc, argv, {{"channel_map", channel_map},
-                                  {"wav_routing_and_bridge", wav_routing_and_bridge},
-                                  {"live_control_and_cleanup", live_control_and_cleanup},
-                                  {"concurrency_and_teardown", concurrency_and_teardown}});
+    return run_tests(argc, argv,
+                     {{"channel_map", channel_map},
+                      {"wav_routing_and_bridge", wav_routing_and_bridge},
+                      {"live_control_and_cleanup", live_control_and_cleanup},
+                      {"concurrency_and_teardown", concurrency_and_teardown}});
 }

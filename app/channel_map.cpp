@@ -198,25 +198,6 @@ ChannelMap &ChannelMap::scale_output(std::size_t to, float factor) noexcept
     return *this;
 }
 
-ChannelMap &ChannelMap::clear_output(std::size_t to) noexcept
-{
-    if (auto *row = output_row(to))
-        std::fill_n(row, input_channels_, 0.0f);
-    return *this;
-}
-
-ChannelMap &ChannelMap::swap_outputs(std::size_t first, std::size_t second) noexcept
-{
-    if (auto *row = output_row(first))
-    {
-        if (second >= output_channels_)
-            status_ = RetCode::EPARAM;
-        else if (first != second)
-            std::swap_ranges(row, row + input_channels_, coefficients_.data() + second * input_channels_);
-    }
-    return *this;
-}
-
 bool ChannelMap::valid() const noexcept
 {
     return static_cast<bool>(status());

@@ -1,5 +1,5 @@
-#include "tests/support/io_fixture.h"
-#include "tests/support/test_backend.h"
+#include "app/graph_service.h"
+#include "audio_interface.h"
 #include "backend/null_backend.h"
 #include "backend/pull_sink.h"
 #include "backend/push_source.h"
@@ -7,8 +7,8 @@
 #include "plugins/convert.h"
 #include "plugins/matrix.h"
 #include "plugins/mixer.h"
-#include "app/graph_service.h"
-#include "audio_interface.h"
+#include "tests/support/io_fixture.h"
+#include "tests/support/test_backend.h"
 #include <cstdlib>
 #include <future>
 #include <memory>
@@ -49,10 +49,22 @@ void operator delete(void *memory) noexcept
     std::free(memory);
 }
 
-void *operator new[](std::size_t size) { return ::operator new(size); }
-void operator delete[](void *memory) noexcept { ::operator delete(memory); }
-void operator delete(void *memory, std::size_t) noexcept { ::operator delete(memory); }
-void operator delete[](void *memory, std::size_t) noexcept { ::operator delete(memory); }
+void *operator new[](std::size_t size)
+{
+    return ::operator new(size);
+}
+void operator delete[](void *memory) noexcept
+{
+    ::operator delete(memory);
+}
+void operator delete(void *memory, std::size_t) noexcept
+{
+    ::operator delete(memory);
+}
+void operator delete[](void *memory, std::size_t) noexcept
+{
+    ::operator delete(memory);
+}
 
 namespace
 {
@@ -92,7 +104,8 @@ void command_queue_timer_allocation_rollback()
     check(allocation_fails(0, [&] { queue.post_after(1h, std::move(task)); }),
           "Growing the timer list propagates the injected allocation failure");
     check(released, "The rejected task releases its capture outside the queue lock");
-    check(queue.post_after(0ms, [&] { fired.set_value(); }) == 1, "A failed registration leaves the first ID available");
+    check(queue.post_after(0ms, [&] { fired.set_value(); }) == 1,
+          "A failed registration leaves the first ID available");
     check(completed.wait_for(3s) == std::future_status::ready, "The retried timer runs");
 }
 
@@ -124,7 +137,8 @@ void commit_allocation_rollback()
             clock.commit();
         }
         clock.advance();
-        check(before->sample(0) == 0.5f && after->frames == 80, "The complete route becomes visible on successful commit");
+        check(before->sample(0) == 0.5f && after->frames == 80,
+              "The complete route becomes visible on successful commit");
         if (!failed)
         {
             check(at > 0, "The graph exercises allocation failure injection");
@@ -164,7 +178,8 @@ void graph_service_allocation_rollback()
         }
         check(static_cast<bool>(sink), "The same WAV path remains available for retry");
 
-        const auto source = graph.create_matrix(BandWidth::Full, 2, 1.0f);
+        const auto source =
+            graph.create_matrix(BandWidth::Full, 2, 2, {ChannelMap::identity(2).coefficients().data(), 4}, 1.0f);
         graph.commit();
         bool rolled_back_partial_edit = false;
         for (int at = 0; at < 128; ++at)
@@ -297,7 +312,9 @@ void backend_allocation_rollback()
 class MeasureRender final : public NodeT<1, 0>
 {
   public:
-    explicit MeasureRender(bool start) : NodeT({planar}, {}), start_(start) {}
+    explicit MeasureRender(bool start) : NodeT({planar}, {}), start_(start)
+    {
+    }
 
     void process(const ProcessContext &) noexcept override
     {
@@ -419,14 +436,15 @@ void active_workers_without_heap()
 
 int main(int argc, char **argv)
 {
-    return aereborn::test::run_tests(argc, argv, {{"commit_allocation_rollback", commit_allocation_rollback},
-                                                {"backend_allocation_rollback", backend_allocation_rollback},
-                                                {"channel_map_allocation_status", channel_map_allocation_status},
-                                                {"graph_service_allocation_rollback", graph_service_allocation_rollback},
-                                                {"graph_service_live_commit_failure", graph_service_live_commit_failure},
-                                                {"command_queue_timer_allocation_rollback",
-                                                 command_queue_timer_allocation_rollback},
-                                                {"render_and_passive_io_without_heap", render_and_passive_io_without_heap},
-                                                {"active_workers_without_heap", active_workers_without_heap}});
+    return aereborn::test::run_tests(
+        argc, argv,
+        {{"commit_allocation_rollback", commit_allocation_rollback},
+         {"backend_allocation_rollback", backend_allocation_rollback},
+         {"channel_map_allocation_status", channel_map_allocation_status},
+         {"graph_service_allocation_rollback", graph_service_allocation_rollback},
+         {"graph_service_live_commit_failure", graph_service_live_commit_failure},
+         {"command_queue_timer_allocation_rollback", command_queue_timer_allocation_rollback},
+         {"render_and_passive_io_without_heap", render_and_passive_io_without_heap},
+         {"active_workers_without_heap", active_workers_without_heap}});
 }
 #endif

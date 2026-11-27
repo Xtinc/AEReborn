@@ -101,12 +101,6 @@ NodeId GraphService::create_mixer(BandWidth bandwidth, std::size_t channels, std
     return add_node(std::make_unique<Mixer>(bandwidth, channels, inputs))->first;
 }
 
-NodeId GraphService::create_matrix(BandWidth bandwidth, std::size_t channels, float gain)
-{
-    assert(commands_.on_thread());
-    return add_node(std::make_unique<Matrix>(bandwidth, channels, gain))->first;
-}
-
 NodeId GraphService::create_matrix(BandWidth bandwidth, std::size_t input_channels, std::size_t output_channels,
                                    View<const float> coefficients, float gain)
 {

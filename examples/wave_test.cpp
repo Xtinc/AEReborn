@@ -102,13 +102,13 @@ int main(int argc, char *argv[])
 
         // 子总线（48kHz 2ch）+ 自定义 ChannelMap（左右互换并衰减右声道）
         const auto sub_mix = check_node(audio.create_mixer(BandWidth::Full, 2, 2), "create_mixer(sub)");
-        const auto sub_map = ChannelMap::identity(2).swap_outputs(0, 1).scale_output(1, 0.85f);
+        const auto sub_map = ChannelMap::select(2, {1, 0}).scale_output(1, 0.85f);
         const auto sub_fx = check_node(audio.create_matrix(BandWidth::Full, sub_map, 0.90f), "create_matrix(sub_fx)");
 
         // 主总线（48kHz 2ch，4 路输入，slot 3 留空）
         const auto main_mix = check_node(audio.create_mixer(BandWidth::Full, 2, 4), "create_mixer(main)");
         const auto master_gain =
-            check_node(audio.create_matrix(BandWidth::Full, 2, 0.60f), "create_matrix(master_gain)");
+            check_node(audio.create_matrix(BandWidth::Full, ChannelMap::identity(2), 0.60f), "create_matrix(master_gain)");
 
         // 显式单声道混缩矩阵
         const auto mono_down =

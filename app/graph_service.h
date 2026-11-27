@@ -28,7 +28,6 @@ class GraphService
     NodeId create_owav(const std::string &path, PortSpec spec, std::chrono::seconds segment_duration,
                        std::chrono::microseconds io_period);
     NodeId create_mixer(BandWidth bandwidth, std::size_t channels, std::size_t inputs);
-    NodeId create_matrix(BandWidth bandwidth, std::size_t channels, float gain);
     NodeId create_matrix(BandWidth bandwidth, std::size_t input_channels, std::size_t output_channels,
                          View<const float> coefficients, float gain);
 

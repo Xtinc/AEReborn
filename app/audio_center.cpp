@@ -68,11 +68,6 @@ NodeId AudioCenter::create_mixer(BandWidth bandwidth, std::size_t channels, std:
     return dispatch(*commands_, [&] { return graph_->create_mixer(bandwidth, channels, inputs); });
 }
 
-NodeId AudioCenter::create_matrix(BandWidth bandwidth, std::size_t channels, float gain)
-{
-    return dispatch(*commands_, [&] { return graph_->create_matrix(bandwidth, channels, gain); });
-}
-
 NodeId AudioCenter::create_matrix(BandWidth bandwidth, const ChannelMap &map, float gain)
 {
     return dispatch(*commands_, [&] {

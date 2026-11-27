@@ -53,10 +53,6 @@ class ChannelMap
     ChannelMap &mix(std::initializer_list<std::size_t> from, std::size_t to, float gain = 1.0f) noexcept;
     /// @brief Multiply the weights feeding one output by factor.
     ChannelMap &scale_output(std::size_t to, float factor) noexcept;
-    /// @brief Clear all weights feeding one output.
-    ChannelMap &clear_output(std::size_t to) noexcept;
-    /// @brief Exchange the weights feeding two outputs.
-    ChannelMap &swap_outputs(std::size_t first, std::size_t second) noexcept;
 
     /// @brief Report whether this map can be passed to AudioCenter::create_matrix().
     bool valid() const noexcept;
@@ -118,11 +114,9 @@ class AudioCenter
 
     /// @brief Create an F32P mixer with 1 to 64 inputs. Returns an empty handle on failure.
     NodeId create_mixer(BandWidth bandwidth, std::size_t channels, std::size_t inputs);
-    /// @brief Create an identity channel map with linear gain. Returns an empty handle on failure.
-    NodeId create_matrix(BandWidth bandwidth, std::size_t channels, float gain = 1.0f);
     /// @brief Create a node by copying a channel map and applying the given linear gain.
     /// @return A node handle, or an empty handle on failure.
-    /// @note Keep the map available for reading until this call returns. See last_error() on failure.
+    /// @note Use ChannelMap::identity(channels) for a gain-only node. Keep the map available for reading until this call returns. See last_error() on failure.
     NodeId create_matrix(BandWidth bandwidth, const ChannelMap &map, float gain = 1.0f);
 
     /// @brief Stage a connection from an output to an input, inserting format bridges as needed.

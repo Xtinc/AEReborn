@@ -1,37 +1,21 @@
 #include "matrix.h"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 namespace aereborn
 {
 namespace
 {
-template <bool Accumulate> void write_scaled(float &dst, const float &src, float gain) noexcept
+void accumulate_steady(float *dst, const float *src, std::size_t frames, float gain) noexcept
 {
-    if (Accumulate)
-        dst += src * gain;
-    else
-        dst = src * gain;
-}
-
-template <bool Accumulate> void apply_steady_gain(float *dst, const float *src, std::size_t frames, float gain) noexcept
-{
-    if (Accumulate && gain == 0)
+    if (gain == 0.0f)
         return;
     for (std::size_t frame = 0; frame < frames; ++frame)
-        write_scaled<Accumulate>(dst[frame], src[frame], gain);
+        dst[frame] += src[frame] * gain;
 }
 
-template <bool Accumulate> void write_ramp_sample(float &dst, const float &src, float gain) noexcept
-{
-    if (gain != 0)
-        write_scaled<Accumulate>(dst, src, gain);
-    else if (!Accumulate)
-        dst = 0.0f;
-}
-
-template <bool Accumulate>
-void apply_ramping_gain(float *dst, const float *src, std::size_t frames, float coefficient, float start, float target,
-                        double scale) noexcept
+void accumulate_ramp(float *dst, const float *src, std::size_t frames, float coefficient, float start, float target,
+                     double scale) noexcept
 {
     const auto last = frames - 1;
     const auto begin = static_cast<double>(start);
@@ -39,10 +23,27 @@ void apply_ramping_gain(float *dst, const float *src, std::size_t frames, float 
     for (std::size_t frame = 0; frame < last; ++frame)
     {
         // Scale after adding the weighted endpoints so exact crossings stay zero with fused multiply-add.
-        const auto gain = static_cast<float>((begin * (last - frame) + end * (frame + 1)) * scale);
-        write_ramp_sample<Accumulate>(dst[frame], src[frame], Accumulate ? coefficient * gain : gain);
+        const auto gain = coefficient * static_cast<float>((begin * (last - frame) + end * (frame + 1)) * scale);
+        if (gain != 0.0f)
+            dst[frame] += src[frame] * gain;
     }
-    write_ramp_sample<Accumulate>(dst[last], src[last], Accumulate ? coefficient * target : target);
+    const auto end_gain = coefficient * target;
+    if (end_gain != 0.0f)
+        dst[last] += src[last] * end_gain;
+}
+
+std::size_t find_unity_source(const float *row, std::size_t input_channels, float target) noexcept
+{
+    std::size_t found = input_channels;
+    for (std::size_t src_ch = 0; src_ch < input_channels; ++src_ch)
+    {
+        if (row[src_ch] == 0.0f)
+            continue;
+        if (found != input_channels || row[src_ch] * target != 1.0f)
+            return input_channels;
+        found = src_ch;
+    }
+    return found;
 }
 } // namespace
 
@@ -52,6 +53,11 @@ Matrix::Matrix(BandWidth rate, std::size_t channels, float gain)
 {
     if (!inputs()[0].valid() || !std::isfinite(gain))
         throw Error(RetCode::EPARAM, "Invalid matrix specification");
+    if (channels > coefficients_.max_size() / channels)
+        throw Error(RetCode::TOOLARGE, "Channel matrix exceeds supported size");
+    coefficients_.resize(channels * channels, 0.0f);
+    for (std::size_t ch = 0; ch < channels; ++ch)
+        coefficients_[ch * channels + ch] = 1.0f;
 }
 Matrix::Matrix(BandWidth rate, std::size_t input_channels, std::size_t output_channels, View<const float> coefficients,
                float gain)
@@ -95,8 +101,7 @@ void Matrix::reset() noexcept
 }
 void Matrix::process(const ProcessContext &context) noexcept
 {
-    const auto &output_block = context.outputs[0];
-    const auto output = output_block.f32p_view();
+    const auto output = context.outputs[0].f32p_view();
     const auto frames = output.frames();
     if (frames == 0)
         return;
@@ -110,46 +115,33 @@ void Matrix::process(const ProcessContext &context) noexcept
         gain_ = target;
         return;
     }
-    const auto &input_block = context.inputs[0];
-    const auto input = input_block.f32p_view();
+    const auto input = context.inputs[0].f32p_view();
     const auto scale = steady ? 0.0 : 1.0 / frames;
-    if (coefficients_.empty())
+    const auto input_channels = input.channels();
+    for (std::size_t dst_ch = 0; dst_ch < output.channels(); ++dst_ch)
     {
-        if (steady && target == 1.0f)
+        auto *dst = output.channel(dst_ch);
+        const auto *row = coefficients_.data() + dst_ch * input_channels;
+        if (steady)
         {
-            const auto bytes = input_block.byte_view();
-            std::memcpy(output_block.byte_view().data(), bytes.data(), bytes.size());
-            return;
-        }
-        for (std::size_t ch = 0; ch < output.channels(); ++ch)
-        {
-            auto *dst = output.channel(ch);
-            const auto *src = input.channel(ch);
-            if (steady)
-                apply_steady_gain<false>(dst, src, frames, target);
-            else
-                apply_ramping_gain<false>(dst, src, frames, 1.0f, gain_, target, scale);
-        }
-    }
-    else
-    {
-        output.clear();
-        const auto input_channels = input.channels();
-        for (std::size_t dst_ch = 0; dst_ch < output.channels(); ++dst_ch)
-        {
-            auto *dst = output.channel(dst_ch);
-            const auto *row = coefficients_.data() + dst_ch * input_channels;
-            for (std::size_t src_ch = 0; src_ch < input_channels; ++src_ch)
+            const auto unity_src = find_unity_source(row, input_channels, target);
+            if (unity_src < input_channels)
             {
-                const auto coefficient = row[src_ch];
-                if (coefficient == 0)
-                    continue;
-                const auto *src = input.channel(src_ch);
-                if (steady)
-                    apply_steady_gain<true>(dst, src, frames, coefficient * target);
-                else
-                    apply_ramping_gain<true>(dst, src, frames, coefficient, gain_, target, scale);
+                std::memcpy(dst, input.channel(unity_src), frames * sizeof(float));
+                continue;
             }
+        }
+        std::fill_n(dst, frames, 0.0f);
+        for (std::size_t src_ch = 0; src_ch < input_channels; ++src_ch)
+        {
+            const auto coefficient = row[src_ch];
+            if (coefficient == 0.0f)
+                continue;
+            const auto *src = input.channel(src_ch);
+            if (steady)
+                accumulate_steady(dst, src, frames, coefficient * target);
+            else
+                accumulate_ramp(dst, src, frames, coefficient, gain_, target, scale);
         }
     }
     gain_ = target;

@@ -20,6 +20,7 @@ class Matrix final : public NodeT<1, 1>
     /// @param channels Channel count of both ports.
     /// @param gain Initial finite linear gain.
     /// @throws Error RetCode::EPARAM If the port specification is invalid or gain is not finite.
+    /// @throws Error RetCode::TOOLARGE If the matrix exceeds the supported storage size.
     Matrix(BandWidth rate, std::size_t channels, float gain = 1.0f);
 
     /// @brief Construct a channel map from a row-major matrix.
