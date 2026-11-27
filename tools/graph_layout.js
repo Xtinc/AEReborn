@@ -340,20 +340,6 @@ function orderFanouts(outgoing, anchors) {
         || a.to[0] - b.to[0] || a.to[1] - b.to[1]);
 }
 
-function guidePositions(nodes, guide) {
-    const positions = {};
-    for (const node of nodes) {
-        const entry = guide[node.name];
-        const position = Array.isArray(entry) ? entry : entry?.[inactive(node) ? 'idle' : 'active'];
-        if (position)
-            positions[node.id] = [...position];
-    }
-    const top = Math.min(...Object.values(positions).map(([, y]) => y));
-    for (const position of Object.values(positions))
-        position[1] += 8 - top;
-    return positions;
-}
-
 async function arrangeGraph(cards, connections, styles, positions) {
     const sourceGutter = cards.reduce((width, card) => Math.max(width, card.left), 0);
     for (const card of cards.filter(card => !card.node.inputs.length)) {
@@ -368,6 +354,6 @@ async function arrangeGraph(cards, connections, styles, positions) {
 }
 
 module.exports = {
-    slotTop, portMarkHeight, nodeKey, ribbonWidth, inactive, cardBox, guidePositions, orderFanouts, arrangeGraph, occupiedAreas,
+    slotTop, portMarkHeight, nodeKey, ribbonWidth, inactive, cardBox, orderFanouts, arrangeGraph, occupiedAreas,
     planFlows, placeEdgeLabel,
 };

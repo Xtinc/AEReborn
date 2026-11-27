@@ -210,7 +210,7 @@ Tone / BUS（48k F32P）
 
 先用 `npm --prefix tools ci` 安装渲染依赖。运行 `node tools/render_graph.js INPUT.json [OUTPUT.svg]` 生成 SVG。省略输出路径时，SVG 写在 JSON 同目录并沿用文件名。脚本使用 Node.js 18+、ELK 和 Apache ECharts。
 
-`wave_test` 使用 48 kHz 双声道 WAV 作为输入，显式创建监听和分段录音的重采样节点。启动后会在工作目录写入 Plan #2 的快照，运行中输入 `json` 可以重新采样。脚本按 `examples/wave_test_layout.json` 排列示例节点。模板无法容纳快照时，脚本会提示原因并切换到 ELK 自动布局。普通快照也可补充 `name` 供卡片显示。
+`wave_test` 使用 48 kHz 双声道 WAV 作为输入，显式创建监听和分段录音的重采样节点。启动后会在工作目录原样写出 `AudioCenter::dump_json()` 返回的 Plan #2 快照，运行中输入 `json` 可以重新采样。渲染脚本使用 ELK 自动布局。
 
 ```sh
 cmake -S . -B build

@@ -9,7 +9,6 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <utility>
 
 namespace
 {
@@ -29,26 +28,16 @@ void check_rc(RetCode rc, const char *what)
         throw std::runtime_error(std::string(what) + " failed: " + rc.what());
 }
 
-using NamedNode = std::pair<const char *, NodeId>;
-
-void dump_json_now(const AudioCenter &audio, std::initializer_list<NamedNode> nodes)
+void dump_json_now(const AudioCenter &audio)
 {
     const auto snapshot = audio.dump_json();
-    if (snapshot.empty() || snapshot.front() != '{')
+    if (snapshot.empty())
         throw std::runtime_error(std::string("dump_json failed: ") + AudioCenter::last_error().what());
     const char *path = "complex_public_scene.json";
     std::ofstream out(path, std::ios::binary);
-    out << "{\n  \"scene\":\"wave_test\",\n  \"labels\":{";
-    bool first = true;
-    for (const auto &node : nodes)
-    {
-        if (!first)
-            out << ',';
-        first = false;
-        out << '"' << node.second.node() << "\":\"" << node.first << '"';
-    }
-    out << "},";
-    if (!out.write(snapshot.data() + 1, static_cast<std::streamsize>(snapshot.size() - 1)))
+    out << snapshot;
+    out.close();
+    if (!out)
         throw std::runtime_error(std::string("Failed to write ") + path);
     std::cout << "Diagnostic snapshot written to " << path << '\n';
 }
@@ -134,13 +123,6 @@ int main(int argc, char *argv[])
         const auto rec_paused = check_node(
             audio.create_owav(out_paused_path, PortSpec(BandWidth::Full, 2, SampleFormat::S24_3LE)),
             "create_owav(paused)");
-        const std::initializer_list<NamedNode> named_nodes{
-            {"bgm", src_bgm}, {"voice", src_voice}, {"extra", src_extra},
-            {"sub_mix", sub_mix}, {"sub_fx", sub_fx}, {"main_mix", main_mix}, {"gain", master_gain},
-            {"mono", mono_down}, {"16k", monitor_convert}, {"44.1k", segment_convert},
-            {"master", rec_master}, {"monitor", rec_monitor},
-            {"segment", rec_segment}, {"paused_branch", rec_paused}};
-
         // =====================================================================
         // 2. 连接同规格端口。监听和分段录制经过上面显式创建的转换节点。
         // =====================================================================
@@ -178,7 +160,7 @@ int main(int argc, char *argv[])
         check_rc(audio.commit(), "commit(Plan #2)");
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        dump_json_now(audio, named_nodes);
+        dump_json_now(audio);
         print_help();
 
         // =====================================================================
@@ -198,7 +180,7 @@ int main(int argc, char *argv[])
             }
             else if (cmd == "json")
             {
-                dump_json_now(audio, named_nodes);
+                dump_json_now(audio);
             }
             else if (cmd == "gain")
             {

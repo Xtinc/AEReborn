@@ -4,7 +4,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const echarts = require('echarts');
-const {slotTop, portMarkHeight, nodeKey, ribbonWidth, inactive, cardBox, guidePositions, orderFanouts, arrangeGraph, occupiedAreas,
+const {slotTop, portMarkHeight, nodeKey, ribbonWidth, inactive, cardBox, orderFanouts, arrangeGraph, occupiedAreas,
     planFlows, placeEdgeLabel} = require('./graph_layout');
 
 const colors = {
@@ -457,10 +457,10 @@ function detachedSection(backends, width, y) {
     </g>`};
 }
 
-async function renderGraph(snapshot, guide) {
-    const {engine, connections, backends} = snapshot;
-    const nodes = snapshot.nodes.map(node => ({...node, name: node.name ?? snapshot.labels?.[node.id]}));
-    const anchors = snapshot.positions || (guide && guidePositions(nodes, guide));
+async function render(snapshot) {
+    if (snapshot.version !== 1)
+        throw new Error(`Unsupported diagnostic JSON version ${snapshot.version}`);
+    const {engine, nodes, connections, backends, positions: anchors} = snapshot;
     const nodeById = new Map(nodes.map(node => [node.id, node]));
     const backendByNode = new Map();
     const detached = [];
@@ -545,20 +545,6 @@ async function renderGraph(snapshot, guide) {
     ${footer.markup}
 </svg>
 `;
-}
-
-async function render(snapshot) {
-    if (snapshot.version !== 1)
-        throw new Error(`Unsupported diagnostic JSON version ${snapshot.version}`);
-    const guide = snapshot.scene === 'wave_test' && !snapshot.positions ? require('../examples/wave_test_layout.json') : null;
-    if (!guide)
-        return renderGraph(snapshot);
-    try {
-        return await renderGraph(snapshot, guide);
-    } catch (error) {
-        console.warn(`${error.message}. Using automatic layout for this snapshot.`);
-        return renderGraph(snapshot);
-    }
 }
 
 async function main() {
