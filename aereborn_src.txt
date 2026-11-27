@@ -212,6 +212,7 @@ Tone / BUS（48k F32P）
 
 应用通过 `include/audio_interface.h` 使用 `AudioCenter` 创建 WAV 输入、WAV 输出、Mixer 和 Matrix。门面将操作同步派发至控制线程，由 `app/graph_service.cpp` 管理图和后端。调用会阻塞。所有调用线程须在实例析构前结束对实例的访问。控制方法返回 `RetCode`，创建失败返回空句柄，诊断失败返回空字符串。`AudioCenter::last_error()` 返回调用线程最近一次控制或诊断操作的状态。
 
+- 使用 `ChannelMap` 描述声道映射。索引从零开始，`route(from, to, weight)` 按输入到输出设置权重，`mix({0, 2}, 0)` 将输入 0 和 2 等权混到输出 0。可用 `ChannelMap::select(4, {2, 3})` 选取一对立体声，也可用 `dense()` 传入按输出行排列的系数。`create_matrix(rate, map, gain)` 复制映射后创建节点。构造或修改映射时发生的首个错误可通过 `map.status()` 查询，也会由创建调用通过 `last_error()` 返回。
 - `connect(from, to)` 可直接连接同规格端口，规格变化时自动插入 Matrix 或 Convert。降声道先映射，升声道先重采样。单声道复制到各输出，合并为单声道时取平均，其他情况按相同下标映射并将额外输出置零。
 - 首次 `start()` 和草稿有变化时会自动提交。运行中 `commit()` 的图准备失败会保留当前计划。发布新计划后，门面先按旧计划的逆执行顺序停止离场后端，再按新计划的执行顺序启动入场后端。离场的录音后端可以在计划切换后排空队列。留在计划里的后端延续原有状态，包括自然结束和 I/O 错误。若有后端启动失败，门面停止后端和时钟并保留新计划，修复后可重新 `start()`。移除 WAV 端点会立即解绑，旧计划里仍存在的采集端点输出静音，播放端点停止接收数据。
 - 未暂停的 WAV 输出在断开上游后继续录制静音，以保留时间轴。暂停输出节点并提交会停止该后端。单文件输出在创建节点时独占打开，目标已存在时返回 `BUSY`。编号分段跳过已有文件。`stop()` 排空录音队列并保留打开的文件，移除输出或销毁实例会回填最终的 WAV 文件长度。
@@ -391,6 +392,7 @@ add_library(aereborn STATIC
     backend/wav_file.cpp
     diag/inspect.cpp
     app/audio_center.cpp
+    app/channel_map.cpp
     app/graph_service.cpp
 )
 add_library(aereborn::aereborn ALIAS aereborn)
@@ -7314,6 +7316,7 @@ class WavFile
 #include "audio_types.h"
 #include <chrono>
 #include <cstddef>
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <vector>
@@ -7323,6 +7326,73 @@ namespace aereborn
 
 class CommandQueue;
 class GraphService;
+
+/// @brief Build a weighted channel map for AudioCenter::create_matrix().
+/// @note Indices are zero-based and follow the direction from input to output.
+///       Construction and editing keep the first error. Later edits leave the map alone.
+class ChannelMap
+{
+  public:
+    /// @brief Construct an empty map with status EPARAM.
+    ChannelMap() noexcept = default;
+    /// @brief Construct a silent map with the given input and output channel counts.
+    explicit ChannelMap(std::size_t input_channels, std::size_t output_channels) noexcept;
+
+    /// @brief Route every input to the corresponding output at unity gain.
+    static ChannelMap identity(std::size_t channels) noexcept;
+    /// @brief Pick inputs in output order. An input may appear more than once.
+    static ChannelMap select(std::size_t input_channels, const std::vector<std::size_t> &sources) noexcept;
+    /// @copydoc select(std::size_t, const std::vector<std::size_t>&)
+    static ChannelMap select(std::size_t input_channels, std::initializer_list<std::size_t> sources) noexcept;
+    /// @brief Pick count consecutive input channels starting at first.
+    static ChannelMap slice(std::size_t input_channels, std::size_t first, std::size_t count) noexcept;
+    /// @brief Average the input channels into a single output.
+    static ChannelMap to_mono(std::size_t input_channels) noexcept;
+    /// @brief Copy one input channel to every output.
+    static ChannelMap from_mono(std::size_t output_channels) noexcept;
+    /// @brief Copy row-major coefficients, one row of input weights per output.
+    static ChannelMap dense(std::size_t input_channels, std::size_t output_channels,
+                            const std::vector<float> &coefficients) noexcept;
+    /// @copydoc dense(std::size_t, std::size_t, const std::vector<float>&)
+    static ChannelMap dense(std::size_t input_channels, std::size_t output_channels,
+                            std::initializer_list<float> coefficients) noexcept;
+
+    /// @brief Set the weight from one input to one output. Zero disconnects that route.
+    ChannelMap &route(std::size_t from, std::size_t to, float weight = 1.0f) noexcept;
+    /// @brief Replace an output's weights with gain divided equally among distinct inputs.
+    ChannelMap &mix(const std::vector<std::size_t> &from, std::size_t to, float gain = 1.0f) noexcept;
+    /// @copydoc mix(const std::vector<std::size_t>&, std::size_t, float)
+    ChannelMap &mix(std::initializer_list<std::size_t> from, std::size_t to, float gain = 1.0f) noexcept;
+    /// @brief Multiply the weights feeding one output by factor.
+    ChannelMap &scale_output(std::size_t to, float factor) noexcept;
+    /// @brief Clear all weights feeding one output.
+    ChannelMap &clear_output(std::size_t to) noexcept;
+    /// @brief Exchange the weights feeding two outputs.
+    ChannelMap &swap_outputs(std::size_t first, std::size_t second) noexcept;
+
+    /// @brief Report whether this map can be passed to AudioCenter::create_matrix().
+    bool valid() const noexcept;
+    /// @brief Report EPARAM for invalid maps or edits and TOOLARGE for capacity or allocation failures.
+    RetCode status() const noexcept;
+    std::size_t input_channels() const noexcept { return input_channels_; }
+    std::size_t output_channels() const noexcept { return output_channels_; }
+    /// @brief Return a routing weight, or zero for an invalid map or index.
+    float weight(std::size_t from, std::size_t to) const noexcept;
+    /// @brief Borrow row-major coefficients until the map is edited, moved, or destroyed.
+    const std::vector<float> &coefficients() const noexcept { return coefficients_; }
+
+  private:
+    static ChannelMap select(std::size_t input_channels, const std::size_t *sources, std::size_t count) noexcept;
+    static ChannelMap dense(std::size_t input_channels, std::size_t output_channels,
+                            const float *coefficients, std::size_t count) noexcept;
+    ChannelMap &mix(const std::size_t *from, std::size_t count, std::size_t to, float gain) noexcept;
+    float *output_row(std::size_t to) noexcept;
+
+    std::size_t input_channels_ = 0;
+    std::size_t output_channels_ = 0;
+    std::vector<float> coefficients_;
+    RetCode status_{RetCode::EPARAM};
+};
 
 /// @brief Control a graph of WAV endpoints, mixers, and channel matrices.
 /// @note Calls on a live instance serialize on a control thread and may block.
@@ -7362,10 +7432,10 @@ class AudioCenter
     NodeId create_mixer(BandWidth bandwidth, std::size_t channels, std::size_t inputs);
     /// @brief Create an identity channel map with linear gain. Returns an empty handle on failure.
     NodeId create_matrix(BandWidth bandwidth, std::size_t channels, float gain = 1.0f);
-    /// @brief Create a channel map with row-major coefficients (output by input) and linear gain.
+    /// @brief Create a node by copying a channel map and applying the given linear gain.
     /// @return A node handle, or an empty handle on failure.
-    NodeId create_matrix(BandWidth bandwidth, std::size_t input_channels, std::size_t output_channels,
-                         const std::vector<float> &coefficients, float gain = 1.0f);
+    /// @note Keep the map available for reading until this call returns. See last_error() on failure.
+    NodeId create_matrix(BandWidth bandwidth, const ChannelMap &map, float gain = 1.0f);
 
     /// @brief Stage a connection from an output to an input, inserting format bridges as needed.
     RetCode connect(NodeId from, NodeId to);
@@ -8560,11 +8630,12 @@ NodeId AudioCenter::create_matrix(BandWidth bandwidth, std::size_t channels, flo
     return dispatch(*commands_, [&] { return graph_->create_matrix(bandwidth, channels, gain); });
 }
 
-NodeId AudioCenter::create_matrix(BandWidth bandwidth, std::size_t input_channels, std::size_t output_channels,
-                                  const std::vector<float> &coefficients, float gain)
+NodeId AudioCenter::create_matrix(BandWidth bandwidth, const ChannelMap &map, float gain)
 {
     return dispatch(*commands_, [&] {
-        return graph_->create_matrix(bandwidth, input_channels, output_channels,
+        throw_if_error(map.status());
+        const auto &coefficients = map.coefficients();
+        return graph_->create_matrix(bandwidth, map.input_channels(), map.output_channels(),
                                      {coefficients.data(), coefficients.size()}, gain);
     });
 }
@@ -8637,6 +8708,259 @@ std::string AudioCenter::dump_dot() const
 RetCode AudioCenter::last_error() noexcept
 {
     return thread_last_error;
+}
+
+} // namespace aereborn
+
+===== app/channel_map.cpp =====
+#include "audio_interface.h"
+
+#include <algorithm>
+#include <cmath>
+#include <new>
+
+namespace aereborn
+{
+namespace
+{
+
+RetCode check_dimensions(std::size_t inputs, std::size_t outputs, std::size_t capacity) noexcept
+{
+    if (!inputs || !outputs)
+        return RetCode::EPARAM;
+    if (outputs > capacity / inputs)
+        return RetCode::TOOLARGE;
+    return RetCode::OK;
+}
+
+} // namespace
+
+ChannelMap::ChannelMap(std::size_t input_channels, std::size_t output_channels) noexcept
+    : status_(check_dimensions(input_channels, output_channels, coefficients_.max_size()))
+{
+    if (!status_)
+        return;
+
+    try
+    {
+        coefficients_.resize(input_channels * output_channels);
+        input_channels_ = input_channels;
+        output_channels_ = output_channels;
+    }
+    catch (const std::bad_alloc &)
+    {
+        status_ = RetCode::TOOLARGE;
+    }
+}
+
+ChannelMap ChannelMap::identity(std::size_t channels) noexcept
+{
+    ChannelMap map(channels, channels);
+    if (map.valid())
+        for (std::size_t channel = 0; channel < channels; ++channel)
+            map.coefficients_[channel * channels + channel] = 1.0f;
+    return map;
+}
+
+ChannelMap ChannelMap::select(std::size_t input_channels, const std::vector<std::size_t> &sources) noexcept
+{
+    return select(input_channels, sources.data(), sources.size());
+}
+
+ChannelMap ChannelMap::select(std::size_t input_channels, std::initializer_list<std::size_t> sources) noexcept
+{
+    return select(input_channels, sources.begin(), sources.size());
+}
+
+ChannelMap ChannelMap::select(std::size_t input_channels, const std::size_t *sources, std::size_t count) noexcept
+{
+    for (std::size_t output = 0; output < count; ++output)
+        if (sources[output] >= input_channels)
+            return {};
+
+    ChannelMap map(input_channels, count);
+    if (map.valid())
+        for (std::size_t output = 0; output < count; ++output)
+            map.coefficients_[output * input_channels + sources[output]] = 1.0f;
+    return map;
+}
+
+ChannelMap ChannelMap::slice(std::size_t input_channels, std::size_t first, std::size_t count) noexcept
+{
+    if (first > input_channels || count > input_channels - first)
+        return {};
+
+    ChannelMap map(input_channels, count);
+    if (map.valid())
+        for (std::size_t output = 0; output < count; ++output)
+            map.coefficients_[output * input_channels + first + output] = 1.0f;
+    return map;
+}
+
+ChannelMap ChannelMap::to_mono(std::size_t input_channels) noexcept
+{
+    ChannelMap map(input_channels, 1);
+    if (map.valid())
+        std::fill(map.coefficients_.begin(), map.coefficients_.end(), 1.0f / static_cast<float>(input_channels));
+    return map;
+}
+
+ChannelMap ChannelMap::from_mono(std::size_t output_channels) noexcept
+{
+    ChannelMap map(1, output_channels);
+    std::fill(map.coefficients_.begin(), map.coefficients_.end(), 1.0f);
+    return map;
+}
+
+ChannelMap ChannelMap::dense(std::size_t input_channels, std::size_t output_channels,
+                             const std::vector<float> &coefficients) noexcept
+{
+    return dense(input_channels, output_channels, coefficients.data(), coefficients.size());
+}
+
+ChannelMap ChannelMap::dense(std::size_t input_channels, std::size_t output_channels,
+                             std::initializer_list<float> coefficients) noexcept
+{
+    return dense(input_channels, output_channels, coefficients.begin(), coefficients.size());
+}
+
+ChannelMap ChannelMap::dense(std::size_t input_channels, std::size_t output_channels, const float *coefficients,
+                             std::size_t count) noexcept
+{
+    ChannelMap map;
+    map.status_ = check_dimensions(input_channels, output_channels, map.coefficients_.max_size());
+    if (!map.status_)
+        return map;
+    if (count != input_channels * output_channels ||
+        !std::all_of(coefficients, coefficients + count, [](float weight) { return std::isfinite(weight); }))
+        return {};
+
+    try
+    {
+        map.coefficients_.assign(coefficients, coefficients + count);
+        map.input_channels_ = input_channels;
+        map.output_channels_ = output_channels;
+    }
+    catch (const std::bad_alloc &)
+    {
+        map.status_ = RetCode::TOOLARGE;
+    }
+    return map;
+}
+
+ChannelMap &ChannelMap::route(std::size_t from, std::size_t to, float weight) noexcept
+{
+    if (auto *row = output_row(to))
+    {
+        if (from < input_channels_ && std::isfinite(weight))
+            row[from] = weight;
+        else
+            status_ = RetCode::EPARAM;
+    }
+    return *this;
+}
+
+ChannelMap &ChannelMap::mix(const std::vector<std::size_t> &from, std::size_t to, float gain) noexcept
+{
+    return mix(from.data(), from.size(), to, gain);
+}
+
+ChannelMap &ChannelMap::mix(std::initializer_list<std::size_t> from, std::size_t to, float gain) noexcept
+{
+    return mix(from.begin(), from.size(), to, gain);
+}
+
+ChannelMap &ChannelMap::mix(const std::size_t *from, std::size_t count, std::size_t to, float gain) noexcept
+{
+    auto *row = output_row(to);
+    if (!row)
+        return *this;
+    if (!count || count > input_channels_ || !std::isfinite(gain))
+    {
+        status_ = RetCode::EPARAM;
+        return *this;
+    }
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        if (from[i] >= input_channels_ || std::find(from, from + i, from[i]) != from + i)
+        {
+            status_ = RetCode::EPARAM;
+            return *this;
+        }
+    }
+
+    const auto weight = gain / static_cast<float>(count);
+    std::fill_n(row, input_channels_, 0.0f);
+    for (std::size_t i = 0; i < count; ++i)
+        row[from[i]] = weight;
+    return *this;
+}
+
+ChannelMap &ChannelMap::scale_output(std::size_t to, float factor) noexcept
+{
+    auto *row = output_row(to);
+    if (!row)
+        return *this;
+    const auto end = row + input_channels_;
+    if (!std::isfinite(factor) ||
+        !std::all_of(row, end, [factor](float weight) { return std::isfinite(weight * factor); }))
+    {
+        status_ = RetCode::EPARAM;
+        return *this;
+    }
+    for (auto *weight = row; weight != end; ++weight)
+        *weight *= factor;
+    return *this;
+}
+
+ChannelMap &ChannelMap::clear_output(std::size_t to) noexcept
+{
+    if (auto *row = output_row(to))
+        std::fill_n(row, input_channels_, 0.0f);
+    return *this;
+}
+
+ChannelMap &ChannelMap::swap_outputs(std::size_t first, std::size_t second) noexcept
+{
+    if (auto *row = output_row(first))
+    {
+        if (second >= output_channels_)
+            status_ = RetCode::EPARAM;
+        else if (first != second)
+            std::swap_ranges(row, row + input_channels_, coefficients_.data() + second * input_channels_);
+    }
+    return *this;
+}
+
+bool ChannelMap::valid() const noexcept
+{
+    return static_cast<bool>(status());
+}
+
+RetCode ChannelMap::status() const noexcept
+{
+    if (status_ && (!input_channels_ || !output_channels_ || coefficients_.size() != input_channels_ * output_channels_))
+        return RetCode::EPARAM;
+    return status_;
+}
+
+float ChannelMap::weight(std::size_t from, std::size_t to) const noexcept
+{
+    if (!valid() || from >= input_channels_ || to >= output_channels_)
+        return 0.0f;
+    return coefficients_[to * input_channels_ + from];
+}
+
+float *ChannelMap::output_row(std::size_t to) noexcept
+{
+    if (!valid())
+        return nullptr;
+    if (to >= output_channels_)
+    {
+        status_ = RetCode::EPARAM;
+        return nullptr;
+    }
+    return coefficients_.data() + to * input_channels_;
 }
 
 } // namespace aereborn
