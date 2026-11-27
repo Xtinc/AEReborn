@@ -485,11 +485,11 @@ async function renderGraph(snapshot, guide) {
     }
     const cards = nodes.map(node => {
         const {incoming, outgoing} = routes.get(node.id);
-        const ordered = orderFanouts(outgoing, anchors, routes);
+        const ordered = orderFanouts(outgoing, anchors);
         return makeCard(node, backendByNode.get(node.id), incoming, ordered, styles, engine.state === 'Running',
             anchors?.[node.id]);
     });
-    const {layout, positioned} = await arrangeGraph(cards, connections, styles, anchors, routes, guide);
+    const {layout, positioned} = await arrangeGraph(cards, connections, styles, anchors);
     const cardsById = new Map(cards.map(card => [card.box.id, card]));
     const boxes = occupiedAreas(layout, cardsById);
     const flows = planFlows(layout, boxes, connections, styles, positioned);

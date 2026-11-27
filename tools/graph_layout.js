@@ -115,50 +115,6 @@ function curvedRoute(points, width, obstacles) {
     return {points, spans, curved: true};
 }
 
-function followBridges(edge, anchors, routes) {
-    const chain = [];
-    while (!anchors[edge.to[0]]) {
-        const id = edge.to[0];
-        const outgoing = routes.get(id).outgoing;
-        if (outgoing.length !== 1 || chain.includes(id))
-            break;
-        chain.push(id);
-        edge = outgoing[0];
-    }
-    return {chain, edge};
-}
-
-function placeBridges(cards, connections, anchors, routes) {
-    const positions = {...anchors};
-    const cardById = new Map(cards.map(card => [card.node.id, card]));
-    for (const connection of connections) {
-        const source = anchors[connection.from[0]];
-        if (!source)
-            continue;
-        const {chain, edge} = followBridges(connection, anchors, routes);
-        const target = anchors[edge.to[0]];
-        if (!chain.length || !target)
-            continue;
-        const fromRight = source[0] + cardById.get(connection.from[0]).width;
-        const bridges = chain.map(id => cardById.get(id));
-        const available = target[0] - fromRight - bridges.reduce((sum, card) => sum + card.width, 0);
-        const gap = Math.min(columnGap, available / (bridges.length + 1));
-        if (gap < 12)
-            throw new Error(`Layout has no room for the bridges on connection #${connection.id}`);
-        const targetPort = cardById.get(edge.to[0]).box.ports.find(port => port.id === inputKey(...edge.to));
-        const lane = target[1] + targetPort.y;
-        let x = target[0] - gap;
-        // End each automatic conversion chain on the destination's signal lane.
-        for (const card of bridges.reverse()) {
-            x -= card.width;
-            positions[card.node.id] = [x, lane - card.height / 2];
-            x -= gap;
-        }
-    }
-    const top = Math.min(...Object.values(positions).map(([, y]) => y));
-    return Object.fromEntries(Object.entries(positions).map(([id, [x, y, ...size]]) => [id, [x, y - top + 8, ...size]]));
-}
-
 function placedLayout(cards, connections, positions, routed = new Map()) {
     const children = cards.map(({node, box, left}) => {
         const position = positions[node.id];
@@ -376,15 +332,10 @@ async function automaticLayout(cards, connections, styles) {
     return placedLayout(cards, connections, positions, routed);
 }
 
-function orderFanouts(outgoing, anchors, routes) {
+function orderFanouts(outgoing, anchors) {
     if (outgoing.length < 2)
         return outgoing;
-    const targetRow = edge => {
-        if (!anchors)
-            return edge.to[0];
-        const target = followBridges(edge, anchors, routes).edge.to[0];
-        return anchors[target]?.[1] ?? 0;
-    };
+    const targetRow = edge => anchors?.[edge.to[0]]?.[1] ?? 0;
     return [...outgoing].sort((a, b) => a.from[1] - b.from[1] || targetRow(a) - targetRow(b)
         || a.to[0] - b.to[0] || a.to[1] - b.to[1]);
 }
@@ -393,13 +344,17 @@ function guidePositions(nodes, guide) {
     const positions = {};
     for (const node of nodes) {
         const entry = guide[node.name];
-        if (entry)
-            positions[node.id] = Array.isArray(entry) ? entry : entry[inactive(node) ? 'idle' : 'active'];
+        const position = Array.isArray(entry) ? entry : entry?.[inactive(node) ? 'idle' : 'active'];
+        if (position)
+            positions[node.id] = [...position];
     }
+    const top = Math.min(...Object.values(positions).map(([, y]) => y));
+    for (const position of Object.values(positions))
+        position[1] += 8 - top;
     return positions;
 }
 
-async function arrangeGraph(cards, connections, styles, anchors, routes, guide) {
+async function arrangeGraph(cards, connections, styles, positions) {
     const sourceGutter = cards.reduce((width, card) => Math.max(width, card.left), 0);
     for (const card of cards.filter(card => !card.node.inputs.length)) {
         const padding = sourceGutter - card.left;
@@ -408,9 +363,8 @@ async function arrangeGraph(cards, connections, styles, anchors, routes, guide) 
         for (const port of card.box.ports)
             port.x += padding;
     }
-    const fixed = guide ? placeBridges(cards, connections, anchors, routes) : anchors;
-    const layout = fixed ? placedLayout(cards, connections, fixed) : await automaticLayout(cards, connections, styles);
-    return {layout, positioned: !!fixed};
+    const layout = positions ? placedLayout(cards, connections, positions) : await automaticLayout(cards, connections, styles);
+    return {layout, positioned: !!positions};
 }
 
 module.exports = {

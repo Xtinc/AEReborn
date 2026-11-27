@@ -168,7 +168,7 @@ void graph_service_allocation_rollback()
     queue.sync([&] {
         GraphService graph(queue, period);
         NodeId sink;
-        const PortSpec target(BandWidth::CDQuality, 1, SampleFormat::S16LE);
+        const PortSpec target(BandWidth::Full, 2, SampleFormat::S16LE);
         for (int at = 0; at < 128; ++at)
         {
             if (!allocation_fails(at, [&] { sink = graph.create_owav(path, target, 0s, 10ms); }))
@@ -181,33 +181,32 @@ void graph_service_allocation_rollback()
         const auto source =
             graph.create_matrix(BandWidth::Full, 2, 2, {ChannelMap::identity(2).coefficients().data(), 4}, 1.0f);
         graph.commit();
-        bool rolled_back_partial_edit = false;
         for (int at = 0; at < 128; ++at)
         {
             const auto failed = allocation_fails(at, [&] { graph.connect(source, sink); });
-            const auto draft = graph.dump_json();
-            if (failed)
-                rolled_back_partial_edit |= draft.find("\"dirty\":true") != std::string::npos;
-            graph.commit();
-            const auto plan = graph.dump_json();
-            const auto matrix = plan.find("\"type\":\"Matrix\",\"in_plan\":true") != std::string::npos;
-            const auto converter = plan.find("\"type\":\"Convert\"") != std::string::npos;
             if (failed)
             {
-                check(!matrix && !converter, "A failed bridge never becomes part of a plan");
+                const auto snapshot = graph.dump_json();
+                check(snapshot.find("\"dirty\":false") != std::string::npos &&
+                          snapshot.find("\"connections\":[\n  ]") != std::string::npos,
+                      "A failed connection leaves the draft and its bookkeeping unchanged");
                 expect_error(RetCode::ECONN, [&] { graph.disconnect(sink); });
             }
             else
             {
-                check(matrix && converter && rolled_back_partial_edit, "A partially applied bridge can be retried");
+                graph.commit();
+                check(at > 0 && graph.dump_json().find("\"type\":\"Matrix\",\"in_plan\":true") != std::string::npos,
+                      "The connection publishes after allocation failures");
                 graph.disconnect(sink);
                 graph.commit();
-                check(graph.dump_json().find("\"type\":\"Convert\"") == std::string::npos,
-                      "Disconnect removes the bridge");
+                const auto snapshot = graph.dump_json();
+                check(snapshot.find("\"type\":\"Matrix\",\"in_plan\":false") != std::string::npos &&
+                          snapshot.find("\"connections\":[\n  ]") != std::string::npos,
+                      "Disconnect removes the edge and keeps the explicitly created node");
                 return;
             }
         }
-        check(false, "The bridge eventually connects after the allocation failures");
+        check(false, "The link eventually connects after the allocation failures");
     });
 }
 

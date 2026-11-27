@@ -20,20 +20,6 @@ bool contains_node(View<const NodeId> nodes, NodeId id) noexcept
     return !nodes.empty() && std::find(nodes.begin(), nodes.end(), id) != nodes.end();
 }
 
-std::vector<float> default_matrix(std::size_t inputs, std::size_t outputs)
-{
-    std::vector<float> coefficients;
-    if (outputs > coefficients.max_size() / inputs)
-        throw Error(RetCode::TOOLARGE);
-    coefficients.resize(inputs * outputs);
-    if (inputs == 1 || outputs == 1)
-        std::fill(coefficients.begin(), coefficients.end(), 1.0f / static_cast<float>(inputs));
-    else
-        for (std::size_t ch = 0; ch < std::min(inputs, outputs); ++ch)
-            coefficients[ch * inputs + ch] = 1.0f;
-    return coefficients;
-}
-
 } // namespace
 
 GraphService::GraphService(CommandQueue &commands, BlockPeriod period) : commands_(commands), engine_(period) {}
@@ -109,6 +95,12 @@ NodeId GraphService::create_matrix(BandWidth bandwidth, std::size_t input_channe
     return add_node(std::make_unique<Matrix>(bandwidth, input_channels, output_channels, coefficients, gain))->first;
 }
 
+NodeId GraphService::create_convert(PortSpec input, PortSpec output)
+{
+    assert(commands_.on_thread());
+    return add_node(std::make_unique<Convert>(input, output))->first;
+}
+
 GraphService::NodeMap::iterator GraphService::find_node(NodeId node)
 {
     assert(commands_.on_thread());
@@ -138,55 +130,18 @@ PortSpec GraphService::port_spec(NodeId port, bool output)
 
 void GraphService::connect(NodeId from, NodeId to)
 {
-    auto source = port_spec(from, true);
-    const auto destination = port_spec(to, false);
-    assert(source.format == SampleFormat::F32P && destination.format == SampleFormat::F32P);
+    assert(commands_.on_thread());
+    // Reserve bookkeeping before editing the draft, so an allocation failure leaves it untouched.
     const auto found = links_.lower_bound(to);
-    if (found != links_.end() && found->first == to)
-        throw Error(found->second.from == from ? RetCode::DUPLICATE : RetCode::INPUTBUSY);
-
-    const auto entry = links_.emplace_hint(found, to, LogicalLink{from});
-    auto &link = entry->second;
+    const bool insert = found == links_.end() || found->first != to;
+    const auto entry = insert ? links_.emplace_hint(found, to, Connection{}) : found;
     const auto cleanup = [&]() noexcept {
-        remove_bridges(link);
-        links_.erase(entry);
+        if (insert)
+            links_.erase(entry);
     };
     ScopeExit<decltype(cleanup)> rollback(cleanup);
-    std::size_t next = 0;
-    auto previous = from;
-    const auto append = [&](NodeId bridge) {
-        auto &segment = link.bridges[next++];
-        segment.node = bridge;
-        segment.input = engine_.connect(previous, bridge);
-        previous = bridge;
-    };
-    const auto map_channels = [&] {
-        const auto coefficients = default_matrix(source.channels, destination.channels);
-        append(engine_.emplace_node<Matrix>(source.bandwidth, source.channels, destination.channels,
-                                            View<const float>{coefficients.data(), coefficients.size()}));
-        source.channels = destination.channels;
-    };
-
-    if (source.channels > destination.channels)
-        map_channels();
-    if (source.bandwidth != destination.bandwidth)
-    {
-        const PortSpec converted{destination.bandwidth, source.channels, source.format};
-        append(engine_.emplace_node<Convert>(source, converted));
-        source = converted;
-    }
-    if (source.channels < destination.channels)
-        map_channels();
-    link.tail = engine_.connect(previous, to);
+    entry->second = {engine_.connect(from, to), from, to};
     rollback.dismiss();
-}
-
-void GraphService::remove_bridges(const LogicalLink &link) noexcept
-{
-    // Removing a bridge also removes every connection incident to it.
-    for (auto it = link.bridges.rbegin(); it != link.bridges.rend(); ++it)
-        if (it->node)
-            engine_.remove_node(it->node);
 }
 
 void GraphService::disconnect(NodeId from, NodeId to)
@@ -210,10 +165,7 @@ void GraphService::disconnect_input(NodeId to, const NodeId *from)
         port_spec(to, false);
         throw Error(RetCode::ECONN);
     }
-    if (link->second.bridges.front().node)
-        remove_bridges(link->second);
-    else
-        engine_.disconnect(link->second.tail);
+    engine_.disconnect(link->second.id);
     links_.erase(link);
 }
 
@@ -225,10 +177,7 @@ void GraphService::remove(NodeId node)
     for (auto it = links_.begin(); it != links_.end();)
     {
         if (it->first.base() == node || it->second.from.base() == node)
-        {
-            remove_bridges(it->second);
             it = links_.erase(it);
-        }
         else
             ++it;
     }
@@ -334,19 +283,7 @@ std::string GraphService::dump_json()
             drivers.push_back(entry.second.backend.get());
     }
     for (const auto &entry : links_)
-    {
-        const auto &link = entry.second;
-        auto from = link.from;
-        for (const auto &bridge : link.bridges)
-            if (bridge.node)
-            {
-                nodes.push_back({bridge.node, engine_.node(bridge.node), false});
-                connections.push_back({bridge.input, from, bridge.node});
-                from = bridge.node;
-            }
-        connections.push_back({link.tail, from, entry.first});
-    }
-    std::sort(nodes.begin(), nodes.end(), [](const auto &a, const auto &b) { return a.id < b.id; });
+        connections.push_back(entry.second);
     std::sort(connections.begin(), connections.end(), [](const auto &a, const auto &b) { return a.id < b.id; });
     return aereborn::dump_json(engine_, {nodes.data(), nodes.size()}, {connections.data(), connections.size()},
                               {drivers.data(), drivers.size()});

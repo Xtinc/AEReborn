@@ -118,7 +118,7 @@ std::string backend_state(NodeId id, const char *state)
     return "\"node\":" + std::to_string(id.node()) + ",\"state\":\"" + state + '"';
 }
 
-bool bridges_in_plan_order(const std::string &snapshot, bool downmix)
+bool runs_before(const std::string &snapshot, NodeId first, NodeId second)
 {
     const auto order_start = snapshot.find("\"plan_order\":[");
     check(order_start != std::string::npos, "Expect the execution order in diagnostics");
@@ -126,15 +126,9 @@ bool bridges_in_plan_order(const std::string &snapshot, bool downmix)
     const auto order_end = snapshot.find(']', first_id);
     check(order_end != std::string::npos, "Expect the complete execution order");
     const auto order = ',' + snapshot.substr(first_id, order_end - first_id) + ',';
-    const auto position_in_plan = [&](std::size_t type) {
-        check(type != std::string::npos, "Expect the automatic bridge in diagnostics");
-        const auto id = snapshot.rfind("{\"id\":", type);
-        check(id != std::string::npos, "Expect the automatic bridge ID");
-        return order.find(',' + std::to_string(std::stoull(snapshot.substr(id + 6))) + ',');
-    };
-    const auto matrix = position_in_plan(snapshot.rfind("\"type\":\"Matrix\""));
-    const auto convert = position_in_plan(snapshot.find("\"type\":\"Convert\""));
-    return matrix != std::string::npos && convert != std::string::npos && (downmix ? matrix < convert : convert < matrix);
+    const auto first_position = order.find(',' + std::to_string(first.node()) + ',');
+    const auto second_position = order.find(',' + std::to_string(second.node()) + ',');
+    return second_position != std::string::npos && first_position < second_position;
 }
 
 void channel_map()
@@ -202,7 +196,7 @@ void channel_map()
     find_steady_level(read_s16(output, 48000, 1), 0, static_cast<std::uint16_t>(-4096), 1);
 }
 
-void wav_routing_and_bridge()
+void wav_routing_and_conversion()
 {
     const std::string input = AEREBORN_TEST_DATA "/dukou_excerpt.wav";
     TempWave files("audio-center-routing");
@@ -211,6 +205,9 @@ void wav_routing_and_bridge()
     const auto upmixed = files.path("-upmixed.wav");
     const auto added = files.path("-added.wav");
     const PortSpec cd_mono{BandWidth::CDQuality, 1, SampleFormat::S16LE};
+    const PortSpec stereo_graph{BandWidth::Full, 2, SampleFormat::F32P};
+    const PortSpec mono_graph{BandWidth::Full, 1, SampleFormat::F32P};
+    const PortSpec cd_mono_graph{BandWidth::CDQuality, 1, SampleFormat::F32P};
     AudioCenter audio;
     const auto source = audio.create_iwav(input);
     const auto mixer = audio.create_mixer(BandWidth::Full, 2, 2);
@@ -218,19 +215,36 @@ void wav_routing_and_bridge()
     const auto out_stereo = audio.create_owav(stereo);
     const auto out_mono = audio.create_owav(mono, cd_mono);
     check(source && mixer && matrix && out_stereo && out_mono, "Create all WAV routes");
+    check(audio.output_spec(source) == stereo_graph, "WAV sources expose their graph-side specifications");
+    check(!audio.output_spec(source[1]).valid(), "An absent output port has no specification");
+    expect(AudioCenter::last_error(), RetCode::EPORT);
+    check(!audio.create_convert(stereo_graph, mono_graph), "Convert preserves the channel count");
+    expect(AudioCenter::last_error(), RetCode::EPARAM);
+    const auto downmix = audio.create_matrix(BandWidth::Full, ChannelMap::to_mono(2));
+    const auto downsample = audio.create_convert(mono_graph, cd_mono_graph);
+    const auto decode = audio.create_convert({BandWidth::Full, 2, SampleFormat::F32LE}, stereo_graph);
+    check(downmix && downsample && decode, "Create explicit channel, rate and format converters");
+    const auto before_rejected_links = audio.dump_json();
+    expect(audio.connect(matrix, decode), RetCode::INVFMT);
+    expect(audio.connect(matrix, downsample), RetCode::INVFMT);
+    expect(audio.connect(downmix, out_mono), RetCode::INVFMT);
+    check(audio.dump_json() == before_rejected_links, "Incompatible connections leave the configured graph intact");
+    expect(audio.remove(decode));
     expect(audio.connect(source, mixer[1]));
     expect(audio.connect(mixer, matrix));
     expect(audio.connect(matrix, out_stereo));
-    expect(audio.connect(matrix, out_mono));
+    expect(audio.connect(matrix, downmix));
+    expect(audio.connect(downmix, downsample));
+    expect(audio.connect(downsample, out_mono));
     expect(audio.start());
     expect(audio.start(), RetCode::BUSY);
 
     const auto snapshot = audio.dump_json();
-    check(bridges_in_plan_order(snapshot, true), "Downmix precedes resampling");
+    check(runs_before(snapshot, downmix, downsample), "Downmix precedes resampling");
     check(snapshot.find("\"file\":\"dukou_excerpt.wav\"") != std::string::npos &&
               snapshot.find("\"type\":\"Convert\"") != std::string::npos &&
               snapshot.find("\"to\":[" + std::to_string(mixer.node()) + ",1],\"in_plan\":true") != std::string::npos,
-          "JSON exposes audio bridges, exact destination ports and WAV file names");
+          "JSON exposes explicit converters, exact destination ports and WAV file names");
     wait_for([&] { return audio.dump_json().find("\"error\":\"EOS\"") != std::string::npos; },
              "The finite input reaches EOS", 4s);
     const auto added_source = audio.create_iwav(input, -1);
@@ -263,6 +277,7 @@ void wav_routing_and_bridge()
     expect(audio.stop());
     expect(audio.remove(out_stereo));
     expect(audio.remove(out_mono));
+    check(audio.output_spec(downsample) == cd_mono_graph, "Removing a sink keeps the explicit converter");
     expect(audio.remove(added_sink));
     expect(audio.remove(added_source));
     check(has_signal(read_s16(stereo, 48000, 2)), "Stereo branch contains audio");
@@ -271,8 +286,12 @@ void wav_routing_and_bridge()
 
     const auto mono_source = audio.create_iwav(mono);
     const auto stereo_sink = audio.create_owav(upmixed);
-    check(mono_source && stereo_sink, "Create the reverse specification route");
-    expect(audio.connect(mono_source, stereo_sink));
+    const auto upsample = audio.create_convert(cd_mono_graph, mono_graph);
+    const auto upmix = audio.create_matrix(BandWidth::Full, ChannelMap::select(1, {0, 0}));
+    check(mono_source && stereo_sink && upsample && upmix, "Create the reverse specification route");
+    expect(audio.connect(mono_source, upsample));
+    expect(audio.connect(upsample, upmix));
+    expect(audio.connect(upmix, stereo_sink));
     expect(audio.commit());
     const auto stopped = audio.dump_json();
     check(stopped.find("\"engine\":{\"state\":\"Ready\"") != std::string::npos &&
@@ -281,7 +300,7 @@ void wav_routing_and_bridge()
               stopped.find("\"state\":\"Running\"") == std::string::npos,
           "A stopped engine can publish a new plan without starting its backends");
     expect(audio.start());
-    check(bridges_in_plan_order(audio.dump_json(), false), "Mono resampling precedes channel duplication");
+    check(runs_before(audio.dump_json(), upsample, upmix), "Mono resampling precedes channel duplication");
     advance(audio, 6);
     expect(audio.remove(stereo_sink));
     const auto upmixed_pcm = read_s16(upmixed, 48000, 2);
@@ -302,19 +321,19 @@ void live_control_and_cleanup()
     const auto source = audio.create_iwav(input, -1);
     const auto mix = audio.create_mixer(BandWidth::Full, 2, 2);
     const auto gain = audio.create_matrix(BandWidth::Full, ChannelMap::identity(2));
-    const auto other_rate = audio.create_matrix(BandWidth::CDQuality, ChannelMap::identity(1));
+    const auto downstream = audio.create_matrix(BandWidth::Full, ChannelMap::identity(2));
     const auto sink = audio.create_owav(output);
     const auto monitor_sink = audio.create_owav(monitor);
-    check(source && mix && gain && other_rate && sink && monitor_sink, "Create the live graph");
+    check(source && mix && gain && downstream && sink && monitor_sink, "Create the live graph");
     expect(audio.connect(source, mix));
     expect(audio.connect(source, mix[1]));
     expect(audio.connect(mix, gain));
     expect(audio.connect(gain, sink));
-    expect(audio.connect(gain, other_rate));
-    expect(audio.connect(other_rate, gain), RetCode::INPUTBUSY);
+    expect(audio.connect(gain, downstream));
+    expect(audio.connect(downstream, gain), RetCode::INPUTBUSY);
     expect(audio.connect(gain, mix), RetCode::INPUTBUSY);
     expect(audio.disconnect(source, mix));
-    expect(audio.connect(other_rate, mix), RetCode::CYCLE);
+    expect(audio.connect(downstream, mix), RetCode::CYCLE);
     expect(audio.connect(source, mix));
     expect(audio.connect(source, mix), RetCode::DUPLICATE);
     expect(audio.disconnect({}, sink), RetCode::ENODE);
@@ -432,7 +451,7 @@ int main(int argc, char **argv)
 {
     return run_tests(argc, argv,
                      {{"channel_map", channel_map},
-                      {"wav_routing_and_bridge", wav_routing_and_bridge},
+                      {"wav_routing_and_conversion", wav_routing_and_conversion},
                       {"live_control_and_cleanup", live_control_and_cleanup},
                       {"concurrency_and_teardown", concurrency_and_teardown}});
 }

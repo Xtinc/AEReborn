@@ -78,6 +78,16 @@ NodeId AudioCenter::create_matrix(BandWidth bandwidth, const ChannelMap &map, fl
     });
 }
 
+NodeId AudioCenter::create_convert(PortSpec input, PortSpec output)
+{
+    return dispatch(*commands_, [&] { return graph_->create_convert(input, output); });
+}
+
+PortSpec AudioCenter::output_spec(NodeId port) const
+{
+    return dispatch(*commands_, [&] { return graph_->port_spec(port, true); });
+}
+
 RetCode AudioCenter::connect(NodeId from, NodeId to)
 {
     return call_status(*commands_, [&] { graph_->connect(from, to); });

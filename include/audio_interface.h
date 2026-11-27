@@ -119,11 +119,21 @@ class AudioCenter
     /// @note Use ChannelMap::identity(channels) for a gain-only node. Keep the map available for reading until this call returns. See last_error() on failure.
     NodeId create_matrix(BandWidth bandwidth, const ChannelMap &map, float gain = 1.0f);
 
-    /// @brief Stage a connection from an output to an input, inserting format bridges as needed.
+    /// @brief Create a sample rate and format converter. Input and output must have the same channel count.
+    /// @return A node handle, or an empty handle on failure. See last_error().
+    /// @note Use create_matrix() to change the channel count.
+    NodeId create_convert(PortSpec input, PortSpec output);
+
+    /// @brief Read the graph-side specification of an output port, including WAV sources.
+    /// @return The port specification, or an invalid specification on failure. See last_error().
+    PortSpec output_spec(NodeId port) const;
+
+    /// @brief Stage a connection between ports with identical sample rate, channel count and sample format.
+    /// @return INVFMT if the port specifications differ.
     RetCode connect(NodeId from, NodeId to);
-    /// @brief Stage removal of the given connection and its automatic bridges.
+    /// @brief Stage removal of the given connection.
     RetCode disconnect(NodeId from, NodeId to);
-    /// @brief Stage removal of the connection at the destination input and its automatic bridges.
+    /// @brief Stage removal of the connection at the destination input.
     /// @note Unconnected, unpaused WAV outputs record silence while running.
     RetCode disconnect(NodeId to);
     /// @brief Remove a node and its connections from the draft. The handle must select port zero.

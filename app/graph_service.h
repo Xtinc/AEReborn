@@ -2,7 +2,6 @@
 #define AEREBORN_APP_GRAPH_SERVICE_H
 
 #include "core/engine.h"
-#include <array>
 #include <chrono>
 #include <map>
 #include <memory>
@@ -29,6 +28,8 @@ class GraphService
     NodeId create_mixer(BandWidth bandwidth, std::size_t channels, std::size_t inputs);
     NodeId create_matrix(BandWidth bandwidth, std::size_t input_channels, std::size_t output_channels,
                          View<const float> coefficients, float gain);
+    NodeId create_convert(PortSpec input, PortSpec output);
+    PortSpec port_spec(NodeId port, bool output);
 
     void connect(NodeId from, NodeId to);
     void disconnect(NodeId from, NodeId to);
@@ -54,32 +55,17 @@ class GraphService
     };
     using NodeMap = std::map<NodeId, NodeBinding>;
 
-    struct LogicalLink
-    {
-        struct Bridge
-        {
-            NodeId node;
-            ConnId input;
-        };
-
-        NodeId from;
-        std::array<Bridge, 2> bridges{};
-        ConnId tail{};
-    };
-
     NodeMap::iterator add_node(std::unique_ptr<Node> node);
     template <class Endpoint>
     NodeId add_endpoint(std::unique_ptr<Endpoint> endpoint, std::unique_ptr<ActiveBackend> backend);
     NodeMap::iterator find_node(NodeId node);
     Backend *backend_of(NodeId node) noexcept;
-    PortSpec port_spec(NodeId port, bool output);
     void disconnect_input(NodeId to, const NodeId *from);
-    void remove_bridges(const LogicalLink &link) noexcept;
 
     CommandQueue &commands_;
     Engine engine_;
     NodeMap nodes_;
-    std::map<NodeId, LogicalLink> links_; // Keyed by destination input port.
+    std::map<NodeId, Connection> links_; // Keyed by destination input port.
 };
 
 } // namespace aereborn

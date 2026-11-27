@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "engine": {"state":"Running","plan":2,"tick":12480,"period_ms":10,"tick_us":138,"missed_periods":0,"dirty":true},
+  "nodes": [
+    {"id":1,"type":"MultiTone","name":"src16","in_plan":true,"paused":false,"inputs":[],"outputs":[{"rate":44100,"channels":16,"format":"F32P"}]},
+    {"id":2,"type":"Playback","name":"raw16_play","in_plan":true,"paused":false,"inputs":[{"rate":44100,"channels":16,"format":"F32P"}],"outputs":[],"queue":{"bound":true,"online":true,"steady":true,"frames":1000,"capacity":1920,"overflow":0}},
+    {"id":3,"type":"Matrix","name":"down16_to_2","in_plan":true,"paused":false,"inputs":[{"rate":44100,"channels":16,"format":"F32P"}],"outputs":[{"rate":44100,"channels":2,"format":"F32P"}],"gain":1},
+    {"id":4,"type":"Capture","name":"voice_cap","in_plan":true,"paused":false,"inputs":[],"outputs":[{"rate":16000,"channels":1,"format":"F32P"}],"queue":{"bound":true,"online":true,"steady":true,"frames":960,"capacity":1920,"underrun":0}},
+    {"id":5,"type":"Matrix","name":"voice_upmix","in_plan":true,"paused":false,"inputs":[{"rate":16000,"channels":1,"format":"F32P"}],"outputs":[{"rate":16000,"channels":2,"format":"F32P"}],"gain":1},
+    {"id":6,"type":"MultiTone","name":"bgm_tone","in_plan":true,"paused":false,"inputs":[],"outputs":[{"rate":48000,"channels":2,"format":"F32P"}],"gain":0},
+    {"id":7,"type":"Convert","name":"","in_plan":true,"paused":false,"inputs":[{"rate":44100,"channels":2,"format":"F32P"}],"outputs":[{"rate":48000,"channels":2,"format":"F32P"}]},
+    {"id":8,"type":"Convert","name":"","in_plan":true,"paused":false,"inputs":[{"rate":16000,"channels":2,"format":"F32P"}],"outputs":[{"rate":48000,"channels":2,"format":"F32P"}]},
+    {"id":9,"type":"MultiTone","name":"paused_tone","in_plan":false,"paused":true,"inputs":[],"outputs":[{"rate":48000,"channels":2,"format":"F32P"}]},
+    {"id":10,"type":"Mixer","name":"main_mixer","in_plan":true,"paused":false,"inputs":[{"rate":48000,"channels":2,"format":"F32P"},{"rate":48000,"channels":2,"format":"F32P"},{"rate":48000,"channels":2,"format":"F32P"},{"rate":48000,"channels":2,"format":"F32P"}],"outputs":[{"rate":48000,"channels":2,"format":"F32P"}],"slots":[{"high":false,"muted":false,"suppressed":false},{"high":true,"muted":false,"suppressed":false},{"high":false,"muted":true,"suppressed":false},{"high":false,"muted":false,"suppressed":false}]},
+    {"id":11,"type":"Capture","name":"dangling_cap","in_plan":false,"paused":false,"inputs":[],"outputs":[{"rate":48000,"channels":1,"format":"F32P"}],"queue":{"bound":true,"online":false,"steady":false,"frames":0,"capacity":1920,"underrun":0}},
+    {"id":12,"type":"Matrix","name":"master_gain","in_plan":true,"paused":false,"inputs":[{"rate":48000,"channels":2,"format":"F32P"}],"outputs":[{"rate":48000,"channels":2,"format":"F32P"}],"gain":0.6},
+    {"id":13,"type":"Playback","name":"rec_play","in_plan":true,"paused":false,"inputs":[{"rate":48000,"channels":2,"format":"F32P"}],"outputs":[],"queue":{"bound":true,"online":true,"steady":true,"frames":1440,"capacity":1920,"overflow":0}},
+    {"id":14,"type":"Matrix","name":"monitor_down","in_plan":true,"paused":false,"inputs":[{"rate":48000,"channels":2,"format":"F32P"}],"outputs":[{"rate":48000,"channels":1,"format":"F32P"}],"gain":1},
+    {"id":15,"type":"Playback","name":"paused_play","in_plan":false,"paused":true,"inputs":[{"rate":48000,"channels":2,"format":"F32P"}],"outputs":[],"queue":{"bound":true,"online":false,"steady":false,"frames":0,"capacity":1920,"overflow":0}},
+    {"id":16,"type":"RmsMeter","name":"","in_plan":true,"paused":false,"inputs":[{"rate":16000,"channels":1,"format":"F32P"}],"outputs":[]},
+    {"id":17,"type":"Convert","name":"","in_plan":true,"paused":false,"inputs":[{"rate":48000,"channels":1,"format":"F32P"}],"outputs":[{"rate":16000,"channels":1,"format":"F32P"}]}
+  ],
+  "connections": [
+    {"id":1,"from":[1,0],"to":[2,0],"in_plan":true},
+    {"id":2,"from":[1,0],"to":[3,0],"in_plan":true},
+    {"id":3,"from":[3,0],"to":[7,0],"in_plan":true},
+    {"id":4,"from":[7,0],"to":[10,0],"in_plan":true},
+    {"id":5,"from":[4,0],"to":[5,0],"in_plan":true},
+    {"id":6,"from":[5,0],"to":[8,0],"in_plan":true},
+    {"id":7,"from":[8,0],"to":[10,1],"in_plan":true},
+    {"id":8,"from":[6,0],"to":[10,2],"in_plan":true},
+    {"id":9,"from":[10,0],"to":[12,0],"in_plan":true},
+    {"id":10,"from":[12,0],"to":[13,0],"in_plan":true},
+    {"id":11,"from":[12,0],"to":[14,0],"in_plan":true},
+    {"id":12,"from":[14,0],"to":[17,0],"in_plan":true},
+    {"id":13,"from":[17,0],"to":[16,0],"in_plan":true},
+    {"id":14,"from":[12,0],"to":[15,0],"in_plan":false},
+    {"id":15,"from":[9,0],"to":[10,3],"in_plan":false}
+  ],
+  "backends": [
+    {"node":1,"type":"16ch Source","state":"Running","error":"OK","device":{"rate":44100,"channels":16,"format":"F32P"},"active":false,"async":false,"fir":false,"max_frames":441},
+    {"node":2,"type":"NullPlayback","device":{"rate":44100,"channels":16,"format":"F32LE"},"file":null,"state":"Running","error":"OK","async":false,"active":true,"fir":false,"max_frames":441},
+    {"node":4,"type":"WavCapture","device":{"rate":16000,"channels":1,"format":"F32LE"},"file":"demo_voice_16k.wav","state":"Running","error":"OK","async":false,"active":true,"fir":false,"max_frames":160},
+    {"node":13,"type":"WavPlayback","device":{"rate":48000,"channels":2,"format":"S16LE"},"file":"demo_mix_48k_out.wav","state":"Running","error":"OK","async":false,"active":true,"fir":false,"max_frames":480},
+    {"node":15,"type":"WavPlayback","device":{"rate":48000,"channels":2,"format":"S16LE"},"file":"paused_mix_48k.wav","state":"Stopped","error":"OK","async":false,"active":true,"fir":false,"max_frames":480}
+  ],
+  "positions": {
+    "1": [174,62,138,65], "2": [730,32,153,78], "3": [392,125,147,50], "4": [174,191,138,78],
+    "5": [392,195,147,50], "6": [174,294,138,46], "7": [619,119,106,46], "8": [619,182,106,46],
+    "9": [366,382,138,46], "10": [805,156,149,122], "11": [174,382,142,75], "12": [1034,190,132,56],
+    "13": [1246,85,143,78], "14": [1246,213,146,50], "15": [1246,382,155,76], "16": [1649,213,108,46],
+    "17": [1472,215,97,46]
+  }
+}

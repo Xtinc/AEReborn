@@ -70,7 +70,7 @@ int main(int argc, char *argv[])
 {
     if (argc < 3)
     {
-        std::cerr << "Usage: " << argv[0] << " <bgm.wav> <voice.wav> [extra.wav]\n";
+        std::cerr << "Usage: " << argv[0] << " <bgm.wav> <voice.wav> [extra.wav] (48 kHz stereo inputs)\n";
         return 1;
     }
 
@@ -85,18 +85,18 @@ int main(int argc, char *argv[])
         const std::string out_segment_path = "scene_out_segment_44k.wav";
         const std::string out_paused_path = "scene_out_paused_48k.wav";
 
-        // 单文件 create_owav 为独占打开，运行前清理旧输出避免返回 BUSY
-        for (const auto &p : {out_master_path, out_monitor_path, out_paused_path})
-            std::remove(p.c_str());
-
         AudioCenter audio(BlockPeriod::INR_10MS);
 
         // =====================================================================
-        // 1. 创建节点（纯公开接口，输入自动探测 WAV 规格并循环播放）
+        // 1. 创建节点。示例总线使用 48 kHz 双声道，输入 WAV 循环播放。
         // =====================================================================
         const auto src_bgm = check_node(audio.create_iwav(bgm_path, -1), "create_iwav(bgm)");
         const auto src_voice = check_node(audio.create_iwav(voice_path, -1), "create_iwav(voice)");
         const auto src_extra = check_node(audio.create_iwav(extra_path, -1), "create_iwav(extra)");
+        const PortSpec stereo{BandWidth::Full, 2, SampleFormat::F32P};
+        for (const auto source : {src_bgm, src_voice, src_extra})
+            if (audio.output_spec(source) != stereo)
+                throw std::runtime_error("wave_test expects 48 kHz stereo input WAV files");
 
         // 子总线（48kHz 2ch）+ 自定义 ChannelMap（左右互换并衰减右声道）
         const auto sub_mix = check_node(audio.create_mixer(BandWidth::Full, 2, 2), "create_mixer(sub)");
@@ -111,8 +111,16 @@ int main(int argc, char *argv[])
         // 显式单声道混缩矩阵
         const auto mono_down =
             check_node(audio.create_matrix(BandWidth::Full, ChannelMap::to_mono(2)), "create_matrix(mono_down)");
+        const auto monitor_convert = check_node(
+            audio.create_convert({BandWidth::Full, 1, SampleFormat::F32P}, {BandWidth::Wide, 1, SampleFormat::F32P}),
+            "create_convert(monitor)");
+        const auto segment_convert = check_node(
+            audio.create_convert(stereo, {BandWidth::CDQuality, 2, SampleFormat::F32P}), "create_convert(segment)");
 
         // 4 路异构输出（标准录盘 / 16k 单声道监听 / 44.1k 分段录盘 / 可暂停支路）
+        // 单文件 create_owav 独占打开，输入检查通过后清理旧输出。
+        for (const auto &p : {out_master_path, out_monitor_path, out_paused_path})
+            std::remove(p.c_str());
         const auto rec_master = check_node(
             audio.create_owav(out_master_path, PortSpec(BandWidth::Full, 2, SampleFormat::S16LE)),
             "create_owav(master)");
@@ -129,11 +137,12 @@ int main(int argc, char *argv[])
         const std::initializer_list<NamedNode> named_nodes{
             {"bgm", src_bgm}, {"voice", src_voice}, {"extra", src_extra},
             {"sub_mix", sub_mix}, {"sub_fx", sub_fx}, {"main_mix", main_mix}, {"gain", master_gain},
-            {"mono", mono_down}, {"master", rec_master}, {"monitor", rec_monitor},
+            {"mono", mono_down}, {"16k", monitor_convert}, {"44.1k", segment_convert},
+            {"master", rec_master}, {"monitor", rec_monitor},
             {"segment", rec_segment}, {"paused_branch", rec_paused}};
 
         // =====================================================================
-        // 2. 连线（跨采样率/声道由 AudioCenter 自动插桥）
+        // 2. 连接同规格端口。监听和分段录制经过上面显式创建的转换节点。
         // =====================================================================
         check_rc(audio.connect(src_bgm, sub_mix[0]), "connect(src_bgm -> sub_mix[0])");
         check_rc(audio.connect(sub_mix, sub_fx), "connect(sub_mix -> sub_fx)");
@@ -146,8 +155,10 @@ int main(int argc, char *argv[])
         check_rc(audio.connect(main_mix, master_gain), "connect(main_mix -> master_gain)");
         check_rc(audio.connect(master_gain, rec_master), "connect(master_gain -> rec_master)");
         check_rc(audio.connect(master_gain, mono_down), "connect(master_gain -> mono_down)");
-        check_rc(audio.connect(mono_down, rec_monitor), "connect(mono_down -> rec_monitor)");
-        check_rc(audio.connect(master_gain, rec_segment), "connect(master_gain -> rec_segment)");
+        check_rc(audio.connect(mono_down, monitor_convert), "connect(mono_down -> monitor_convert)");
+        check_rc(audio.connect(monitor_convert, rec_monitor), "connect(monitor_convert -> rec_monitor)");
+        check_rc(audio.connect(master_gain, segment_convert), "connect(master_gain -> segment_convert)");
+        check_rc(audio.connect(segment_convert, rec_segment), "connect(segment_convert -> rec_segment)");
 
         // =====================================================================
         // 3. 初始混音策略与启动（引擎进入持续运行态）
