@@ -133,14 +133,9 @@ RetCode AudioCenter::set_high_priority(NodeId mixer_port, bool high)
     return call_status(*commands_, [&] { graph_->set_high_priority(mixer_port, high); });
 }
 
-std::string AudioCenter::dump_text() const
+std::string AudioCenter::dump_json() const
 {
-    return dispatch(*commands_, [&] { return graph_->dump_text(); });
-}
-
-std::string AudioCenter::dump_dot() const
-{
-    return dispatch(*commands_, [&] { return graph_->dump_dot(); });
+    return dispatch(*commands_, [&] { return graph_->dump_json(); });
 }
 
 RetCode AudioCenter::last_error() noexcept

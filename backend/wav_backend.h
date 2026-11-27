@@ -17,6 +17,9 @@ class WavCapture final : public ActiveBackend
     /// @copydoc Backend::type_name
     const char *type_name() const noexcept override { return "WavCapture"; }
 
+    /// @brief Borrow the configured WAV input path.
+    const std::string &path() const noexcept { return path_; }
+
     /// @brief Number of additional passes after the first one.
     struct Repeat
     {
@@ -55,6 +58,9 @@ class WavPlayback final : public ActiveBackend
   public:
     /// @copydoc Backend::type_name
     const char *type_name() const noexcept override { return "WavPlayback"; }
+
+    /// @brief Borrow the configured WAV output path, before segment numbering.
+    const std::string &path() const noexcept { return path_; }
 
     /// @brief Record to one file, truncating its existing contents at bind time.
     /// @throws Error If the format is unsupported for WAV output.

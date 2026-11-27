@@ -202,9 +202,31 @@ Tone / BUS（48k F32P）
 
 ### 运行态诊断
 
-仓库内的目标链接 `aereborn::aereborn`，并通过私有头路径包含 `diag/inspect.h`，即可在串行控制侧调用 `dump_text()` 或 `dump_dot()`。两者都支持返回字符串或写入输出流。传入需要一起检查的后端，报告会按端点关联生效节点，并列出未进入生效 Plan 的后端。队列水位为近似值，`underrun` 和 `overflow` 分别累计图侧采集缺帧和播放丢帧。`late` 是时钟跳过的周期数，`tick_us` 是最近一拍含时钟收尾的估计耗时。
+`AudioCenter::dump_json()` 导出版本化诊断快照，供桑基风格的 SVG 脚本读取。GraphService 提供当前配置和端口规格，`in_plan` 表示节点或连线已生效，`plan_order` 按实际执行顺序列出已提交计划的节点 ID。引擎显示 `DIRTY` 时，图包含待提交的配置，`plan_order` 继续反映当前生效的计划。已提交的暂停支路仍可见，暂存的暂停用 `PAUSE PENDING` 标记。仓库内的目标可在串行控制侧通过 `diag/inspect.h` 调用 `dump_json(engine)` 导出已提交计划。
 
-用 `dot -Tsvg graph.dot -o graph.svg` 渲染信号流图。卡片标题显示端点状态和后端错误短码，橙色标记预填充、排空、跳拍或队列缺帧。多端口节点按插槽接线，Mixer 的静音端口和入边置灰。启用优先级时，文本报告显示 `high` 和 `suppressed`，DOT 用 `[HIGH]` 标记高优端口，用 `[SUPP]` 和琥珀色虚线标记被压制的普通端口及其入边。卡片和连线直接显示关键规格，SVG 悬停可查看完整诊断详情。`io.diagnostic_reports` 和 `io.mixer_priority_diagnostics` 检查文本和 DOT 输出，`io.endpoint_diagnostics` 检查端点计数、重启及短批次排空。
+队列水位为近似值，`underrun` 和 `overflow` 分别累计图侧采集缺帧和播放丢帧。`missed_periods` 是时钟跳过的周期数，`tick_us` 是最近一拍含时钟收尾的估计耗时。WAV 后端只导出文件名。
+
+先用 `npm --prefix tools ci` 安装渲染依赖。运行 `node tools/render_graph.js INPUT.json [OUTPUT.svg]` 生成 SVG。省略输出路径时，SVG 写在 JSON 同目录并沿用文件名。脚本使用 Node.js 18+、ELK 和 Apache ECharts。
+
+`wave_test` 启动后会在工作目录写入 Plan #2 的快照，运行中输入 `json` 可以重新采样。脚本按 `examples/wave_test_layout.json` 排列主支路和自动插入的转换节点。模板无法容纳快照时，脚本会提示原因并切换到 ELK 自动布局。普通快照也可补充 `name` 供卡片显示。
+
+```sh
+cmake -S . -B build
+cmake --build build --target wave_test
+npm --prefix tools ci
+mkdir -p build/graph-preview
+(cd build/graph-preview && printf 'q\n' | ../examples/wave_test \
+    ../../tests/data/california_hotel_excerpt.wav ../../tests/data/dukou_excerpt.wav)
+node tools/render_graph.js build/graph-preview/complex_public_scene.json
+```
+
+`examples/sankey_reference.json` 是示意快照。`positions` 支持 `[x, y]` 和 `[x, y, width, height]`，坐标对应卡片左上角。每个输入和输出都有标记，空端口显示浅色轮廓。Mixer 的每个输入对齐对应 Slot。同一输出端口的多条流带从卡片边缘并排引出，共用一个标记。悬停标记可查看端口编号、规格和连接数。
+
+1、2、4、8、16 声道流带分别宽 7、16、20、24、32 px。暂停支路用灰色虚线显示。Mixer 用 `[HIGH]` 标记高优端口，用 `[SUPP]` 和琥珀色虚线标记被压制的普通端口及其入边。后端完整错误说明和漂移数据放在悬停标题中。
+
+```sh
+node tools/render_graph.js examples/sankey_reference.json build/graph-preview/reference-sankey.svg
+```
 
 ### AudioCenter
 

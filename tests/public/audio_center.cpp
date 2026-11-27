@@ -101,16 +101,40 @@ std::size_t find_steady_level(const Bytes &data, std::size_t start, std::uint16_
 
 std::uint64_t tick(const AudioCenter &audio)
 {
-    const auto text = audio.dump_text();
-    const auto start = text.find(" | tick=");
+    const auto snapshot = audio.dump_json();
+    const auto start = snapshot.find("\"tick\":");
     check(start != std::string::npos, "Expect the current render tick in diagnostics");
-    return std::stoull(text.substr(start + 8));
+    return std::stoull(snapshot.substr(start + 7));
 }
 
 void advance(const AudioCenter &audio, std::uint64_t blocks)
 {
     const auto target = tick(audio) + blocks;
     wait_for([&] { return tick(audio) >= target; }, "Wait for the expected render ticks", 4s);
+}
+
+std::string backend_state(NodeId id, const char *state)
+{
+    return "\"node\":" + std::to_string(id.node()) + ",\"state\":\"" + state + '"';
+}
+
+bool bridges_in_plan_order(const std::string &snapshot, bool downmix)
+{
+    const auto order_start = snapshot.find("\"plan_order\":[");
+    check(order_start != std::string::npos, "Expect the execution order in diagnostics");
+    const auto first_id = order_start + sizeof("\"plan_order\":[") - 1;
+    const auto order_end = snapshot.find(']', first_id);
+    check(order_end != std::string::npos, "Expect the complete execution order");
+    const auto order = ',' + snapshot.substr(first_id, order_end - first_id) + ',';
+    const auto position_in_plan = [&](std::size_t type) {
+        check(type != std::string::npos, "Expect the automatic bridge in diagnostics");
+        const auto id = snapshot.rfind("{\"id\":", type);
+        check(id != std::string::npos, "Expect the automatic bridge ID");
+        return order.find(',' + std::to_string(std::stoull(snapshot.substr(id + 6))) + ',');
+    };
+    const auto matrix = position_in_plan(snapshot.rfind("\"type\":\"Matrix\""));
+    const auto convert = position_in_plan(snapshot.find("\"type\":\"Convert\""));
+    return matrix != std::string::npos && convert != std::string::npos && (downmix ? matrix < convert : convert < matrix);
 }
 
 void channel_map()
@@ -201,26 +225,39 @@ void wav_routing_and_bridge()
     expect(audio.start());
     expect(audio.start(), RetCode::BUSY);
 
-    const auto text = audio.dump_text();
-    const auto bridge = text.rfind("] Matrix");
-    const auto converter = text.find("] Convert");
-    check(bridge != std::string::npos && converter != std::string::npos && bridge < converter,
-          "Downmix precedes resampling");
-    check(audio.dump_dot().find("digraph") != std::string::npos, "Expect DOT diagnostics");
-    wait_for([&] { return audio.dump_text().find("err=End of stream") != std::string::npos; },
+    const auto snapshot = audio.dump_json();
+    check(bridges_in_plan_order(snapshot, true), "Downmix precedes resampling");
+    check(snapshot.find("\"file\":\"dukou_excerpt.wav\"") != std::string::npos &&
+              snapshot.find("\"type\":\"Convert\"") != std::string::npos &&
+              snapshot.find("\"to\":[" + std::to_string(mixer.node()) + ",1],\"in_plan\":true") != std::string::npos,
+          "JSON exposes audio bridges, exact destination ports and WAV file names");
+    wait_for([&] { return audio.dump_json().find("\"error\":\"EOS\"") != std::string::npos; },
              "The finite input reaches EOS", 4s);
     const auto added_source = audio.create_iwav(input, -1);
     const auto added_sink = audio.create_owav(added);
     check(added_source && added_sink, "Create an independent branch while the engine is running");
     expect(audio.connect(added_source, added_sink));
     expect(audio.set_paused(out_stereo, true));
+    const auto stereo_node = "\"id\":" + std::to_string(out_stereo.node()) + ",\"type\":\"Playback\",\"in_plan\":";
+    const auto stereo_link = "\"from\":[" + std::to_string(matrix.node()) + ",0],\"to\":[" +
+                             std::to_string(out_stereo.node()) + ",0],\"in_plan\":";
+    const auto added_node = "\"id\":" + std::to_string(added_source.node()) + ",\"type\":\"Capture\",\"in_plan\":";
+    const auto drafted = audio.dump_json();
+    check(drafted.find(stereo_node + "true,\"paused\":true") != std::string::npos &&
+              drafted.find(stereo_link + "true") != std::string::npos &&
+              drafted.find(added_node + "false,\"paused\":false") != std::string::npos,
+          "JSON shows pending pause and the newly configured branch alongside the committed plan");
     expect(audio.commit());
-    const auto changed = audio.dump_text();
-    check(changed.find("err=End of stream") != std::string::npos &&
-              changed.find("WavCapture (sync) state=Running") != std::string::npos,
+    const auto published = audio.dump_json();
+    check(published.find(stereo_node + "false,\"paused\":true") != std::string::npos &&
+              published.find(stereo_link + "false") != std::string::npos &&
+              published.find(added_node + "true,\"paused\":false") != std::string::npos,
+          "JSON retains the paused branch and updates plan membership after commit");
+    check(published.find("\"error\":\"EOS\"") != std::string::npos &&
+              published.find(backend_state(added_source, "Running")) != std::string::npos,
           "The new branch starts while the original capture stays at EOS");
     advance(audio, 8);
-    check(audio.dump_text().find("err=End of stream") != std::string::npos,
+    check(audio.dump_json().find("\"error\":\"EOS\"") != std::string::npos,
           "The original capture keeps its EOS status while the new branch runs");
     expect(audio.stop());
     expect(audio.stop());
@@ -237,18 +274,14 @@ void wav_routing_and_bridge()
     check(mono_source && stereo_sink, "Create the reverse specification route");
     expect(audio.connect(mono_source, stereo_sink));
     expect(audio.commit());
-    const auto stopped = audio.dump_text();
-    check(stopped.find("Engine: Ready") != std::string::npos &&
-              stopped.find("WavCapture (sync) state=Stopped") != std::string::npos &&
-              stopped.find("WavPlayback (sync) state=Stopped") != std::string::npos &&
-              stopped.find("state=Running") == std::string::npos,
+    const auto stopped = audio.dump_json();
+    check(stopped.find("\"engine\":{\"state\":\"Ready\"") != std::string::npos &&
+              stopped.find(backend_state(mono_source, "Stopped")) != std::string::npos &&
+              stopped.find(backend_state(stereo_sink, "Stopped")) != std::string::npos &&
+              stopped.find("\"state\":\"Running\"") == std::string::npos,
           "A stopped engine can publish a new plan without starting its backends");
     expect(audio.start());
-    const auto reverse = audio.dump_text();
-    const auto upconvert = reverse.find("] Convert");
-    const auto upmix = reverse.find("] Matrix");
-    check(upconvert != std::string::npos && upmix != std::string::npos && upconvert < upmix,
-          "Mono resampling precedes channel duplication");
+    check(bridges_in_plan_order(audio.dump_json(), false), "Mono resampling precedes channel duplication");
     advance(audio, 6);
     expect(audio.remove(stereo_sink));
     const auto upmixed_pcm = read_s16(upmixed, 48000, 2);
@@ -304,13 +337,15 @@ void live_control_and_cleanup()
     advance(audio, 8);
     expect(audio.set_muted(mix[1], false));
     advance(audio, 8);
-    check(audio.dump_dot().find("[HIGH]") != std::string::npos, "Report the live priority setting");
+    check(audio.dump_json().find("\"high\":true,\"muted\":false") != std::string::npos,
+          "Report the live priority setting");
     expect(audio.disconnect(sink));
     expect(audio.commit());
     advance(audio, 8);
     expect(audio.set_paused(sink, true));
     expect(audio.commit());
-    check(audio.dump_text().find("[" + std::to_string(sink.node()) + "] Playback") == std::string::npos,
+    check(audio.dump_json().find("\"id\":" + std::to_string(sink.node()) +
+                                 ",\"type\":\"Playback\",\"in_plan\":false,\"paused\":true") != std::string::npos,
           "Pausing the recorder removes it from the running plan");
     advance(audio, 5);
     expect(audio.remove(sink));
@@ -326,15 +361,14 @@ void live_control_and_cleanup()
 
     expect(audio.set_paused(monitor_sink, true));
     expect(audio.commit());
-    const auto paused = audio.dump_text();
-    const auto detached = paused.find("Detached Backends:");
-    check(paused.find("WavPlayback (sync) state=Stopped", detached) != std::string::npos,
-          "A paused recorder stops and appears among detached backends");
+    const auto paused = audio.dump_json();
+    check(paused.find(backend_state(monitor_sink, "Stopped")) != std::string::npos,
+          "A paused recorder's backend stops");
     expect(audio.set_paused(monitor_sink, false));
     expect(audio.commit());
-    const auto resumed = audio.dump_text();
-    check(resumed.find("WavCapture (sync) state=Running") != std::string::npos &&
-              resumed.find("WavPlayback (sync) state=Running") != std::string::npos,
+    const auto resumed = audio.dump_json();
+    check(resumed.find(backend_state(source, "Running")) != std::string::npos &&
+              resumed.find(backend_state(monitor_sink, "Running")) != std::string::npos,
           "Both endpoints restart when the recorder rejoins the plan");
 
     expect(audio.remove(source)); // Unbind while the old plan still includes this endpoint.
@@ -377,7 +411,7 @@ void concurrency_and_teardown()
         auto diagnostics = std::async(std::launch::async, [&] {
             for (int i = 0; i < 10; ++i)
             {
-                check(!audio.dump_text().empty(), "Concurrent diagnostics are available");
+                check(!audio.dump_json().empty(), "Concurrent diagnostics are available");
                 expect(audio.commit());
             }
             expect(audio.set_gain(mixer, 0.5f), RetCode::ETYPE);

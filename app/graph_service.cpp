@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cassert>
 #include <utility>
+#include <vector>
 
 namespace aereborn
 {
@@ -41,8 +42,8 @@ GraphService::~GraphService()
 {
     assert(commands_.on_thread());
     for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it)
-        if (it->second)
-            it->second->unbind();
+        if (it->second.backend)
+            it->second.backend->unbind();
     engine_.stop();
 }
 
@@ -51,7 +52,7 @@ GraphService::NodeMap::iterator GraphService::add_node(std::unique_ptr<Node> nod
     const auto id = engine_.add_node(std::move(node));
     const auto cleanup = [&]() noexcept { engine_.remove_node(id); };
     ScopeExit<decltype(cleanup)> rollback(cleanup);
-    const auto entry = nodes_.emplace(id, nullptr).first;
+    const auto entry = nodes_.emplace(id, NodeBinding{}).first;
     rollback.dismiss();
     return entry;
 }
@@ -68,7 +69,7 @@ NodeId GraphService::add_endpoint(std::unique_ptr<Endpoint> endpoint, std::uniqu
     };
     ScopeExit<decltype(cleanup)> rollback(cleanup);
     backend->bind(*node);
-    entry->second = std::move(backend);
+    entry->second.backend = std::move(backend);
     rollback.dismiss();
     return entry->first;
 }
@@ -122,7 +123,7 @@ GraphService::NodeMap::iterator GraphService::find_node(NodeId node)
 Backend *GraphService::backend_of(NodeId node) noexcept
 {
     const auto entry = nodes_.find(node);
-    return entry == nodes_.end() ? nullptr : entry->second.get();
+    return entry == nodes_.end() ? nullptr : entry->second.backend.get();
 }
 
 PortSpec GraphService::port_spec(NodeId port, bool output)
@@ -154,8 +155,9 @@ void GraphService::connect(NodeId from, NodeId to)
     std::size_t next = 0;
     auto previous = from;
     const auto append = [&](NodeId bridge) {
-        link.bridges[next++] = bridge;
-        engine_.connect(previous, bridge);
+        auto &segment = link.bridges[next++];
+        segment.node = bridge;
+        segment.input = engine_.connect(previous, bridge);
         previous = bridge;
     };
     const auto map_channels = [&] {
@@ -175,9 +177,7 @@ void GraphService::connect(NodeId from, NodeId to)
     }
     if (source.channels < destination.channels)
         map_channels();
-    const auto connection = engine_.connect(previous, to);
-    if (next == 0)
-        link.direct = connection;
+    link.tail = engine_.connect(previous, to);
     rollback.dismiss();
 }
 
@@ -185,8 +185,8 @@ void GraphService::remove_bridges(const LogicalLink &link) noexcept
 {
     // Removing a bridge also removes every connection incident to it.
     for (auto it = link.bridges.rbegin(); it != link.bridges.rend(); ++it)
-        if (*it)
-            engine_.remove_node(*it);
+        if (it->node)
+            engine_.remove_node(it->node);
 }
 
 void GraphService::disconnect(NodeId from, NodeId to)
@@ -210,18 +210,18 @@ void GraphService::disconnect_input(NodeId to, const NodeId *from)
         port_spec(to, false);
         throw Error(RetCode::ECONN);
     }
-    if (link->second.direct)
-        engine_.disconnect(link->second.direct);
-    else
+    if (link->second.bridges.front().node)
         remove_bridges(link->second);
+    else
+        engine_.disconnect(link->second.tail);
     links_.erase(link);
 }
 
 void GraphService::remove(NodeId node)
 {
     const auto entry = find_node(node);
-    if (entry->second)
-        entry->second->unbind();
+    if (entry->second.backend)
+        entry->second.backend->unbind();
     for (auto it = links_.begin(); it != links_.end();)
     {
         if (it->first.base() == node || it->second.from.base() == node)
@@ -289,15 +289,16 @@ void GraphService::stop() noexcept
 {
     assert(commands_.on_thread());
     for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it)
-        if (it->second)
-            it->second->stop();
+        if (it->second.backend)
+            it->second.backend->stop();
     engine_.stop();
 }
 
 void GraphService::set_paused(NodeId node, bool paused)
 {
-    find_node(node);
+    const auto entry = find_node(node);
     engine_.set_paused(node, paused);
+    entry->second.paused = paused;
 }
 
 void GraphService::set_gain(NodeId matrix, float gain)
@@ -318,26 +319,37 @@ void GraphService::set_high_priority(NodeId mixer_port, bool high)
     engine_.node<Mixer>(mixer_port.base())->set_high_priority(mixer_port.port(), high);
 }
 
-std::vector<const Backend *> GraphService::backends() const
+std::string GraphService::dump_json()
 {
     assert(commands_.on_thread());
-    std::vector<const Backend *> result;
+    std::vector<const Backend *> drivers;
+    std::vector<ConfiguredNode> nodes;
+    std::vector<Connection> connections;
+    nodes.reserve(nodes_.size());
+    connections.reserve(links_.size());
     for (const auto &entry : nodes_)
-        if (entry.second)
-            result.push_back(entry.second.get());
-    return result;
-}
-
-std::string GraphService::dump_text() const
-{
-    const auto drivers = backends();
-    return aereborn::dump_text(engine_, {drivers.data(), drivers.size()});
-}
-
-std::string GraphService::dump_dot() const
-{
-    const auto drivers = backends();
-    return aereborn::dump_dot(engine_, {drivers.data(), drivers.size()});
+    {
+        nodes.push_back({entry.first, engine_.node(entry.first), entry.second.paused});
+        if (entry.second.backend)
+            drivers.push_back(entry.second.backend.get());
+    }
+    for (const auto &entry : links_)
+    {
+        const auto &link = entry.second;
+        auto from = link.from;
+        for (const auto &bridge : link.bridges)
+            if (bridge.node)
+            {
+                nodes.push_back({bridge.node, engine_.node(bridge.node), false});
+                connections.push_back({bridge.input, from, bridge.node});
+                from = bridge.node;
+            }
+        connections.push_back({link.tail, from, entry.first});
+    }
+    std::sort(nodes.begin(), nodes.end(), [](const auto &a, const auto &b) { return a.id < b.id; });
+    std::sort(connections.begin(), connections.end(), [](const auto &a, const auto &b) { return a.id < b.id; });
+    return aereborn::dump_json(engine_, {nodes.data(), nodes.size()}, {connections.data(), connections.size()},
+                              {drivers.data(), drivers.size()});
 }
 
 } // namespace aereborn

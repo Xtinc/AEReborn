@@ -1,0 +1,11 @@
+{
+  "name": "aereborn-graph-renderer",
+  "private": true,
+  "scripts": {
+    "test": "node --test graph_layout.test.js"
+  },
+  "dependencies": {
+    "echarts": "6.0.0",
+    "elkjs": "0.10.0"
+  }
+}

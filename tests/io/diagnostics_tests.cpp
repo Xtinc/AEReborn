@@ -8,7 +8,6 @@
 #include "tests/support/io_fixture.h"
 #include "tests/support/test_backend.h"
 #include <array>
-#include <sstream>
 
 namespace
 {
@@ -41,16 +40,16 @@ class SampledBackend final : public Backend
 void diagnostic_reports()
 {
     Engine engine(period);
+    const auto initial = dump_json(engine);
     check(engine.plan_nodes().empty() && engine.plan_connections().empty() &&
-              dump_text(engine).find("Engine: Unprepared | period=5ms | tick=0 | plan_gen=0") == 0 &&
-              dump_dot(engine).find(">UNPREPARED<") != std::string::npos,
+              initial.find("\"state\":\"Unprepared\",\"period_ms\":5,\"plan\":0,\"tick\":0") != std::string::npos &&
+              initial.find("\"plan_order\":[]") != std::string::npos,
           "Diagnostics work before the initial commit");
     SampledBackend sampled;
     const Backend *backend = &sampled;
-    const auto sampled_graph = dump_dot(engine, {&backend, 1});
-    check(sampled.reads == 1 && sampled_graph.find(">RUN<") != std::string::npos &&
-              sampled_graph.find("state=Running") != std::string::npos,
-          "A backend card and its tooltip use the same state sample");
+    const auto sampled_graph = dump_json(engine, {&backend, 1});
+    check(sampled.reads == 1 && sampled_graph.find("\"node\":null,\"state\":\"Running\"") != std::string::npos,
+          "The detached backend state is sampled once");
     const PortSpec stereo_pcm(rate, 2, SampleFormat::F32LE);
     const PortSpec converted(BandWidth::Wide, 1, SampleFormat::S16LE);
     const auto capture = engine.emplace_node<Capture>(rate, 2, 5ms);
@@ -101,61 +100,41 @@ void diagnostic_reports()
           "The published order includes only executed nodes");
     const std::array<const Backend *, 5> backend_list{{&source, &failed_source, nullptr, &sink, &disconnected}};
     const View<const Backend *const> backends(backend_list.data(), backend_list.size());
-    const auto text = dump_text(engine, backends);
-    const auto graph = dump_dot(engine, backends);
-    check(text.find("high=") == std::string::npos && text.find("suppressed=") == std::string::npos &&
-              graph.find("[HIGH]") == std::string::npos && graph.find("[SUPP]") == std::string::npos,
-          "A mixer without priorities keeps the ordinary diagnostic format");
-    std::ostringstream text_stream, graph_stream;
-    dump_text(text_stream, engine, backends);
-    dump_dot(graph_stream, engine, backends);
-    check(text == text_stream.str() && graph == graph_stream.str(), "Both overloads produce the same output");
-    const auto input_label = "#" + std::to_string(input.value) + ": ";
-    check(text.find("Plan Order: [") != std::string::npos && text.find("in0..1=48000/2ch/F32P") != std::string::npos &&
-              text.find("muted=[0, 1]") != std::string::npos && text.find("gain=0.50") != std::string::npos &&
-              text.find("out0=16000/1ch/S16LE") != std::string::npos && text.find(input_label) != std::string::npos &&
-              text.find("PushSource (sync) state=Running dev=48000/2ch/F32LE") != std::string::npos,
-          "Text reports the port formats, DSP settings, connections, and attached backends");
-    const auto detached_section = text.find("Detached Backends:\n");
-    check(detached_section != std::string::npos &&
-              text.find(RetCode(RetCode::DEVLOST).what(), detached_section) != std::string::npos &&
-              text.find("#" + std::to_string(pruned.value) + ": ") == std::string::npos,
-          "A stopped backend and its error remain visible after its connection is pruned");
-
-    const auto capture_id = std::to_string(capture.node());
     const auto muted_id = std::to_string(muted_capture.node());
     const auto mixer_id = std::to_string(mixer.node());
-    const auto matrix_id = std::to_string(matrix.node());
-    const auto playback_id = std::to_string(playback.node());
-    check(graph.find("digraph AEReborn") == 0 && graph.find("shape=plain") != std::string::npos &&
-              graph.find("STYLE=\"ROUNDED\" BGCOLOR=\"#DFF4F0\" COLOR=\"#2E8B7D\"><TR><TD ALIGN=\"LEFT\">")
+    const auto snapshot = dump_json(engine, backends);
+    auto order = std::string("\"plan_order\":[");
+    const char *separator = "";
+    for (const auto id : {capture, muted_capture, mixer, matrix, convert, observer, playback})
+    {
+        order += separator + std::to_string(id.node());
+        separator = ",";
+    }
+    check(snapshot.find(order + ']') != std::string::npos, "JSON lists the actual execution order");
+    const auto paused_id = std::to_string(detached.node());
+    const auto detached_error = std::string("\"node\":null,\"state\":\"Stopped\",\"error\":\"DEVLOST\",\"error_message\":\"")
+                                + RetCode(RetCode::DEVLOST).what() + '"';
+    check(snapshot.find("\"type\":\"Monitor <A> & \\\"B\\\"\"") != std::string::npos &&
+              snapshot.find("\"id\":" + paused_id + ",\"type\":\"Playback\"") == std::string::npos &&
+              snapshot.find("\"id\":" + muted_id + ",\"type\":\"Capture\",\"in_plan\":true,\"paused\":false")
                   != std::string::npos &&
-              graph.find(">READY<") != std::string::npos && graph.find(">DIRTY<") != std::string::npos &&
-              graph.find(">ONLINE<") != std::string::npos && graph.find(">OFFLINE<") != std::string::npos &&
-              graph.find("Queue 720/1920 (38%)") != std::string::npos &&
-              graph.find("Monitor &lt;A&gt; &amp; &quot;B&quot;") != std::string::npos,
-          "DOT cards fill the rounded outline and show status, queue numbers, and safely escaped titles");
-    check(graph.find("PORT=\"i1\"") != std::string::npos && graph.find("in1 [MUTE]") != std::string::npos &&
-              graph.find("PORT=\"o0\" ROWSPAN=\"2\"") != std::string::npos &&
-              graph.find("n" + muted_id + ":e -> n" + mixer_id + ":i1:w [label=\"48k 2ch F32P (muted)\", style=dashed")
-                  != std::string::npos &&
-              graph.find("n" + mixer_id + ":o0:e -> n" + matrix_id + ":w") != std::string::npos &&
-              graph.find("2ch -&gt; 1ch | Gain 0.50") != std::string::npos &&
-              graph.find("48k F32P -&gt; 16k S16LE") != std::string::npos,
-          "DOT anchors ports, mutes the matching edge, and displays channel, gain and format conversion");
-    check(graph.find("b" + capture_id + ":e -> n" + capture_id + ":w") != std::string::npos &&
-              graph.find("b" + muted_id + ":e -> n" + muted_id + ":w [style=dashed, color=\"#DC2626\", label=\"ASRC\"")
-                  != std::string::npos &&
-              graph.find("n" + playback_id + ":e -> b" + playback_id + ":w [style=dashed, color=\"#64748B\", label=\"FIR\"")
-                  != std::string::npos &&
-              graph.find("tooltip=\"" + input_label + "[" + capture_id + "]:0") != std::string::npos &&
-              graph.find("cluster_detached") != std::string::npos && graph.find("ERR: DEVLOST") != std::string::npos &&
-              graph.find("ERR: EOS") != std::string::npos &&
-              graph.find(RetCode(RetCode::DEVLOST).what()) != std::string::npos,
-          "DOT labels backend modes and error codes and retains detailed tooltips for edges and failures");
+              snapshot.find("\"id\":" + std::to_string(pruned.value) + ",\"from\":") == std::string::npos &&
+              snapshot.find("\"to\":[" + paused_id + ",0]") == std::string::npos &&
+              snapshot.find(detached_error) != std::string::npos,
+          "Engine JSON reports committed nodes and connections together with detached backend status");
+    check(snapshot.find("\"state\":\"Ready\"") != std::string::npos &&
+              snapshot.find("\"dirty\":true") != std::string::npos &&
+              snapshot.find("\"capacity\":1920,\"frames\":720") != std::string::npos &&
+              snapshot.find("\"from\":[" + muted_id + ",0],\"to\":[" + mixer_id + ",1]") != std::string::npos &&
+              snapshot.find("\"id\":" + std::to_string(input.value) + ",\"from\":") != std::string::npos &&
+              snapshot.find("\"gain\":0.5") != std::string::npos &&
+              snapshot.find("\"high\":false,\"muted\":true,\"suppressed\":false") != std::string::npos &&
+              snapshot.find("\"format\":\"S16LE\"") != std::string::npos &&
+              snapshot.find("\"error\":\"EOS\"") != std::string::npos,
+          "JSON reports queue levels, exact ports, sample formats, and backend errors");
 
     engine.node<Matrix>(matrix)->set_gain(0.0f);
-    check(dump_dot(engine, backends).find("Gain 0.00 [MUTE]") != std::string::npos, "Zero gain is visible on the card");
+    check(dump_json(engine, backends).find("\"gain\":0") != std::string::npos, "JSON reports zero gain");
     source.unbind();
     check(!source.endpoint_node() && !source.logical_spec().valid(), "Unbinding removes the graph association");
     check(disconnected.uses_resampler(), "The bound asynchronous backend has a prepared FIR resampler");
@@ -188,45 +167,23 @@ void mixer_priority_diagnostics()
     clock.start();
     clock.advance();
 
-    const auto text = dump_text(engine);
-    check(text.find("muted=[0, 0, 1] high=[0, 1, 1] suppressed=[1, 0, 0]") != std::string::npos,
-          "Text reports requested priorities and latest suppression in port order");
-    const auto graph = dump_dot(engine);
-    const auto mixer_edge =
-        "n" + std::to_string(source.node()) + ":e -> n" + std::to_string(mixed.node()) + ":i";
-    check(graph.find("in0 [SUPP]</FONT>") != std::string::npos &&
-              graph.find("in1 [HIGH]") != std::string::npos && graph.find("in2 [HIGH MUTE]") != std::string::npos,
-          "DOT labels suppressed, high, and muted high inputs");
-    check(graph.find(mixer_edge + "0:w [label=\"48k 1ch F32P (suppressed)\", style=dashed, "
-                                  "color=\"#D97706\", fontcolor=\"#92400E\"") != std::string::npos &&
-              graph.find("48000/1ch/F32P, suppressed)") != std::string::npos &&
-              graph.find(mixer_edge + "2:w [label=\"48k 1ch F32P (muted)\", style=dashed, color=\"#9CA3AF\"") !=
-                  std::string::npos,
-          "DOT gives suppressed and muted connections distinct edge styles and tooltips");
-    const auto single_id = std::to_string(single.node());
-    check(graph.find("in0 [HIGH]") != std::string::npos &&
-              graph.find(" -> n" + single_id + ":i0:w") != std::string::npos &&
-              graph.find("n" + single_id + ":o0:e -> n" + std::to_string(extra_monitor.node()) + ":w") !=
-                  std::string::npos,
-          "A single high-priority mixer exposes matching port labels and edge anchors");
+    const auto snapshot = dump_json(engine);
+    check(snapshot.find("\"slots\":[{\"high\":false,\"muted\":false,\"suppressed\":true},"
+                        "{\"high\":true,\"muted\":false,\"suppressed\":false},"
+                        "{\"high\":true,\"muted\":true,\"suppressed\":false}]") != std::string::npos &&
+              snapshot.find("\"slots\":[{\"high\":true,\"muted\":false,\"suppressed\":false}]") != std::string::npos,
+          "JSON reports suppression, priority and mute in port order");
 
     single_mixer.set_high_priority(0, false);
     single_mixer.set_muted(0, true);
-    const auto muted_graph = dump_dot(engine);
-    const auto single_card = muted_graph.find("\n  n" + single_id + " [");
-    check(single_card != std::string::npos &&
-              muted_graph.find("in0 [MUTE]</FONT>", single_card) < muted_graph.find('\n', single_card + 1),
-          "A single muted mixer displays the mute label on its input port");
-    const auto single_edge = "n" + std::to_string(source.node()) + ":e -> n" + single_id + ":i0:w";
-    check(muted_graph.find(single_edge + " [label=\"48k 1ch F32P (muted)\", style=dashed, color=\"#9CA3AF\"") !=
-              std::string::npos,
-          "The single muted mixer's input edge is anchored, dashed and grey");
+    check(dump_json(engine).find("\"slots\":[{\"high\":false,\"muted\":true,\"suppressed\":false}]")
+              != std::string::npos,
+          "JSON reports the single mixer's mute state");
 
     mixer.set_muted(1, true);
     clock.advance();
-    check(dump_text(engine).find("muted=[0, 1, 1] high=[0, 1, 1] suppressed=[0, 0, 0]") != std::string::npos &&
-              dump_dot(engine).find("[SUPP]") == std::string::npos,
-          "The reports clear suppression when the high-priority inputs are muted");
+    check(dump_json(engine).find("\"suppressed\":true") == std::string::npos,
+          "JSON clears suppression when the high-priority inputs are muted");
 }
 
 void endpoint_diagnostics()
@@ -244,15 +201,16 @@ void endpoint_diagnostics()
     prefilling.bind(capture);
     prefilling.start();
     clock.start();
-    const auto prefilling_graph = dump_dot(engine);
-    check(prefilling_graph.find(">RUNNING<") != std::string::npos &&
-              prefilling_graph.find(">PREFILL<") != std::string::npos,
-          "DOT reports running and prefill states");
+    const auto prefilling_snapshot = dump_json(engine);
+    check(prefilling_snapshot.find("\"state\":\"Running\"") != std::string::npos &&
+              prefilling_snapshot.find("\"online\":true,\"steady\":false") != std::string::npos,
+          "JSON reports running and prefill states");
     std::this_thread::sleep_for(15ms);
     clock.advance();
     check(capture.online() && !capture.steady() && capture.underrun_frames() == 0,
           "Startup silence while waiting for prefill does not count as an underrun");
-    check(dump_dot(engine).find(">LATE ") != std::string::npos, "DOT highlights missed periods");
+    check(engine.missed_periods() > 0 && dump_json(engine).find("\"missed_periods\":0") == std::string::npos,
+          "JSON reports nonzero missed periods");
     prefilling.unbind();
 
     PushSource source(pcm);

@@ -148,10 +148,9 @@ class AudioCenter
     /// @brief Set a mixer's high-priority flag for the given input port.
     RetCode set_high_priority(NodeId mixer_port, bool high);
 
-    /// @brief Describe the committed graph and live backends as text. Returns empty on failure.
-    std::string dump_text() const;
-    /// @brief Describe the committed graph and live backends as DOT. Returns empty on failure.
-    std::string dump_dot() const;
+    /// @brief Describe the configured graph as JSON with live backend metrics and committed execution order.
+    /// @return The snapshot, or an empty string on failure. See last_error().
+    std::string dump_json() const;
 
     /// @brief Return the status of the most recent control or diagnostic call on this thread.
     /// @note Successful calls store OK. Construction, destruction, and this query leave it alone.

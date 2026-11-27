@@ -3,11 +3,13 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace
 {
@@ -27,37 +29,34 @@ void check_rc(RetCode rc, const char *what)
         throw std::runtime_error(std::string(what) + " failed: " + rc.what());
 }
 
-void dump_text_now(const AudioCenter &audio)
+using NamedNode = std::pair<const char *, NodeId>;
+
+void dump_json_now(const AudioCenter &audio, std::initializer_list<NamedNode> nodes)
 {
-    const std::string report = audio.dump_text();
-    if (report.empty())
-        throw std::runtime_error(std::string("dump_text failed: ") + AudioCenter::last_error().what());
-    std::cout << "\n================ DUMP TEXT ================\n" << report << '\n';
-}
-
-void dump_dot_now(const AudioCenter &audio, const std::string &dot_path, bool print_dot)
-{
-    const std::string dot = audio.dump_dot();
-    if (dot.empty())
-        throw std::runtime_error(std::string("dump_dot failed: ") + AudioCenter::last_error().what());
-
-    std::ofstream out(dot_path);
-    if (!out)
-        throw std::runtime_error("Failed to open DOT output file: " + dot_path);
-    out << dot;
-
-    if (print_dot)
-        std::cout << "\n================ DUMP DOT ================\n" << dot << '\n';
-
-    std::cout << "DOT written to: " << dot_path << "\n"
-              << "Render SVG    : dot -Tsvg " << dot_path << " -o complex_public_scene.svg\n";
+    const auto snapshot = audio.dump_json();
+    if (snapshot.empty() || snapshot.front() != '{')
+        throw std::runtime_error(std::string("dump_json failed: ") + AudioCenter::last_error().what());
+    const char *path = "complex_public_scene.json";
+    std::ofstream out(path, std::ios::binary);
+    out << "{\n  \"scene\":\"wave_test\",\n  \"labels\":{";
+    bool first = true;
+    for (const auto &node : nodes)
+    {
+        if (!first)
+            out << ',';
+        first = false;
+        out << '"' << node.second.node() << "\":\"" << node.first << '"';
+    }
+    out << "},";
+    if (!out.write(snapshot.data() + 1, static_cast<std::streamsize>(snapshot.size() - 1)))
+        throw std::runtime_error(std::string("Failed to write ") + path);
+    std::cout << "Diagnostic snapshot written to " << path << '\n';
 }
 
 void print_help()
 {
     std::cout << "\nEngine is running continuously. Commands:\n"
-              << "  text         - dump_text() live state\n"
-              << "  dot          - dump_dot() to complex_public_scene.dot\n"
+              << "  json         - dump_json() to complex_public_scene.json\n"
               << "  gain <val>   - set master_gain (e.g. gain 0.5)\n"
               << "  high         - toggle high priority on main_mix[1] (voice)\n"
               << "  mute         - toggle mute on main_mix[2] (extra)\n"
@@ -85,7 +84,6 @@ int main(int argc, char *argv[])
         const std::string out_monitor_path = "scene_out_monitor_16k.wav";
         const std::string out_segment_path = "scene_out_segment_44k.wav";
         const std::string out_paused_path = "scene_out_paused_48k.wav";
-        const std::string dot_path = "complex_public_scene.dot";
 
         // 单文件 create_owav 为独占打开，运行前清理旧输出避免返回 BUSY
         for (const auto &p : {out_master_path, out_monitor_path, out_paused_path})
@@ -128,6 +126,11 @@ int main(int argc, char *argv[])
         const auto rec_paused = check_node(
             audio.create_owav(out_paused_path, PortSpec(BandWidth::Full, 2, SampleFormat::S24_3LE)),
             "create_owav(paused)");
+        const std::initializer_list<NamedNode> named_nodes{
+            {"bgm", src_bgm}, {"voice", src_voice}, {"extra", src_extra},
+            {"sub_mix", sub_mix}, {"sub_fx", sub_fx}, {"main_mix", main_mix}, {"gain", master_gain},
+            {"mono", mono_down}, {"master", rec_master}, {"monitor", rec_monitor},
+            {"segment", rec_segment}, {"paused_branch", rec_paused}};
 
         // =====================================================================
         // 2. 连线（跨采样率/声道由 AudioCenter 自动插桥）
@@ -164,8 +167,7 @@ int main(int argc, char *argv[])
         check_rc(audio.commit(), "commit(Plan #2)");
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        dump_text_now(audio);
-        dump_dot_now(audio, dot_path, true);
+        dump_json_now(audio, named_nodes);
         print_help();
 
         // =====================================================================
@@ -183,13 +185,9 @@ int main(int argc, char *argv[])
             {
                 break;
             }
-            else if (cmd == "text")
+            else if (cmd == "json")
             {
-                dump_text_now(audio);
-            }
-            else if (cmd == "dot")
-            {
-                dump_dot_now(audio, dot_path, false);
+                dump_json_now(audio, named_nodes);
             }
             else if (cmd == "gain")
             {

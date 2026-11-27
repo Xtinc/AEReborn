@@ -3,26 +3,27 @@
 
 #include "core/engine.h"
 #include "backend/backend.h"
-#include <iosfwd>
 #include <string>
 
 namespace aereborn
 {
 
-/// @brief Write a text report of the committed render plan and supplied backends.
+/// @brief Return versioned JSON of the committed plan and supplied backends.
 /// @pre Call on the serialized control side with live backends and endpoints.
-/// @note Live figures are approximate and can represent different points in time.
-void dump_text(std::ostream &out, const Engine &engine, View<const Backend *const> backends = {});
+/// @note Metrics are sampled independently. WAV backends expose only the configured file name.
+std::string dump_json(const Engine &engine, View<const Backend *const> backends = {});
 
-/// @brief Return the text report as a string. Follows the same contract as the stream overload.
-std::string dump_text(const Engine &engine, View<const Backend *const> backends = {});
+struct ConfiguredNode
+{
+    NodeId id;
+    const Node *node;
+    bool paused;
+};
 
-/// @brief Write a Graphviz DOT graph of the committed plan and supplied backends.
-/// @copydetails dump_text(std::ostream &, const Engine &, View<const Backend *const>)
-void dump_dot(std::ostream &out, const Engine &engine, View<const Backend *const> backends = {});
-
-/// @brief Return the DOT graph as a string. Follows the same contract as the stream overload.
-std::string dump_dot(const Engine &engine, View<const Backend *const> backends = {});
+/// @brief Return JSON of the caller's configured topology, marking members of the committed plan.
+/// @pre Call on the serialized control side with live node and backend pointers.
+std::string dump_json(const Engine &engine, View<const ConfiguredNode> nodes, View<const Connection> connections,
+                      View<const Backend *const> backends);
 
 } // namespace aereborn
 

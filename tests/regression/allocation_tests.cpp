@@ -185,13 +185,13 @@ void graph_service_allocation_rollback()
         for (int at = 0; at < 128; ++at)
         {
             const auto failed = allocation_fails(at, [&] { graph.connect(source, sink); });
-            const auto draft = graph.dump_text();
+            const auto draft = graph.dump_json();
             if (failed)
-                rolled_back_partial_edit |= draft.find("dirty=true") != std::string::npos;
+                rolled_back_partial_edit |= draft.find("\"dirty\":true") != std::string::npos;
             graph.commit();
-            const auto plan = graph.dump_text();
-            const auto matrix = plan.find("] Matrix") != std::string::npos;
-            const auto converter = plan.find("] Convert") != std::string::npos;
+            const auto plan = graph.dump_json();
+            const auto matrix = plan.find("\"type\":\"Matrix\",\"in_plan\":true") != std::string::npos;
+            const auto converter = plan.find("\"type\":\"Convert\"") != std::string::npos;
             if (failed)
             {
                 check(!matrix && !converter, "A failed bridge never becomes part of a plan");
@@ -202,7 +202,8 @@ void graph_service_allocation_rollback()
                 check(matrix && converter && rolled_back_partial_edit, "A partially applied bridge can be retried");
                 graph.disconnect(sink);
                 graph.commit();
-                check(graph.dump_text().find("] Convert") == std::string::npos, "Disconnect removes the bridge");
+                check(graph.dump_json().find("\"type\":\"Convert\"") == std::string::npos,
+                      "Disconnect removes the bridge");
                 return;
             }
         }
@@ -234,31 +235,32 @@ void graph_service_live_commit_failure()
 
             if (!allocation_fails(at, [&] { graph.commit(); }))
                 return false;
-            const auto after = graph.dump_text();
-            if (after.find("dirty=true") != std::string::npos)
+            const auto after = graph.dump_json();
+            const auto order = std::string("\"plan_order\":[") + std::to_string(first.node());
+            const auto full_order = order + ',' + std::to_string(second.node()) + ',' + std::to_string(third.node()) + ']';
+            const auto backend_running = [](const std::string &snapshot, NodeId id) {
+                return snapshot.find("\"node\":" + std::to_string(id.node()) + ",\"state\":\"Running\"") !=
+                       std::string::npos;
+            };
+            if (after.find("\"dirty\":true") != std::string::npos)
             {
                 preparation_failed = true;
-                check(after.find("Engine: Running") != std::string::npos &&
-                          after.find("[" + std::to_string(first.node()) + "] Playback") != std::string::npos &&
-                          after.find("[" + std::to_string(third.node()) + "] Playback") == std::string::npos &&
-                          after.find("state=Running") != std::string::npos,
+                check(after.find("\"engine\":{\"state\":\"Running\"") != std::string::npos &&
+                          after.find(order + ']') != std::string::npos && backend_running(after, first),
                       "Preparation failure keeps the old plan and its backend running");
                 graph.commit();
             }
             else
             {
                 ++backend_start_failures;
-                check(after.find("Engine: Ready") != std::string::npos &&
-                          after.find("[" + std::to_string(third.node()) + "] Playback") != std::string::npos &&
-                          after.find("state=Running") == std::string::npos,
+                check(after.find("\"engine\":{\"state\":\"Ready\"") != std::string::npos &&
+                          after.find(full_order) != std::string::npos && after.find("\"state\":\"Running\"") == std::string::npos,
                       "Failure after publication stops the clock and all backends and keeps the new plan");
                 graph.start();
             }
-            const auto recovered = graph.dump_text();
-            const auto first_running = recovered.find("state=Running");
-            const auto second_running = recovered.find("state=Running", first_running + 1);
-            check(first_running != std::string::npos && second_running != std::string::npos &&
-                      recovered.find("state=Running", second_running + 1) != std::string::npos,
+            const auto recovered = graph.dump_json();
+            check(backend_running(recovered, first) && backend_running(recovered, second) &&
+                      backend_running(recovered, third),
                   "Retry brings up every backend");
             return true;
         });

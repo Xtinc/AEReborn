@@ -7,7 +7,6 @@
 #include <map>
 #include <memory>
 #include <string>
-#include <vector>
 
 namespace aereborn
 {
@@ -45,17 +44,27 @@ class GraphService
     void set_muted(NodeId mixer_port, bool muted);
     void set_high_priority(NodeId mixer_port, bool high);
 
-    std::string dump_text() const;
-    std::string dump_dot() const;
+    std::string dump_json();
 
   private:
-    using NodeMap = std::map<NodeId, std::unique_ptr<Backend>>;
+    struct NodeBinding
+    {
+        std::unique_ptr<Backend> backend;
+        bool paused = false;
+    };
+    using NodeMap = std::map<NodeId, NodeBinding>;
 
     struct LogicalLink
     {
+        struct Bridge
+        {
+            NodeId node;
+            ConnId input;
+        };
+
         NodeId from;
-        std::array<NodeId, 2> bridges{};
-        ConnId direct{};
+        std::array<Bridge, 2> bridges{};
+        ConnId tail{};
     };
 
     NodeMap::iterator add_node(std::unique_ptr<Node> node);
@@ -66,7 +75,6 @@ class GraphService
     PortSpec port_spec(NodeId port, bool output);
     void disconnect_input(NodeId to, const NodeId *from);
     void remove_bridges(const LogicalLink &link) noexcept;
-    std::vector<const Backend *> backends() const;
 
     CommandQueue &commands_;
     Engine engine_;
