@@ -30,7 +30,8 @@ class AlsaBackend final : public ActiveBackend
     /// @param card Bare card name, explicit PCM name, or empty for the default PCM.
     /// @param device Hardware device index for a bare card name.
     /// @param use_mmap Prefer interleaved MMAP over ordinary interleaved I/O.
-    explicit AlsaBackend(std::string card, unsigned int device, bool use_mmap);
+    /// @param fail_on_timeout Stop the worker when PCM I/O times out.
+    explicit AlsaBackend(std::string card, unsigned int device, bool use_mmap, bool fail_on_timeout = true);
     ~AlsaBackend() override
     {
         unbind();

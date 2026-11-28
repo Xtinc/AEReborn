@@ -112,9 +112,7 @@ Engine 停止会等待图处理退出。后端停止时唤醒阻塞的异步 I/O
 
 ## 5. 外部资源与恢复
 
-逻辑端点可跨设备切换复用。后端独占借用已经准备的端点，并持有设备句柄。设备枚举、选择策略与自动恢复可由后续的 DeviceService 负责。
-选择可以是固定设备、跟随系统默认、优先某类设备；不在收到任意插入事件后立即抢占当前设备。
-设备身份使用平台稳定标识及匹配规则，不依赖枚举序号永久不变。
+逻辑端点可跨设备切换复用。后端独占借用已经准备的端点，并持有设备句柄。`DeviceService` 在控制线程创建并恢复硬件后端，`GraphService` 持有绑定并按已提交计划启停。创建和重连时按原配置选择设备，配置为 `default` 时解析当时的系统默认设备。后续可接入系统热插拔通知以缩短发现时间。
 
 ```text
 逻辑意图：Running / Paused / Stopped
@@ -124,7 +122,7 @@ Engine 停止会等待图处理退出。后端停止时唤醒阻塞的异步 I/O
 两组状态分别维护：恢复完成仍要服从用户当前意图。
 掉线期间保留图、音量和连接；缺失采集数据补静音并由后端记录缺口，输出设备不可用时丢弃该设备数据，总线及其他下游继续处理。
 可就地恢复的欠载由后端处理；需重开、等待设备、不可恢复的配置错误由统一恢复策略区分。
-重试带退避和取消，主动定期重开也是同一策略的选项。会话代际编号屏蔽过期打开结果与旧设备数据。
+`DeviceService` 用一个共享定时器在控制线程每秒巡检已启动且启用恢复的硬件绑定。当前测试阶段，严格模式在上线满 10 秒后的首次巡检重开设备。两个间隔固定在 `app/device_service.cpp`。没有待巡检的端点时取消共享定时器。硬件端点停止时释放失效驱动和默认设备驱动，下次启动会重新打开设备。
 
 一个逻辑端点最多由一个外部参与方读写队列。播放侧在最终设备端点之前显式混音。图侧端点保持既定格式，后端在打开设备时独立协商实际格式。
 设备协商格式与逻辑音频格式分离，恢复不改变应用看到的端口布局；适配不了时报告端点失败。
@@ -231,16 +229,19 @@ node tools/render_graph.js examples/sankey_reference.json build/graph-preview/re
 
 ### AudioCenter
 
-应用通过 `include/audio_interface.h` 使用 `AudioCenter` 创建 WAV、回调和主动推拉端点，以及 Mixer、Matrix 和 Convert。门面将图编辑、运行控制和诊断同步派发至控制线程，由 `app/graph_service.cpp` 管理图和后端。所有调用线程须在实例析构前结束对实例的访问。控制方法返回 `RetCode`，创建失败返回空句柄，诊断失败返回空字符串。`AudioCenter::last_error()` 返回调用线程最近一次控制、诊断或推拉操作的状态。
+应用通过 `include/audio_interface.h` 使用 `AudioCenter` 创建硬件、WAV、回调和主动推拉端点，以及 Mixer、Matrix 和 Convert。门面将图编辑、运行控制和诊断同步派发至控制线程，并在控制线程完成 WAV、回调和推拉端点的装配。PCM 推拉由调用线程直接执行。`GraphService` 管理图、节点表和计划切换，`DeviceService` 管理硬件设备与恢复。析构时先取消硬件巡检，再解绑图端点，最后销毁设备服务。所有调用线程须在实例析构前结束对实例的访问。控制方法返回 `RetCode`，创建失败返回空句柄，诊断失败返回空字符串。`AudioCenter::last_error()` 返回调用线程最近一次控制、诊断或推拉操作的状态。
 
 - 使用 `ChannelMap` 描述声道映射。索引从零开始，`route(from, to, weight)` 按输入到输出设置权重，`mix({0, 2}, 0)` 将输入 0 和 2 等权混到输出 0。纯增益节点使用 `ChannelMap::identity(channels)`；可用 `ChannelMap::select(4, {2, 3})` 选取一对立体声，也可用 `dense()` 传入按输出行排列的系数。`create_matrix(rate, map, gain)` 复制映射后创建节点。构造或修改映射时发生的首个错误可通过 `map.status()` 查询，也会由创建调用通过 `last_error()` 返回。
 - `connect(from, to)` 要求采样率、声道数和样本格式完全相同，任一项不同返回 `INVFMT`。调用者用 `create_matrix()` 改变声道数，用 `create_convert(input, output)` 改变采样率或样本格式，然后逐段连接。`output_spec(port)` 可读取节点的图侧规格。WAV、回调和推拉端点的图侧样本格式为 F32P，后端处理各自的交错 PCM 格式。断开边时，显式创建的转换节点仍由调用者管理。
+- `create_idev()` 和 `create_odev()` 创建硬件采集和播放端点。`DevConfig` 默认选择系统默认设备，图侧为 48 kHz、双声道、F32P，设备 I/O 预算为 10 ms。ALSA 将裸卡名展开为 `hw:CARD=<name>,DEV=<device>`，含 `:` 的 PCM 名称原样传入。WASAPI 使用 UTF-8 Endpoint ID 或友好名，精确名称优先于子串匹配，匹配不唯一时返回 `EPARAM`。
+- ALSA 协商交错 PCM 的位深与采样率，优先 MMAP，回退到 RW。`DevFlags::MEMCPY` 强制 RW，可与任一恢复模式组合，Windows 接受并忽略该位。WASAPI 使用共享模式的混音格式。协商后的流须接受精确声道数，否则返回 `INVFMT`。对于 ALSA `hw:`，这个要求直接适用于硬件。`plughw:` 等 PCM 插件可以在其下游完成声道转换。图侧声道映射由 `Matrix` 完成。
+- `RECOVERSOFT` 忽略 I/O 超时，遇设备离线或 I/O 失败时重连。`RECOVERHARD` 也恢复超时，并按第 5 节所述间隔定期重开。受影响支路在重开和队列预填充期间会短暂静音或丢帧。两种模式都允许创建离线占位端点，巡检仅在进入运行计划后执行。遇不可恢复错误时该路停止巡检，可通过停止和重新启动再次尝试。`dump_json()` 的硬件节点包含 `device_status`，记录 `stopped`、`waiting`、`online` 或 `failed` 以及最近错误。
 - `create_icallback()` 提供可写的输出缓冲，`create_ocallback()` 提供只读的输入缓冲。两者使用 `AudioCallback`，另一方向的指针为 `nullptr`，缓冲只在当次调用中有效。回调侧采样率及声道数与图端口一致，只需 PCM 编解码。回调须返回且不得抛异常或调用 `AudioCenter` 控制方法。默认批次时长为 10 ms，48 kHz 时为 480 帧。
 - 回调输入只有进入生效计划才启动，交付的全零样本仍视为活跃输入，因此高优先级回调源仍会压制普通输入。可提交暂停或静音对应的 Mixer 输入来解除压制。
 - `stop()`、移出计划的 `commit()`、`remove()` 和析构均等待相关回调线程退出。回调输出在退出时排空已排队的音频，最后一批可能较短。调用方须让 `user_data` 在这些操作返回前保持有效。如果之后重启或恢复端点，回调仍使用原来的指针。
 - `create_ipush()` 和 `create_opull()` 创建使用固定交错 PCM 的端点，图侧使用同采样率、同声道数的 F32P。业务线程用 `push()` 和 `pull()` 传递当次调用期间有效的缓冲，返回实际接受或写入的帧数。短写后按已接受帧数续推，短读保留缓冲的未写后缀。队列满或空时可返回 0，状态为 `OK`。未启动或移出生效计划的端点返回 `ESTATE`。高优先级推流的队列耗尽后，Mixer 在首个无该路输入的块内恢复普通输入的增益。
 - `io_period` 为推拉队列提供突发数据预算，默认 10 ms。内部转换按最多 10 ms 的工作区切片处理。`GraphService` 在同一张节点表中登记节点与 `NodeBinding`。业务线程通过查表直接判定 `ENODE` 和 `ETYPE`，取得端点引用后立即释放表锁。推拉端点在同一节点内串行传输和启停。移除先摘除表项，再等待在途传输并解绑。停止或提交暂停会丢弃推拉端点的缓冲帧，业务线程可在停机前读取队列中可用的帧。
-- 首次 `start()` 和草稿有变化时会自动提交。运行中 `commit()` 的图准备失败会保留当前计划。发布新计划后，门面先按旧计划的逆执行顺序停止离场后端，再按新计划的执行顺序启动入场后端。离场的录音后端可以在计划切换后排空队列。留在计划里的后端延续原有状态，包括自然结束和 I/O 错误。若有后端启动失败，门面停止后端和时钟并保留新计划，修复后可重新 `start()`。移除端点会立即解绑，旧计划里仍存在的采集端点输出静音，播放端点停止接收数据。
+- 首次 `start()` 和草稿有变化时会自动提交。运行中 `commit()` 的图准备失败会保留当前计划。发布新计划后，门面先按旧计划的逆执行顺序停止离场后端，再按新计划的执行顺序启动入场后端。离场的录音后端可以在计划切换后排空队列。留在计划里的后端延续原有状态，包括自然结束和 I/O 错误。启用恢复的硬件端点在本路处理启动失败，其余后端启动失败时门面停止后端和时钟并保留新计划。移除端点会立即解绑，旧计划里仍存在的采集端点输出静音，播放端点停止接收数据。
 - 未暂停的 WAV、回调和拉取输出在提交断连后继续接收静音，以保留时间轴。暂停输出节点并提交会停止该后端。单文件 WAV 输出在创建节点时独占打开，目标已存在时返回 `BUSY`。编号分段跳过已有文件。`stop()` 排空录音队列并保留打开的文件，移除输出或销毁实例会回填最终的 WAV 文件长度。
 
 ### 构建与验证
@@ -261,7 +262,7 @@ ctest --test-dir build/release -C Release -L bus --output-on-failure
 
 `tests/data/` 的两份 48 kHz 双声道 WAV 短片来自《渡口》第 30 秒起的 0.5 秒和 CaliforniaHotel 第 40 秒起的 0.75 秒。四声道测试将两段音乐交错到同一个输入，生成两份 48 kHz 拆分归档和一份 44.1 kHz 混音归档。录音和分段文件在构建目录内创建，正常退出时清理。
 
-`io` 包含后端绑定、设备超时、WAV 文件和时钟漂移检查。Linux 有 ALSA 时运行两种 `plug:null` 采集和播放配置。Windows 默认验证 WASAPI 绑定失败和 Null 接管。设置 `AEREBORN_WASAPI_CAPTURE_ID` 或 `AEREBORN_WASAPI_PLAYBACK_ID` 后，可用 `ctest --test-dir build/release -C Release -L hardware --output-on-failure` 运行对应实机用例。ALSA 后端的设计背景见 [ALSA 实施记录](docs/archive/aereborn_alsa.md)。
+`io` 包含后端绑定、设备超时、WAV 文件和时钟漂移检查。Linux 有 ALSA 时使用 `plug:null` 验证两种访问方式和硬件端点工厂。Linux 实机用例使用 `AEREBORN_ALSA_CAPTURE_PCM` 或 `AEREBORN_ALSA_PLAYBACK_PCM` 指定 PCM，声道数默认是 2，可分别通过 `AEREBORN_ALSA_CAPTURE_CHANNELS` 或 `AEREBORN_ALSA_PLAYBACK_CHANNELS` 设置。Windows 默认验证 WASAPI 绑定失败和 Null 接管，实机用例使用 `AEREBORN_WASAPI_CAPTURE_ID` 或 `AEREBORN_WASAPI_PLAYBACK_ID` 指定 Endpoint ID。用 `ctest --test-dir build/release -C Release -L hardware --output-on-failure` 运行当前平台的实机用例。ALSA 后端的设计背景见 [ALSA 实施记录](docs/archive/aereborn_alsa.md)。
 
 MSVC Debug 的迭代器代理会在 `noexcept` 构造中分配内存，`regression` 中的分配注入和零分配检查在 Release 执行。示例由默认开启的 `BUILD_EXAMPLES` 控制。
 

@@ -34,8 +34,10 @@ class WasapiBackend final : public ActiveBackend
     };
 
     /// @brief Construct a backend whose direction is selected when it binds.
-    /// @param device Endpoint ID, or empty for the system default in the selected direction.
-    explicit WasapiBackend(std::wstring device);
+    /// @param device UTF-8 endpoint ID or friendly name. Empty or "default" selects the system default.
+    /// @param fail_on_timeout Stop the worker when PCM I/O times out.
+    /// @pre The device name contains no embedded NUL bytes.
+    explicit WasapiBackend(std::string device, bool fail_on_timeout = true);
     ~WasapiBackend() override { unbind(); }
 
     /// @brief Return the latest native failure since binding or starting, or an empty value while running.
@@ -57,7 +59,7 @@ class WasapiBackend final : public ActiveBackend
     RetCode write(IAudioRenderClient &render, std::uint32_t frames, View<const std::uint8_t> bytes) noexcept;
 
     Failure failure_;
-    std::wstring device_;
+    std::string device_;
     std::wstring device_id_;
     std::array<std::uint8_t, 40> format_{};
     std::vector<std::uint8_t> packet_;

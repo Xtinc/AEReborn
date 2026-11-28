@@ -8,11 +8,17 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <initguid.h>
+#include <functiondiscoverykeys_devpkey.h>
 #include <audioclient.h>
 #include <mmdeviceapi.h>
+#include <propidl.h>
+#include <propsys.h>
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <cwchar>
+#include <limits>
 #include <memory>
 #include <utility>
 
@@ -47,67 +53,154 @@ class ComApartment
     bool active = true;
 };
 
+struct PropertyValue
+{
+    PROPVARIANT value{};
+    ~PropertyValue() { PropVariantClear(&value); }
+};
+
 RetCode record_failure(WasapiBackend::Failure &failure, const char *operation, HRESULT error) noexcept
 {
     failure = {operation, static_cast<std::int32_t>(error)};
-    if (error == AUDCLNT_E_WRONG_ENDPOINT_TYPE)
+    if (error == AUDCLNT_E_WRONG_ENDPOINT_TYPE || error == E_INVALIDARG ||
+        error == HRESULT_FROM_WIN32(ERROR_NO_UNICODE_TRANSLATION))
         return RetCode::EPARAM;
     if (error == AUDCLNT_E_UNSUPPORTED_FORMAT)
         return RetCode::INVFMT;
     if (error == AUDCLNT_E_DEVICE_INVALIDATED || error == HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
         return RetCode::DEVLOST;
+    if (error == E_OUTOFMEMORY)
+        return RetCode::TOOLARGE;
     return RetCode::IOFAILED;
 }
 
-RetCode activate(const std::wstring &id, EDataFlow direction, Interface<IAudioClient> &client,
-                 std::wstring *resolved, WasapiBackend::Failure &failure)
+Result<std::wstring> device_name(const std::string &name, WasapiBackend::Failure &failure)
+{
+    if (name.empty() || name == "default")
+        return std::wstring{};
+    if (name.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        return RetCode::TOOLARGE;
+    const auto bytes = static_cast<int>(name.size());
+    const auto size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name.data(), bytes, nullptr, 0);
+    if (!size)
+        return record_failure(failure, "MultiByteToWideChar", HRESULT_FROM_WIN32(GetLastError()));
+    std::wstring wide(static_cast<std::size_t>(size), L'\0');
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name.data(), bytes, &wide[0], size))
+        return record_failure(failure, "MultiByteToWideChar", HRESULT_FROM_WIN32(GetLastError()));
+    return wide;
+}
+
+Result<Interface<IMMDeviceEnumerator>> make_enumerator(WasapiBackend::Failure &failure) noexcept
 {
     IMMDeviceEnumerator *enumerator_ptr = nullptr;
-    auto rc = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                               IID_PPV_ARGS(&enumerator_ptr));
+    const auto rc = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                     IID_PPV_ARGS(&enumerator_ptr));
     if (FAILED(rc))
         return record_failure(failure, "CoCreateInstance(MMDeviceEnumerator)", rc);
-    const Interface<IMMDeviceEnumerator> enumerator(enumerator_ptr);
+    return Interface<IMMDeviceEnumerator>(enumerator_ptr);
+}
 
-    IMMDevice *device_ptr = nullptr;
-    rc = id.empty() ? enumerator->GetDefaultAudioEndpoint(direction, eConsole, &device_ptr)
-                    : enumerator->GetDevice(id.c_str(), &device_ptr);
+Result<Interface<IMMDevice>> find_friendly_name(IMMDeviceEnumerator &enumerator, const std::wstring &name,
+                                                EDataFlow direction, WasapiBackend::Failure &failure)
+{
+    IMMDeviceCollection *devices_ptr = nullptr;
+    auto rc = enumerator.EnumAudioEndpoints(direction, DEVICE_STATE_ACTIVE, &devices_ptr);
     if (FAILED(rc))
-        return record_failure(failure, id.empty() ? "GetDefaultAudioEndpoint" : "GetDevice", rc);
-    const Interface<IMMDevice> device(device_ptr);
-    if (resolved)
+        return record_failure(failure, "EnumAudioEndpoints", rc);
+    const Interface<IMMDeviceCollection> devices(devices_ptr);
+    UINT count = 0;
+    rc = devices->GetCount(&count);
+    if (FAILED(rc))
+        return record_failure(failure, "IMMDeviceCollection::GetCount", rc);
+
+    Interface<IMMDevice> match;
+    bool exact = false;
+    bool ambiguous = false;
+    for (UINT i = 0; i < count; ++i)
     {
-        if (id.empty())
+        IMMDevice *device_ptr = nullptr;
+        rc = devices->Item(i, &device_ptr);
+        if (FAILED(rc))
+            continue;
+        Interface<IMMDevice> device(device_ptr);
+        IPropertyStore *properties_ptr = nullptr;
+        rc = device->OpenPropertyStore(STGM_READ, &properties_ptr);
+        if (FAILED(rc))
+            continue;
+        const Interface<IPropertyStore> properties(properties_ptr);
+        PropertyValue friendly;
+        rc = properties->GetValue(PKEY_Device_FriendlyName, &friendly.value);
+        if (FAILED(rc) || friendly.value.vt != VT_LPWSTR || !friendly.value.pwszVal)
+            continue;
+
+        const auto *value = friendly.value.pwszVal;
+        const auto exact_name = name == value;
+        if (!exact_name && (exact || !std::wcsstr(value, name.c_str())))
+            continue;
+
+        if (match && exact_name == exact)
         {
-            LPWSTR id_ptr = nullptr;
-            rc = device->GetId(&id_ptr);
-            if (FAILED(rc))
-                return record_failure(failure, "IMMDevice::GetId", rc);
-            const std::unique_ptr<wchar_t, FreeComBuffer> device_id(id_ptr);
-            resolved->assign(device_id.get());
+            ambiguous = true;
+            if (exact)
+                break;
+            continue;
         }
-        else
-        {
-            IMMEndpoint *endpoint_ptr = nullptr;
-            rc = device->QueryInterface(IID_PPV_ARGS(&endpoint_ptr));
-            if (FAILED(rc))
-                return record_failure(failure, "QueryInterface(IMMEndpoint)", rc);
-            const Interface<IMMEndpoint> endpoint(endpoint_ptr);
-            EDataFlow flow;
-            rc = endpoint->GetDataFlow(&flow);
-            if (FAILED(rc))
-                return record_failure(failure, "IMMEndpoint::GetDataFlow", rc);
-            if (flow != direction)
-                return record_failure(failure, "WASAPI endpoint direction", AUDCLNT_E_WRONG_ENDPOINT_TYPE);
-            *resolved = id;
-        }
+        match = std::move(device);
+        exact = exact_name;
+        ambiguous = false;
     }
+    if (ambiguous)
+        return record_failure(failure, "Ambiguous WASAPI friendly name", E_INVALIDARG);
+    if (match)
+        return match;
+    return record_failure(failure, "WASAPI friendly name", HRESULT_FROM_WIN32(ERROR_NOT_FOUND));
+}
+
+Result<Interface<IMMDevice>> resolve_device(IMMDeviceEnumerator &enumerator, const std::wstring &name,
+                                            EDataFlow direction, WasapiBackend::Failure &failure)
+{
+    IMMDevice *device_ptr = nullptr;
+    const auto use_default = name.empty();
+    auto rc = use_default ? enumerator.GetDefaultAudioEndpoint(direction, eConsole, &device_ptr)
+                          : enumerator.GetDevice(name.c_str(), &device_ptr);
+    if (FAILED(rc))
+    {
+        if (!use_default && rc == HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
+            return find_friendly_name(enumerator, name, direction, failure);
+        return record_failure(failure, use_default ? "GetDefaultAudioEndpoint" : "GetDevice", rc);
+    }
+
+    Interface<IMMDevice> device(device_ptr);
+    if (use_default)
+        return device;
+    IMMEndpoint *endpoint_ptr = nullptr;
+    rc = device->QueryInterface(IID_PPV_ARGS(&endpoint_ptr));
+    if (FAILED(rc))
+        return record_failure(failure, "QueryInterface(IMMEndpoint)", rc);
+    const Interface<IMMEndpoint> endpoint(endpoint_ptr);
+    EDataFlow flow;
+    rc = endpoint->GetDataFlow(&flow);
+    if (FAILED(rc))
+        return record_failure(failure, "IMMEndpoint::GetDataFlow", rc);
+    if (flow != direction)
+        return record_failure(failure, "WASAPI endpoint direction", AUDCLNT_E_WRONG_ENDPOINT_TYPE);
+    return device;
+}
+
+Result<Interface<IAudioClient>> activate(IMMDevice &device, WasapiBackend::Failure &failure) noexcept
+{
+    DWORD state = 0;
+    auto rc = device.GetState(&state);
+    if (FAILED(rc))
+        return record_failure(failure, "IMMDevice::GetState", rc);
+    if (state != DEVICE_STATE_ACTIVE)
+        return record_failure(failure, "IMMDevice::GetState", AUDCLNT_E_DEVICE_INVALIDATED);
+
     IAudioClient *client_ptr = nullptr;
-    rc = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void **>(&client_ptr));
+    rc = device.Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void **>(&client_ptr));
     if (FAILED(rc))
         return record_failure(failure, "IMMDevice::Activate(IAudioClient)", rc);
-    client.reset(client_ptr);
-    return {};
+    return Interface<IAudioClient>(client_ptr);
 }
 
 SampleFormat sample_format(const WAVEFORMATEX &format) noexcept
@@ -163,13 +256,26 @@ Result<PortSpec> WasapiBackend::on_open(bool capture, PortSpec logical, std::chr
     if (FAILED(com.result) && com.result != RPC_E_CHANGED_MODE)
         return record_failure(failure_, "CoInitializeEx", com.result);
 
-    Interface<IAudioClient> probe;
-    std::wstring resolved;
-    const auto code = activate(device_, capture ? eCapture : eRender, probe, &resolved, failure_);
-    if (!code)
-        return code;
+    const auto name = device_name(device_, failure_);
+    if (!name)
+        return name.ret_code();
+    const auto enumerator = make_enumerator(failure_);
+    if (!enumerator)
+        return enumerator.ret_code();
+    const auto device = resolve_device(*enumerator.value(), name.value(), capture ? eCapture : eRender, failure_);
+    if (!device)
+        return device.ret_code();
+    LPWSTR id_ptr = nullptr;
+    auto rc = device.value()->GetId(&id_ptr);
+    if (FAILED(rc))
+        return record_failure(failure_, "IMMDevice::GetId", rc);
+    const std::unique_ptr<wchar_t, FreeComBuffer> id(id_ptr);
+
+    const auto probe = activate(*device.value(), failure_);
+    if (!probe)
+        return probe.ret_code();
     WAVEFORMATEX *format_ptr = nullptr;
-    const auto rc = probe->GetMixFormat(&format_ptr);
+    rc = probe.value()->GetMixFormat(&format_ptr);
     if (FAILED(rc))
         return record_failure(failure_, "IAudioClient::GetMixFormat", rc);
     const std::unique_ptr<WAVEFORMATEX, FreeComBuffer> format(format_ptr);
@@ -182,7 +288,7 @@ Result<PortSpec> WasapiBackend::on_open(bool capture, PortSpec logical, std::chr
     if (!budget)
         return budget.ret_code();
 
-    const auto initialized = initialize(*probe, *format, failure_);
+    const auto initialized = initialize(*probe.value(), *format, failure_);
     if (!initialized)
         return initialized.ret_code();
     const auto capacity = initialized.value();
@@ -204,7 +310,7 @@ Result<PortSpec> WasapiBackend::on_open(bool capture, PortSpec logical, std::chr
     static_assert(sizeof(WAVEFORMATEXTENSIBLE) == 40, "Unexpected WAVEFORMATEXTENSIBLE layout");
     format_.fill(0);
     std::memcpy(format_.data(), format.get(), sizeof(*format) + format->cbSize);
-    device_id_ = std::move(resolved);
+    device_id_.assign(id.get());
     packet_ = std::move(packet);
     ready_ = ready.release();
     cancelled_ = cancelled.release();
@@ -232,10 +338,18 @@ RetCode WasapiBackend::on_start() noexcept
     ComApartment com(COINIT_MULTITHREADED);
     if (FAILED(com.result))
         return record_failure(failure_, "CoInitializeEx", com.result);
-    Interface<IAudioClient> client;
-    const auto code = activate(device_id_, source ? eCapture : eRender, client, nullptr, failure_);
-    if (!code)
-        return code;
+    const auto enumerator = make_enumerator(failure_);
+    if (!enumerator)
+        return enumerator.ret_code();
+    IMMDevice *device_ptr = nullptr;
+    auto rc = enumerator.value()->GetDevice(device_id_.c_str(), &device_ptr);
+    if (FAILED(rc))
+        return record_failure(failure_, "GetDevice", rc);
+    const Interface<IMMDevice> device(device_ptr);
+    auto activated = activate(*device, failure_);
+    if (!activated)
+        return activated.ret_code();
+    auto client = std::move(activated).value();
     WAVEFORMATEXTENSIBLE format;
     std::memcpy(&format, format_.data(), sizeof(format));
     const auto initialized = initialize(*client, format.Format, failure_);
@@ -244,7 +358,7 @@ RetCode WasapiBackend::on_start() noexcept
     const auto capacity = initialized.value();
     if (source && capacity > packet_.size() / format.Format.nBlockAlign)
         return RetCode::TOOLARGE;
-    auto rc = client->SetEventHandle(ready_);
+    rc = client->SetEventHandle(ready_);
     if (FAILED(rc))
         return record_failure(failure_, "IAudioClient::SetEventHandle", rc);
 
@@ -404,7 +518,8 @@ RetCode WasapiBackend::write(IAudioRenderClient &render, std::uint32_t frames, V
     return FAILED(rc) ? record_failure(failure_, "IAudioRenderClient::ReleaseBuffer", rc) : RetCode{};
 }
 
-WasapiBackend::WasapiBackend(std::wstring device) : ActiveBackend(true), device_(std::move(device))
+WasapiBackend::WasapiBackend(std::string device, bool fail_on_timeout)
+    : ActiveBackend(true, fail_on_timeout), device_(std::move(device))
 {
 }
 

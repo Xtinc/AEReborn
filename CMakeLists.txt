@@ -28,6 +28,7 @@ add_library(aereborn STATIC
     diag/inspect.cpp
     app/audio_center.cpp
     app/channel_map.cpp
+    app/device_service.cpp
     app/graph_service.cpp
 )
 add_library(aereborn::aereborn ALIAS aereborn)

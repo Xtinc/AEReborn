@@ -688,13 +688,14 @@ RetCode ActiveBackend::run_async() noexcept
     {
         std::size_t frames = 0;
         const auto result = is_capture() ? transfer_capture(frames) : transfer_playback_async(frames);
-        if (!result)
+        if (!result && result != RetCode::TIMEOUT)
             return result;
 
         const auto now = Clock::now();
-        if (now >= io_deadline_)
+        const auto timed_out = !result || now >= io_deadline_;
+        if (timed_out && fail_on_timeout_)
             return RetCode::TIMEOUT;
-        if (frames)
+        if (frames || timed_out)
             io_deadline_ = now + timeout;
     }
     return {};

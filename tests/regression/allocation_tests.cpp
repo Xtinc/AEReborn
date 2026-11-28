@@ -3,6 +3,7 @@
 #include "backend/null_backend.h"
 #include "backend/pull_sink.h"
 #include "backend/push_source.h"
+#include "backend/wav_backend.h"
 #include "core/command_queue.h"
 #include "plugins/convert.h"
 #include "plugins/matrix.h"
@@ -160,6 +161,28 @@ void channel_map_allocation_status()
           "Allocation failure is retained as the first error");
 }
 
+struct WavOutputBinding final : NodeBinding
+{
+    WavOutputBinding(const std::string &path, SampleFormat format)
+        : driver(path, format, 0s, WavFile::WriteMode::Exclusive) {}
+
+    const Backend *backend() const noexcept override { return &driver; }
+    void start() override { driver.start(); }
+    void stop() noexcept override { driver.stop(); }
+    void unbind() noexcept override { driver.unbind(); }
+
+    WavPlayback driver;
+};
+
+NodeId add_wav_output(GraphService &graph, const std::string &path, PortSpec spec)
+{
+    auto endpoint = std::make_unique<Playback>(spec.bandwidth, spec.channels, 10ms);
+    auto binding = std::make_shared<WavOutputBinding>(path, spec.format);
+    auto *node = endpoint.get();
+    auto *driver = &binding->driver;
+    return graph.add_endpoint(std::move(endpoint), std::move(binding), [node, driver] { driver->bind(*node); });
+}
+
 void graph_service_allocation_rollback()
 {
     TempWave files("graph-rollback");
@@ -171,7 +194,7 @@ void graph_service_allocation_rollback()
         const PortSpec target(BandWidth::Full, 2, SampleFormat::S16LE);
         for (int at = 0; at < 128; ++at)
         {
-            if (!allocation_fails(at, [&] { sink = graph.create_owav(path, target, 0s, 10ms); }))
+            if (!allocation_fails(at, [&] { sink = add_wav_output(graph, path, target); }))
                 break;
             WavFile file;
             check(file.open_read(path) == RetCode::IOFAILED, "Allocation failure must precede exclusive file creation");
@@ -223,9 +246,9 @@ void graph_service_live_commit_failure()
         const auto third_path = files.path("-third.wav");
         const auto failed = queue.sync([&] {
             GraphService graph(queue, period);
-            const auto first = graph.create_owav(first_path, pcm, 0s, 10ms);
-            const auto second = graph.create_owav(second_path, pcm, 0s, 10ms);
-            const auto third = graph.create_owav(third_path, pcm, 0s, 10ms);
+            const auto first = add_wav_output(graph, first_path, pcm);
+            const auto second = add_wav_output(graph, second_path, pcm);
+            const auto third = add_wav_output(graph, third_path, pcm);
             graph.set_paused(second, true);
             graph.set_paused(third, true);
             graph.start();

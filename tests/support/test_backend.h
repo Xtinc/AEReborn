@@ -26,8 +26,9 @@ struct BackendCalls
 class TestBackend final : public ActiveBackend
 {
   public:
-    TestBackend(PortSpec spec, std::size_t frames, BackendCalls *calls = nullptr, bool async = true)
-        : ActiveBackend(async), spec_(spec), frames_(frames), calls_(calls)
+    TestBackend(PortSpec spec, std::size_t frames, BackendCalls *calls = nullptr, bool async = true,
+                bool fail_on_timeout = true)
+        : ActiveBackend(async, fail_on_timeout), spec_(spec), frames_(frames), calls_(calls)
     {
     }
 

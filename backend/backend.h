@@ -188,7 +188,9 @@ class ActiveBackend : public Backend
 
   protected:
     /// @param async True for independent hardware clocks, false for graph-clocked I/O.
-    explicit ActiveBackend(bool async) noexcept : async_(async) {}
+    /// @param fail_on_timeout Stop an asynchronous worker when PCM I/O times out.
+    explicit ActiveBackend(bool async, bool fail_on_timeout = true) noexcept
+        : async_(async), fail_on_timeout_(fail_on_timeout) {}
 
     /// @brief Publish an I/O failure for last_error().
     /// @pre Call from the worker or during control-side cleanup after it joins.
@@ -265,6 +267,7 @@ class ActiveBackend : public Backend
     RetCode drain_playback() noexcept;
 
     const bool async_;
+    const bool fail_on_timeout_;
     std::vector<std::uint8_t> device_bytes_;
     ASRC asrc_;
     std::mutex wait_mutex_;

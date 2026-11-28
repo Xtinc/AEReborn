@@ -159,6 +159,14 @@ void write_json_node(std::ostream &out, const ConfiguredNode &entry, bool in_pla
         }
         out << ']';
     }
+    if (entry.device.state)
+    {
+        out << ",\"device_status\":{\"state\":";
+        write_json_string(out, entry.device.state);
+        out << ",\"error\":";
+        write_json_string(out, error_code_name(entry.device.error.code()));
+        out << '}';
+    }
     out << '}';
 }
 

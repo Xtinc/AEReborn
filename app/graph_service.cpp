@@ -1,9 +1,4 @@
 #include "graph_service.h"
-#include "backend/pull_sink.h"
-#include "backend/push_source.h"
-#include "backend/usr_capture.h"
-#include "backend/usr_playback.h"
-#include "backend/wav_backend.h"
 #include "core/command_queue.h"
 #include "diag/inspect.h"
 #include "plugins/convert.h"
@@ -11,7 +6,6 @@
 #include "plugins/mixer.h"
 #include <algorithm>
 #include <cassert>
-#include <limits>
 #include <utility>
 #include <vector>
 
@@ -25,117 +19,12 @@ bool contains_node(View<const NodeId> nodes, NodeId id) noexcept
     return !nodes.empty() && std::find(nodes.begin(), nodes.end(), id) != nodes.end();
 }
 
-void validate_io_period(BandWidth bandwidth, std::chrono::microseconds io_period)
-{
-    // Backend construction validates bandwidth. Reject sub-frame periods before allocating the queue.
-    constexpr auto micros_per_second = 1000000u;
-    const auto rate = static_cast<std::uint32_t>(bandwidth);
-    const std::chrono::microseconds min_period{(micros_per_second + rate - 1) / rate};
-    if (io_period < min_period)
-        throw Error(RetCode::EPARAM);
-}
-
 } // namespace
 
-struct NodeBinding
+GraphService::GraphService(CommandQueue &commands, BlockPeriod period)
+    : commands_(commands), engine_(period)
 {
-    template <class Driver> struct Active;
-    template <class Driver> struct Passive;
-    struct Push;
-    struct Pull;
-
-    virtual ~NodeBinding() = default;
-    virtual Backend &backend() noexcept = 0;
-    virtual void start() { backend().start(); }
-    virtual void stop() noexcept { backend().stop(); }
-    virtual void unbind() noexcept { backend().unbind(); }
-    virtual Result<std::size_t> push(const std::uint8_t *, std::size_t) { return RetCode::ETYPE; }
-    virtual Result<std::size_t> pull(std::uint8_t *, std::size_t) { return RetCode::ETYPE; }
-};
-
-template <class Driver>
-struct NodeBinding::Active final : NodeBinding
-{
-    template <class... Args>
-    explicit Active(Args &&...args) : driver(std::forward<Args>(args)...) {}
-
-    Backend &backend() noexcept override { return driver; }
-
-    Driver driver;
-};
-
-template <class Driver>
-struct NodeBinding::Passive : NodeBinding
-{
-    // Constructing the driver validates the PCM spec before the frame limit is calculated.
-    explicit Passive(PortSpec spec)
-        : driver(spec), max_frames_(std::numeric_limits<std::size_t>::max() / spec.channels / sample_bytes(spec.format))
-    {
-    }
-
-    Backend &backend() noexcept final { return driver; }
-
-    void start() final
-    {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        driver.start();
-    }
-
-    void stop() noexcept final
-    {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        driver.stop();
-    }
-
-    void unbind() noexcept final
-    {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        driver.unbind();
-    }
-
-    Driver driver;
-
-  protected:
-    template <class Byte, class Fn>
-    Result<std::size_t> transfer(Byte *data, std::size_t frames, Fn fn)
-    {
-        if (frames && !data)
-            return RetCode::EPARAM;
-        if (frames > max_frames_)
-            return RetCode::TOOLARGE;
-
-        const std::lock_guard<std::mutex> lock(mutex_);
-        if (!driver.running())
-            return driver.bound() ? RetCode::ESTATE : RetCode::ENODE;
-        return fn({data, driver.device_spec(), frames});
-    }
-
-  private:
-    std::mutex mutex_;
-    const std::size_t max_frames_;
-};
-
-struct NodeBinding::Push final : Passive<PushSource>
-{
-    using Passive<PushSource>::Passive;
-
-    Result<std::size_t> push(const std::uint8_t *data, std::size_t frames) override
-    {
-        return transfer(data, frames, [this](IBBlock block) { return driver.push(block); });
-    }
-};
-
-struct NodeBinding::Pull final : Passive<PullSink>
-{
-    using Passive<PullSink>::Passive;
-
-    Result<std::size_t> pull(std::uint8_t *data, std::size_t frames) override
-    {
-        return transfer(data, frames, [this](OBBlock block) { return driver.pull(block); });
-    }
-};
-
-GraphService::GraphService(CommandQueue &commands, BlockPeriod period) : commands_(commands), engine_(period) {}
+}
 
 GraphService::~GraphService()
 {
@@ -143,11 +32,17 @@ GraphService::~GraphService()
     // External calls have already returned, so teardown can unbind directly.
     for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it)
         if (const auto &endpoint = it->second.endpoint)
-            endpoint->backend().unbind();
+            endpoint->unbind();
     engine_.stop();
 }
 
-GraphService::NodeMap::iterator GraphService::add_node(std::unique_ptr<Node> node, bool published)
+NodeId GraphService::add_node(std::unique_ptr<Node> node)
+{
+    assert(commands_.on_thread());
+    return insert_node(std::move(node), /*published=*/true)->first;
+}
+
+GraphService::NodeMap::iterator GraphService::insert_node(std::unique_ptr<Node> node, bool published)
 {
     const auto id = engine_.add_node(std::move(node));
     const auto cleanup = [&]() noexcept { engine_.remove_node(id); };
@@ -166,13 +61,13 @@ std::shared_ptr<NodeBinding> GraphService::detach_node(NodeMap::iterator entry)
     return endpoint;
 }
 
-template <class Endpoint, class Binding>
-NodeId GraphService::add_endpoint(std::unique_ptr<Endpoint> endpoint, std::shared_ptr<Binding> binding)
+NodeId GraphService::add_endpoint(std::unique_ptr<Node> endpoint, std::shared_ptr<NodeBinding> binding,
+                                 const std::function<void()> &bind)
 {
-    auto *node = endpoint.get();
-    node->prepare(engine_.block_period());
+    assert(commands_.on_thread());
+    endpoint->prepare(engine_.block_period());
     // Reserve the table entry before bind() can create a file, then publish after binding.
-    const auto entry = add_node(std::move(endpoint), /*published=*/false);
+    const auto entry = insert_node(std::move(endpoint), /*published=*/false);
     const auto id = entry->first;
     const auto cleanup = [&]() noexcept {
         binding.reset(); // Destroy the unpublished backend before removing the node it borrows.
@@ -180,7 +75,7 @@ NodeId GraphService::add_endpoint(std::unique_ptr<Endpoint> endpoint, std::share
         engine_.remove_node(id);
     };
     ScopeExit<decltype(cleanup)> rollback(cleanup);
-    binding->driver.bind(*node);
+    bind();
     {
         const std::lock_guard<std::mutex> lock(nodes_mutex_);
         entry->second.endpoint = std::move(binding);
@@ -190,77 +85,7 @@ NodeId GraphService::add_endpoint(std::unique_ptr<Endpoint> endpoint, std::share
     return id;
 }
 
-NodeId GraphService::create_iwav(const std::string &path, int repeat, std::chrono::microseconds io_period)
-{
-    assert(commands_.on_thread());
-    using Binding = NodeBinding::Active<WavCapture>;
-    auto binding = repeat > 0 ? std::make_shared<Binding>(path, WavCapture::Repeat{static_cast<std::size_t>(repeat)})
-                              : std::make_shared<Binding>(path, repeat < 0);
-    const auto spec = binding->driver.probe().value_or_throw();
-    auto endpoint = std::make_unique<Capture>(spec.bandwidth, spec.channels, io_period);
-    return add_endpoint(std::move(endpoint), std::move(binding));
-}
-
-NodeId GraphService::create_owav(const std::string &path, PortSpec spec, std::chrono::seconds segment_duration,
-                                 std::chrono::microseconds io_period)
-{
-    assert(commands_.on_thread());
-    if (!spec.valid())
-        throw Error(RetCode::EPARAM);
-    throw_if_error(WavFile::max_write_frames(spec).ret_code());
-    auto endpoint = std::make_unique<Playback>(spec.bandwidth, spec.channels, io_period);
-    auto binding = std::make_shared<NodeBinding::Active<WavPlayback>>(path, spec.format, segment_duration,
-                                                                  WavFile::WriteMode::Exclusive);
-    return add_endpoint(std::move(endpoint), std::move(binding));
-}
-
-NodeId GraphService::create_icallback(PortSpec spec, AudioCallback callback, void *user_data,
-                                     std::chrono::microseconds io_period)
-{
-    assert(commands_.on_thread());
-    if (!callback)
-        throw Error(RetCode::EPARAM);
-    auto binding = std::make_shared<NodeBinding::Active<UsrCapture>>(spec, [callback, user_data](OBBlock block) noexcept {
-        callback(nullptr, block.byte_view().data(), block.frames(), block.spec(), user_data);
-    });
-    validate_io_period(spec.bandwidth, io_period);
-    auto endpoint = std::make_unique<Capture>(spec.bandwidth, spec.channels, io_period);
-    return add_endpoint(std::move(endpoint), std::move(binding));
-}
-
-NodeId GraphService::create_ocallback(PortSpec spec, AudioCallback callback, void *user_data,
-                                     std::chrono::microseconds io_period)
-{
-    assert(commands_.on_thread());
-    if (!callback)
-        throw Error(RetCode::EPARAM);
-    auto binding = std::make_shared<NodeBinding::Active<UsrPlayback>>(spec, [callback, user_data](IBBlock block) noexcept {
-        callback(block.byte_view().data(), nullptr, block.frames(), block.spec(), user_data);
-    });
-    validate_io_period(spec.bandwidth, io_period);
-    auto endpoint = std::make_unique<Playback>(spec.bandwidth, spec.channels, io_period);
-    return add_endpoint(std::move(endpoint), std::move(binding));
-}
-
-NodeId GraphService::create_ipush(PortSpec spec, std::chrono::microseconds io_period)
-{
-    assert(commands_.on_thread());
-    auto binding = std::make_shared<NodeBinding::Push>(spec);
-    validate_io_period(spec.bandwidth, io_period);
-    auto endpoint = std::make_unique<Capture>(spec.bandwidth, spec.channels, io_period);
-    return add_endpoint(std::move(endpoint), std::move(binding));
-}
-
-NodeId GraphService::create_opull(PortSpec spec, std::chrono::microseconds io_period)
-{
-    assert(commands_.on_thread());
-    auto binding = std::make_shared<NodeBinding::Pull>(spec);
-    validate_io_period(spec.bandwidth, io_period);
-    auto endpoint = std::make_unique<Playback>(spec.bandwidth, spec.channels, io_period);
-    return add_endpoint(std::move(endpoint), std::move(binding));
-}
-
-Result<std::shared_ptr<NodeBinding>> GraphService::find_io_endpoint(NodeId node)
+Result<std::shared_ptr<NodeBinding>> GraphService::find_binding(NodeId node, BindingMatcher matches) noexcept
 {
     if (node.port() != 0)
         return RetCode::EPORT;
@@ -269,44 +94,26 @@ Result<std::shared_ptr<NodeBinding>> GraphService::find_io_endpoint(NodeId node)
     const auto entry = nodes_.find(node);
     if (entry == nodes_.end() || !entry->second.published)
         return RetCode::ENODE;
-    if (!entry->second.endpoint)
-        return RetCode::ETYPE;
-    return entry->second.endpoint;
-}
-
-Result<std::size_t> GraphService::push(NodeId node, const void *data, std::size_t frames)
-{
-    const auto endpoint = find_io_endpoint(node);
-    if (!endpoint)
-        return endpoint.ret_code();
-    return endpoint.value()->push(static_cast<const std::uint8_t *>(data), frames);
-}
-
-Result<std::size_t> GraphService::pull(NodeId node, void *data, std::size_t frames)
-{
-    const auto endpoint = find_io_endpoint(node);
-    if (!endpoint)
-        return endpoint.ret_code();
-    return endpoint.value()->pull(static_cast<std::uint8_t *>(data), frames);
+    const auto &endpoint = entry->second.endpoint;
+    if (endpoint && matches(*endpoint))
+        return endpoint;
+    return RetCode::ETYPE;
 }
 
 NodeId GraphService::create_mixer(BandWidth bandwidth, std::size_t channels, std::size_t inputs)
 {
-    assert(commands_.on_thread());
-    return add_node(std::make_unique<Mixer>(bandwidth, channels, inputs))->first;
+    return add_node(std::make_unique<Mixer>(bandwidth, channels, inputs));
 }
 
 NodeId GraphService::create_matrix(BandWidth bandwidth, std::size_t input_channels, std::size_t output_channels,
                                    View<const float> coefficients, float gain)
 {
-    assert(commands_.on_thread());
-    return add_node(std::make_unique<Matrix>(bandwidth, input_channels, output_channels, coefficients, gain))->first;
+    return add_node(std::make_unique<Matrix>(bandwidth, input_channels, output_channels, coefficients, gain));
 }
 
 NodeId GraphService::create_convert(PortSpec input, PortSpec output)
 {
-    assert(commands_.on_thread());
-    return add_node(std::make_unique<Convert>(input, output))->first;
+    return add_node(std::make_unique<Convert>(input, output));
 }
 
 GraphService::NodeMap::iterator GraphService::find_node(NodeId node)
@@ -385,12 +192,10 @@ void GraphService::remove(NodeId node)
     engine_.remove_node(node);
 }
 
-template <class Operation>
-void GraphService::visit_endpoint(NodeId node, Operation operation)
+NodeBinding *GraphService::find_endpoint(NodeId node) noexcept
 {
     const auto entry = nodes_.find(node);
-    if (entry != nodes_.end() && entry->second.endpoint)
-        operation(*entry->second.endpoint);
+    return entry == nodes_.end() ? nullptr : entry->second.endpoint.get();
 }
 
 void GraphService::commit()
@@ -417,15 +222,13 @@ void GraphService::commit()
     const auto cleanup = [this]() noexcept { stop(); };
     ScopeExit<decltype(cleanup)> rollback(cleanup);
     for (auto it = previous.rbegin(); it != previous.rend(); ++it)
-        visit_endpoint(*it, [&](auto &endpoint) {
+        if (auto *endpoint = find_endpoint(*it))
             if (!contains_node(current, *it))
-                endpoint.stop();
-        });
+                endpoint->stop();
     for (const auto id : current)
-        visit_endpoint(id, [&](auto &endpoint) {
+        if (auto *endpoint = find_endpoint(id))
             if (!contains_node(old_plan, id))
-                endpoint.start();
-        });
+                endpoint->start();
     rollback.dismiss();
 }
 
@@ -438,7 +241,8 @@ void GraphService::start()
     const auto cleanup = [this]() noexcept { stop(); };
     ScopeExit<decltype(cleanup)> rollback(cleanup);
     for (const auto id : engine_.plan_nodes())
-        visit_endpoint(id, [](auto &endpoint) { endpoint.start(); });
+        if (auto *endpoint = find_endpoint(id))
+            endpoint->start();
     engine_.start();
     rollback.dismiss();
 }
@@ -477,7 +281,7 @@ void GraphService::set_high_priority(NodeId mixer_port, bool high)
     engine_.node<Mixer>(mixer_port.base())->set_high_priority(mixer_port.port(), high);
 }
 
-std::string GraphService::dump_json()
+std::string GraphService::dump_json(const DeviceStatusFn &device_status)
 {
     assert(commands_.on_thread());
     std::vector<const Backend *> drivers;
@@ -487,9 +291,11 @@ std::string GraphService::dump_json()
     connections.reserve(links_.size());
     for (const auto &entry : nodes_)
     {
-        nodes.push_back({entry.first, engine_.node(entry.first), entry.second.paused});
-        if (const auto &endpoint = entry.second.endpoint)
-            drivers.push_back(&endpoint->backend());
+        const auto &endpoint = entry.second.endpoint;
+        nodes.push_back({entry.first, engine_.node(entry.first), entry.second.paused,
+                         device_status ? device_status(entry.first) : DeviceStatus{}});
+        if (const auto *backend = endpoint ? endpoint->backend() : nullptr)
+            drivers.push_back(backend);
     }
     for (const auto &entry : links_)
         connections.push_back(entry.second);

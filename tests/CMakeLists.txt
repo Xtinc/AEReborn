@@ -30,6 +30,12 @@ foreach(case channel_map wav_routing_and_conversion live_control_and_cleanup con
     set_tests_properties(public.audio_center_${case} PROPERTIES LABELS public TIMEOUT 20)
 endforeach()
 
+set(device_tests device_parameters)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ALSA_FOUND)
+    list(APPEND device_tests device_offline_recovery device_periodic_reset device_manual_restart)
+endif()
+aereborn_test_group(public device_recovery.cpp aereborn::aereborn ${device_tests})
+
 aereborn_test_group(bus wave_tests.cpp aereborn_test_plugins
     four_channel_song_archive repeated_tracks_and_segments three_output_specs)
 aereborn_test_group(bus routing_tests.cpp aereborn_test_plugins
@@ -50,15 +56,17 @@ aereborn_test_group(dsp plugin_tests.cpp aereborn::aereborn
     fractional_rate_and_antialias convert_activity_and_tail)
 aereborn_test_group(io backend_tests.cpp aereborn::aereborn
     endpoint_ownership_and_restart user_capture_contract user_capture_samples_and_restart
-    device_worker_errors wav_seek_and_padding sample_clock_drift)
+    device_worker_errors device_worker_ignores_timeouts wav_seek_and_padding sample_clock_drift)
 aereborn_test_group(io diagnostics_tests.cpp aereborn::aereborn
     diagnostic_reports mixer_priority_diagnostics endpoint_diagnostics)
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     aereborn_test_group(io platform_tests.cpp aereborn::aereborn
-        wasapi_rebind_after_open_error wasapi_capture wasapi_playback)
+        wasapi_rebind_after_open_error wasapi_device_names wasapi_capture wasapi_playback)
     set_property(TEST io.wasapi_capture io.wasapi_playback APPEND PROPERTY LABELS hardware)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ALSA_FOUND)
-    aereborn_test_group(io platform_tests.cpp aereborn::aereborn alsa_interleaved alsa_prefer_mmap)
+    aereborn_test_group(io platform_tests.cpp aereborn::aereborn
+        alsa_interleaved alsa_prefer_mmap alsa_public_endpoints alsa_capture alsa_playback)
+    set_property(TEST io.alsa_capture io.alsa_playback APPEND PROPERTY LABELS hardware)
 endif()
 aereborn_test_group(regression allocation_tests.cpp aereborn::aereborn
     commit_allocation_rollback backend_allocation_rollback command_queue_timer_allocation_rollback

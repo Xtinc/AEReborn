@@ -13,11 +13,18 @@ namespace aereborn
 /// @note Metrics are sampled independently. WAV backends expose only the configured file name.
 std::string dump_json(const Engine &engine, View<const Backend *const> backends = {});
 
+struct DeviceStatus
+{
+    const char *state = nullptr;
+    RetCode error;
+};
+
 struct ConfiguredNode
 {
     NodeId id;
     const Node *node;
     bool paused;
+    DeviceStatus device{};
 };
 
 /// @brief Return JSON of the caller's configured topology, marking members of the committed plan.

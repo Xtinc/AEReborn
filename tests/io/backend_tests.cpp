@@ -149,6 +149,32 @@ void device_worker_errors()
           "Unbind cancels blocked I/O and joins the worker");
 }
 
+void device_worker_ignores_timeouts()
+{
+    Capture capture(rate, 1, 5ms);
+    capture.prepare(period);
+    BackendCalls calls;
+    TestBackend source(pcm, 240, &calls, true, false);
+    source.gated = true;
+    source.io_result = RetCode::TIMEOUT;
+    source.bind(capture);
+    source.start();
+    check(source.wait_for_io(), "Capture enters its first transfer");
+    for (int i = 0; i < 3; ++i)
+        check(source.run_batch(), "Capture retries after an explicit TIMEOUT");
+    source.stop();
+
+    source.gated = false;
+    source.io_result = {};
+    source.cadence = 1ms;
+    source.empty_capture = true;
+    source.start();
+    std::this_thread::sleep_for(1100ms);
+    check(source.running() && source.last_error() == RetCode::OK, "Capture stays online across two progress deadlines");
+    source.stop();
+    check(calls.cancels == 2 && source.last_error() == RetCode::OK, "Stopping cancels even while timeouts are ignored");
+}
+
 void wav_seek_and_padding()
 {
     TempWave files("wav-seek");
@@ -288,6 +314,7 @@ int main(int argc, char **argv)
                                                 {"user_capture_contract", user_capture_contract},
                                                 {"user_capture_samples_and_restart", user_capture_samples_and_restart},
                                                 {"device_worker_errors", device_worker_errors},
+                                                {"device_worker_ignores_timeouts", device_worker_ignores_timeouts},
                                                 {"wav_seek_and_padding", wav_seek_and_padding},
                                                 {"sample_clock_drift", sample_clock_drift}});
 }

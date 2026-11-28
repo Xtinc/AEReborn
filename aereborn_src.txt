@@ -114,9 +114,7 @@ Engine 停止会等待图处理退出。后端停止时唤醒阻塞的异步 I/O
 
 ## 5. 外部资源与恢复
 
-逻辑端点可跨设备切换复用。后端独占借用已经准备的端点，并持有设备句柄。设备枚举、选择策略与自动恢复可由后续的 DeviceService 负责。
-选择可以是固定设备、跟随系统默认、优先某类设备；不在收到任意插入事件后立即抢占当前设备。
-设备身份使用平台稳定标识及匹配规则，不依赖枚举序号永久不变。
+逻辑端点可跨设备切换复用。后端独占借用已经准备的端点，并持有设备句柄。`DeviceService` 在控制线程创建并恢复硬件后端，`GraphService` 持有绑定并按已提交计划启停。创建和重连时按原配置选择设备，配置为 `default` 时解析当时的系统默认设备。后续可接入系统热插拔通知以缩短发现时间。
 
 ```text
 逻辑意图：Running / Paused / Stopped
@@ -126,7 +124,7 @@ Engine 停止会等待图处理退出。后端停止时唤醒阻塞的异步 I/O
 两组状态分别维护：恢复完成仍要服从用户当前意图。
 掉线期间保留图、音量和连接；缺失采集数据补静音并由后端记录缺口，输出设备不可用时丢弃该设备数据，总线及其他下游继续处理。
 可就地恢复的欠载由后端处理；需重开、等待设备、不可恢复的配置错误由统一恢复策略区分。
-重试带退避和取消，主动定期重开也是同一策略的选项。会话代际编号屏蔽过期打开结果与旧设备数据。
+`DeviceService` 用一个共享定时器在控制线程每秒巡检已启动且启用恢复的硬件绑定。当前测试阶段，严格模式在上线满 10 秒后的首次巡检重开设备。两个间隔固定在 `app/device_service.cpp`。没有待巡检的端点时取消共享定时器。硬件端点停止时释放失效驱动和默认设备驱动，下次启动会重新打开设备。
 
 一个逻辑端点最多由一个外部参与方读写队列。播放侧在最终设备端点之前显式混音。图侧端点保持既定格式，后端在打开设备时独立协商实际格式。
 设备协商格式与逻辑音频格式分离，恢复不改变应用看到的端口布局；适配不了时报告端点失败。
@@ -137,6 +135,7 @@ Engine 停止会等待图处理退出。后端停止时唤醒阻塞的异步 I/O
 - WavCapture 在后端线程读文件，可循环播放。WavPlayback 接收同步播放队列，解绑时回填 RIFF/WAVE 文件长度。
 - `PushSource`：应用推入固定规格的交错 PCM，接口返回已接收的输入帧数。帧时间和连续性信息由上层流处理。
 - `PullSink`：应用从 `Playback` 拉取固定规格的交错 PCM，返回实际输出帧数。
+- `UsrCapture`：同步采集后端在队列有足够空位时请求一整批交错 PCM。每次调用前将缓冲清零，未写入的样本保持静音。
 - `UsrPlayback`：同步播放后端在工作线程按固定批次回调交错 PCM，停止时排空队列和 FIR 尾部。回调中的块只在当次调用内有效。
 
 ## 6. 混音策略归属
@@ -195,7 +194,7 @@ Tone / BUS（48k F32P）
 - `Matrix::set_gain()`、`Mixer::set_muted()` 和 `Mixer::set_high_priority()` 可与 `process()` 并发调用。每个有帧的块各读取一次 Mixer 的静音和优先级掩码。可用 `muted()` 和 `high_priority()` 查询设置，用 `suppressed()` 查询最近一个有帧的块中哪些活跃且未静音的输入处于淡出或稳态压制。Mixer 的 `reset()` 清除处理状态和压制报告，保留静音和优先级设置。控制侧从 `Engine::node()` 借用草稿节点指针，须在节点被移除或替换前结束使用，最长有效期到 Engine 析构。
 - 图提交并准备端点后，`ActiveBackend::bind(endpoint)` 协商 PCM 规格和单包预算 `io_period()`，`start()` 在工作线程上初始化。`ActiveBackend` 和 `PassiveBackend` 共用 `Backend` 的端点占用与 PCM 转换，并可通过 `Backend&` 统一启停与查询。端点已经被占用时抛出 `Error(RetCode::BUSY)`。绑定失败释放资源和占用。设备启动失败时先回收工作线程，再向控制调用方抛出设备错误。
 - `PushSource` 绑定 `Capture`，由应用串行执行 `push(IBBlock)`、控制接口、状态查询和析构。可用单消费者指令队列执行这些操作。PCM 缓冲至少保留到 `push()` 返回。同一流的分片按顺序投递，停止接收旧流数据后再执行停机或重启。`push()` 返回本次接收的输入帧数，后续从该偏移续推。队列空位不足时可能返回零，图侧缺帧时补静音。`stop()` 丢弃未消费的帧并复位重采样器。
-- `PullSink` 同样由应用串行调用，`pull(OBBlock)` 读取 `Playback` 中当前可用的 PCM。`UsrPlayback` 由同步播放工作线程消费 `Playback` 队列。分数秒预算在构造 `Playback` 时一次向上取整为微秒，回调使用固定帧数，交付由数据就绪驱动。
+- `PullSink` 同样由应用串行调用，`pull(OBBlock)` 读取 `Playback` 中当前可用的 PCM。`UsrCapture` 和 `UsrPlayback` 各由同步工作线程运行，批次帧数为采样率乘以 `io_period` 后向下取整。采集由队列空位驱动，播放由队列中的可用帧驱动，排空时可交付短尾包。
 - `stop()` 下线并复位 DSP 和漂移，保留绑定和已分配工作区。同步播放先关闭图侧写入，写完已排队帧及 FIR 尾部。同步 I/O 钩子须自行完成操作。切换设备时依次调用旧后端的 `unbind()` 和新后端的 `bind(endpoint)`、`start()`。
 - 异步播放补齐设备批次的静音，后端通过 `last_error()` 返回 I/O 终止原因。异步等待和数据交接共用以最后一次 I/O 进展为起点的截止时间。主动停止可唤醒设备等待。测试通过真实的 I/O 工作线程验证设备交接。
 - `Engine::stop()` 唤醒时钟并等待在途图处理退出。先停止绑定的后端，再调用 `Engine::reset()`。在移除、替换端点或销毁 Engine 前解绑其后端。派生驱动析构时先调用 `unbind()`。
@@ -232,12 +231,20 @@ node tools/render_graph.js examples/sankey_reference.json build/graph-preview/re
 
 ### AudioCenter
 
-应用通过 `include/audio_interface.h` 使用 `AudioCenter` 创建 WAV 输入、WAV 输出、Mixer、Matrix 和 Convert。门面将操作同步派发至控制线程，由 `app/graph_service.cpp` 管理图和后端。调用会阻塞。所有调用线程须在实例析构前结束对实例的访问。控制方法返回 `RetCode`，创建失败返回空句柄，诊断失败返回空字符串。`AudioCenter::last_error()` 返回调用线程最近一次控制或诊断操作的状态。
+应用通过 `include/audio_interface.h` 使用 `AudioCenter` 创建硬件、WAV、回调和主动推拉端点，以及 Mixer、Matrix 和 Convert。门面将图编辑、运行控制和诊断同步派发至控制线程，并在控制线程完成 WAV、回调和推拉端点的装配。PCM 推拉由调用线程直接执行。`GraphService` 管理图、节点表和计划切换，`DeviceService` 管理硬件设备与恢复。析构时先取消硬件巡检，再解绑图端点，最后销毁设备服务。所有调用线程须在实例析构前结束对实例的访问。控制方法返回 `RetCode`，创建失败返回空句柄，诊断失败返回空字符串。`AudioCenter::last_error()` 返回调用线程最近一次控制、诊断或推拉操作的状态。
 
 - 使用 `ChannelMap` 描述声道映射。索引从零开始，`route(from, to, weight)` 按输入到输出设置权重，`mix({0, 2}, 0)` 将输入 0 和 2 等权混到输出 0。纯增益节点使用 `ChannelMap::identity(channels)`；可用 `ChannelMap::select(4, {2, 3})` 选取一对立体声，也可用 `dense()` 传入按输出行排列的系数。`create_matrix(rate, map, gain)` 复制映射后创建节点。构造或修改映射时发生的首个错误可通过 `map.status()` 查询，也会由创建调用通过 `last_error()` 返回。
-- `connect(from, to)` 要求采样率、声道数和样本格式完全相同，任一项不同返回 `INVFMT`。调用者用 `create_matrix()` 改变声道数，用 `create_convert(input, output)` 改变采样率或样本格式，然后逐段连接。`output_spec(port)` 可读取 WAV 输入等节点的图侧规格。WAV 节点的图侧样本格式为 F32P，文件格式由 WAV 后端处理。断开边时，显式创建的转换节点仍由调用者管理。
-- 首次 `start()` 和草稿有变化时会自动提交。运行中 `commit()` 的图准备失败会保留当前计划。发布新计划后，门面先按旧计划的逆执行顺序停止离场后端，再按新计划的执行顺序启动入场后端。离场的录音后端可以在计划切换后排空队列。留在计划里的后端延续原有状态，包括自然结束和 I/O 错误。若有后端启动失败，门面停止后端和时钟并保留新计划，修复后可重新 `start()`。移除 WAV 端点会立即解绑，旧计划里仍存在的采集端点输出静音，播放端点停止接收数据。
-- 未暂停的 WAV 输出在断开上游后继续录制静音，以保留时间轴。暂停输出节点并提交会停止该后端。单文件输出在创建节点时独占打开，目标已存在时返回 `BUSY`。编号分段跳过已有文件。`stop()` 排空录音队列并保留打开的文件，移除输出或销毁实例会回填最终的 WAV 文件长度。
+- `connect(from, to)` 要求采样率、声道数和样本格式完全相同，任一项不同返回 `INVFMT`。调用者用 `create_matrix()` 改变声道数，用 `create_convert(input, output)` 改变采样率或样本格式，然后逐段连接。`output_spec(port)` 可读取节点的图侧规格。WAV、回调和推拉端点的图侧样本格式为 F32P，后端处理各自的交错 PCM 格式。断开边时，显式创建的转换节点仍由调用者管理。
+- `create_idev()` 和 `create_odev()` 创建硬件采集和播放端点。`DevConfig` 默认选择系统默认设备，图侧为 48 kHz、双声道、F32P，设备 I/O 预算为 10 ms。ALSA 将裸卡名展开为 `hw:CARD=<name>,DEV=<device>`，含 `:` 的 PCM 名称原样传入。WASAPI 使用 UTF-8 Endpoint ID 或友好名，精确名称优先于子串匹配，匹配不唯一时返回 `EPARAM`。
+- ALSA 协商交错 PCM 的位深与采样率，优先 MMAP，回退到 RW。`DevFlags::MEMCPY` 强制 RW，可与任一恢复模式组合，Windows 接受并忽略该位。WASAPI 使用共享模式的混音格式。协商后的流须接受精确声道数，否则返回 `INVFMT`。对于 ALSA `hw:`，这个要求直接适用于硬件。`plughw:` 等 PCM 插件可以在其下游完成声道转换。图侧声道映射由 `Matrix` 完成。
+- `RECOVERSOFT` 忽略 I/O 超时，遇设备离线或 I/O 失败时重连。`RECOVERHARD` 也恢复超时，并按第 5 节所述间隔定期重开。受影响支路在重开和队列预填充期间会短暂静音或丢帧。两种模式都允许创建离线占位端点，巡检仅在进入运行计划后执行。遇不可恢复错误时该路停止巡检，可通过停止和重新启动再次尝试。`dump_json()` 的硬件节点包含 `device_status`，记录 `stopped`、`waiting`、`online` 或 `failed` 以及最近错误。
+- `create_icallback()` 提供可写的输出缓冲，`create_ocallback()` 提供只读的输入缓冲。两者使用 `AudioCallback`，另一方向的指针为 `nullptr`，缓冲只在当次调用中有效。回调侧采样率及声道数与图端口一致，只需 PCM 编解码。回调须返回且不得抛异常或调用 `AudioCenter` 控制方法。默认批次时长为 10 ms，48 kHz 时为 480 帧。
+- 回调输入只有进入生效计划才启动，交付的全零样本仍视为活跃输入，因此高优先级回调源仍会压制普通输入。可提交暂停或静音对应的 Mixer 输入来解除压制。
+- `stop()`、移出计划的 `commit()`、`remove()` 和析构均等待相关回调线程退出。回调输出在退出时排空已排队的音频，最后一批可能较短。调用方须让 `user_data` 在这些操作返回前保持有效。如果之后重启或恢复端点，回调仍使用原来的指针。
+- `create_ipush()` 和 `create_opull()` 创建使用固定交错 PCM 的端点，图侧使用同采样率、同声道数的 F32P。业务线程用 `push()` 和 `pull()` 传递当次调用期间有效的缓冲，返回实际接受或写入的帧数。短写后按已接受帧数续推，短读保留缓冲的未写后缀。队列满或空时可返回 0，状态为 `OK`。未启动或移出生效计划的端点返回 `ESTATE`。高优先级推流的队列耗尽后，Mixer 在首个无该路输入的块内恢复普通输入的增益。
+- `io_period` 为推拉队列提供突发数据预算，默认 10 ms。内部转换按最多 10 ms 的工作区切片处理。`GraphService` 在同一张节点表中登记节点与 `NodeBinding`。业务线程通过查表直接判定 `ENODE` 和 `ETYPE`，取得端点引用后立即释放表锁。推拉端点在同一节点内串行传输和启停。移除先摘除表项，再等待在途传输并解绑。停止或提交暂停会丢弃推拉端点的缓冲帧，业务线程可在停机前读取队列中可用的帧。
+- 首次 `start()` 和草稿有变化时会自动提交。运行中 `commit()` 的图准备失败会保留当前计划。发布新计划后，门面先按旧计划的逆执行顺序停止离场后端，再按新计划的执行顺序启动入场后端。离场的录音后端可以在计划切换后排空队列。留在计划里的后端延续原有状态，包括自然结束和 I/O 错误。启用恢复的硬件端点在本路处理启动失败，其余后端启动失败时门面停止后端和时钟并保留新计划。移除端点会立即解绑，旧计划里仍存在的采集端点输出静音，播放端点停止接收数据。
+- 未暂停的 WAV、回调和拉取输出在提交断连后继续接收静音，以保留时间轴。暂停输出节点并提交会停止该后端。单文件 WAV 输出在创建节点时独占打开，目标已存在时返回 `BUSY`。编号分段跳过已有文件。`stop()` 排空录音队列并保留打开的文件，移除输出或销毁实例会回填最终的 WAV 文件长度。
 
 ### 构建与验证
 
@@ -257,7 +264,7 @@ ctest --test-dir build/release -C Release -L bus --output-on-failure
 
 `tests/data/` 的两份 48 kHz 双声道 WAV 短片来自《渡口》第 30 秒起的 0.5 秒和 CaliforniaHotel 第 40 秒起的 0.75 秒。四声道测试将两段音乐交错到同一个输入，生成两份 48 kHz 拆分归档和一份 44.1 kHz 混音归档。录音和分段文件在构建目录内创建，正常退出时清理。
 
-`io` 包含后端绑定、设备超时、WAV 文件和时钟漂移检查。Linux 有 ALSA 时运行两种 `plug:null` 采集和播放配置。Windows 默认验证 WASAPI 绑定失败和 Null 接管。设置 `AEREBORN_WASAPI_CAPTURE_ID` 或 `AEREBORN_WASAPI_PLAYBACK_ID` 后，可用 `ctest --test-dir build/release -C Release -L hardware --output-on-failure` 运行对应实机用例。ALSA 后端的设计背景见 [ALSA 实施记录](docs/archive/aereborn_alsa.md)。
+`io` 包含后端绑定、设备超时、WAV 文件和时钟漂移检查。Linux 有 ALSA 时使用 `plug:null` 验证两种访问方式和硬件端点工厂。Linux 实机用例使用 `AEREBORN_ALSA_CAPTURE_PCM` 或 `AEREBORN_ALSA_PLAYBACK_PCM` 指定 PCM，声道数默认是 2，可分别通过 `AEREBORN_ALSA_CAPTURE_CHANNELS` 或 `AEREBORN_ALSA_PLAYBACK_CHANNELS` 设置。Windows 默认验证 WASAPI 绑定失败和 Null 接管，实机用例使用 `AEREBORN_WASAPI_CAPTURE_ID` 或 `AEREBORN_WASAPI_PLAYBACK_ID` 指定 Endpoint ID。用 `ctest --test-dir build/release -C Release -L hardware --output-on-failure` 运行当前平台的实机用例。ALSA 后端的设计背景见 [ALSA 实施记录](docs/archive/aereborn_alsa.md)。
 
 MSVC Debug 的迭代器代理会在 `noexcept` 构造中分配内存，`regression` 中的分配注入和零分配检查在 Release 执行。示例由默认开启的 `BUILD_EXAMPLES` 控制。
 
@@ -409,12 +416,14 @@ add_library(aereborn STATIC
     backend/null_backend.cpp
     backend/pull_sink.cpp
     backend/push_source.cpp
+    backend/usr_capture.cpp
     backend/usr_playback.cpp
     backend/wav_backend.cpp
     backend/wav_file.cpp
     diag/inspect.cpp
     app/audio_center.cpp
     app/channel_map.cpp
+    app/device_service.cpp
     app/graph_service.cpp
 )
 add_library(aereborn::aereborn ALIAS aereborn)
@@ -3714,39 +3723,23 @@ class Playback final : public NodeT<1, 0>
 
 ===== plugins/matrix.cpp =====
 #include "matrix.h"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 namespace aereborn
 {
 namespace
 {
-template <bool Accumulate> void write_scaled(float &dst, const float &src, float gain) noexcept
+void accumulate_steady(float *dst, const float *src, std::size_t frames, float gain) noexcept
 {
-    if (Accumulate)
-        dst += src * gain;
-    else
-        dst = src * gain;
-}
-
-template <bool Accumulate> void apply_steady_gain(float *dst, const float *src, std::size_t frames, float gain) noexcept
-{
-    if (Accumulate && gain == 0)
+    if (gain == 0.0f)
         return;
     for (std::size_t frame = 0; frame < frames; ++frame)
-        write_scaled<Accumulate>(dst[frame], src[frame], gain);
+        dst[frame] += src[frame] * gain;
 }
 
-template <bool Accumulate> void write_ramp_sample(float &dst, const float &src, float gain) noexcept
-{
-    if (gain != 0)
-        write_scaled<Accumulate>(dst, src, gain);
-    else if (!Accumulate)
-        dst = 0.0f;
-}
-
-template <bool Accumulate>
-void apply_ramping_gain(float *dst, const float *src, std::size_t frames, float coefficient, float start, float target,
-                        double scale) noexcept
+void accumulate_ramp(float *dst, const float *src, std::size_t frames, float coefficient, float start, float target,
+                     double scale) noexcept
 {
     const auto last = frames - 1;
     const auto begin = static_cast<double>(start);
@@ -3754,10 +3747,27 @@ void apply_ramping_gain(float *dst, const float *src, std::size_t frames, float 
     for (std::size_t frame = 0; frame < last; ++frame)
     {
         // Scale after adding the weighted endpoints so exact crossings stay zero with fused multiply-add.
-        const auto gain = static_cast<float>((begin * (last - frame) + end * (frame + 1)) * scale);
-        write_ramp_sample<Accumulate>(dst[frame], src[frame], Accumulate ? coefficient * gain : gain);
+        const auto gain = coefficient * static_cast<float>((begin * (last - frame) + end * (frame + 1)) * scale);
+        if (gain != 0.0f)
+            dst[frame] += src[frame] * gain;
     }
-    write_ramp_sample<Accumulate>(dst[last], src[last], Accumulate ? coefficient * target : target);
+    const auto end_gain = coefficient * target;
+    if (end_gain != 0.0f)
+        dst[last] += src[last] * end_gain;
+}
+
+std::size_t find_unity_source(const float *row, std::size_t input_channels, float target) noexcept
+{
+    std::size_t found = input_channels;
+    for (std::size_t src_ch = 0; src_ch < input_channels; ++src_ch)
+    {
+        if (row[src_ch] == 0.0f)
+            continue;
+        if (found != input_channels || row[src_ch] * target != 1.0f)
+            return input_channels;
+        found = src_ch;
+    }
+    return found;
 }
 } // namespace
 
@@ -3767,6 +3777,11 @@ Matrix::Matrix(BandWidth rate, std::size_t channels, float gain)
 {
     if (!inputs()[0].valid() || !std::isfinite(gain))
         throw Error(RetCode::EPARAM, "Invalid matrix specification");
+    if (channels > coefficients_.max_size() / channels)
+        throw Error(RetCode::TOOLARGE, "Channel matrix exceeds supported size");
+    coefficients_.resize(channels * channels, 0.0f);
+    for (std::size_t ch = 0; ch < channels; ++ch)
+        coefficients_[ch * channels + ch] = 1.0f;
 }
 Matrix::Matrix(BandWidth rate, std::size_t input_channels, std::size_t output_channels, View<const float> coefficients,
                float gain)
@@ -3810,8 +3825,7 @@ void Matrix::reset() noexcept
 }
 void Matrix::process(const ProcessContext &context) noexcept
 {
-    const auto &output_block = context.outputs[0];
-    const auto output = output_block.f32p_view();
+    const auto output = context.outputs[0].f32p_view();
     const auto frames = output.frames();
     if (frames == 0)
         return;
@@ -3825,46 +3839,33 @@ void Matrix::process(const ProcessContext &context) noexcept
         gain_ = target;
         return;
     }
-    const auto &input_block = context.inputs[0];
-    const auto input = input_block.f32p_view();
+    const auto input = context.inputs[0].f32p_view();
     const auto scale = steady ? 0.0 : 1.0 / frames;
-    if (coefficients_.empty())
+    const auto input_channels = input.channels();
+    for (std::size_t dst_ch = 0; dst_ch < output.channels(); ++dst_ch)
     {
-        if (steady && target == 1.0f)
+        auto *dst = output.channel(dst_ch);
+        const auto *row = coefficients_.data() + dst_ch * input_channels;
+        if (steady)
         {
-            const auto bytes = input_block.byte_view();
-            std::memcpy(output_block.byte_view().data(), bytes.data(), bytes.size());
-            return;
-        }
-        for (std::size_t ch = 0; ch < output.channels(); ++ch)
-        {
-            auto *dst = output.channel(ch);
-            const auto *src = input.channel(ch);
-            if (steady)
-                apply_steady_gain<false>(dst, src, frames, target);
-            else
-                apply_ramping_gain<false>(dst, src, frames, 1.0f, gain_, target, scale);
-        }
-    }
-    else
-    {
-        output.clear();
-        const auto input_channels = input.channels();
-        for (std::size_t dst_ch = 0; dst_ch < output.channels(); ++dst_ch)
-        {
-            auto *dst = output.channel(dst_ch);
-            const auto *row = coefficients_.data() + dst_ch * input_channels;
-            for (std::size_t src_ch = 0; src_ch < input_channels; ++src_ch)
+            const auto unity_src = find_unity_source(row, input_channels, target);
+            if (unity_src < input_channels)
             {
-                const auto coefficient = row[src_ch];
-                if (coefficient == 0)
-                    continue;
-                const auto *src = input.channel(src_ch);
-                if (steady)
-                    apply_steady_gain<true>(dst, src, frames, coefficient * target);
-                else
-                    apply_ramping_gain<true>(dst, src, frames, coefficient, gain_, target, scale);
+                std::memcpy(dst, input.channel(unity_src), frames * sizeof(float));
+                continue;
             }
+        }
+        std::fill_n(dst, frames, 0.0f);
+        for (std::size_t src_ch = 0; src_ch < input_channels; ++src_ch)
+        {
+            const auto coefficient = row[src_ch];
+            if (coefficient == 0.0f)
+                continue;
+            const auto *src = input.channel(src_ch);
+            if (steady)
+                accumulate_steady(dst, src, frames, coefficient * target);
+            else
+                accumulate_ramp(dst, src, frames, coefficient, gain_, target, scale);
         }
     }
     gain_ = target;
@@ -3894,6 +3895,7 @@ class Matrix final : public NodeT<1, 1>
     /// @param channels Channel count of both ports.
     /// @param gain Initial finite linear gain.
     /// @throws Error RetCode::EPARAM If the port specification is invalid or gain is not finite.
+    /// @throws Error RetCode::TOOLARGE If the matrix exceeds the supported storage size.
     Matrix(BandWidth rate, std::size_t channels, float gain = 1.0f);
 
     /// @brief Construct a channel map from a row-major matrix.
@@ -4301,6 +4303,299 @@ add_executable(clocked_graph clocked_graph.cpp)
 target_link_libraries(clocked_graph PRIVATE aereborn_test_plugins)
 target_include_directories(clocked_graph PRIVATE "${PROJECT_SOURCE_DIR}")
 
+add_executable(wave_test wave_test.cpp)
+target_link_libraries(wave_test PRIVATE aereborn_test_plugins)
+target_include_directories(wave_test PRIVATE "${PROJECT_SOURCE_DIR}")
+
+===== examples/sankey_reference.json =====
+{
+  "version": 1,
+  "engine": {"state":"Running","plan":2,"tick":12480,"period_ms":10,"tick_us":138,"missed_periods":0,"dirty":true},
+  "nodes": [
+    {"id":1,"type":"MultiTone","name":"src16","in_plan":true,"paused":false,"inputs":[],"outputs":[{"rate":44100,"channels":16,"format":"F32P"}]},
+    {"id":2,"type":"Playback","name":"raw16_play","in_plan":true,"paused":false,"inputs":[{"rate":44100,"channels":16,"format":"F32P"}],"outputs":[],"queue":{"bound":true,"online":true,"steady":true,"frames":1000,"capacity":1920,"overflow":0}},
+    {"id":3,"type":"Matrix","name":"down16_to_2","in_plan":true,"paused":false,"inputs":[{"rate":44100,"channels":16,"format":"F32P"}],"outputs":[{"rate":44100,"channels":2,"format":"F32P"}],"gain":1},
+    {"id":4,"type":"Capture","name":"voice_cap","in_plan":true,"paused":false,"inputs":[],"outputs":[{"rate":16000,"channels":1,"format":"F32P"}],"queue":{"bound":true,"online":true,"steady":true,"frames":960,"capacity":1920,"underrun":0}},
+    {"id":5,"type":"Matrix","name":"voice_upmix","in_plan":true,"paused":false,"inputs":[{"rate":16000,"channels":1,"format":"F32P"}],"outputs":[{"rate":16000,"channels":2,"format":"F32P"}],"gain":1},
+    {"id":6,"type":"MultiTone","name":"bgm_tone","in_plan":true,"paused":false,"inputs":[],"outputs":[{"rate":48000,"channels":2,"format":"F32P"}],"gain":0},
+    {"id":7,"type":"Convert","name":"","in_plan":true,"paused":false,"inputs":[{"rate":44100,"channels":2,"format":"F32P"}],"outputs":[{"rate":48000,"channels":2,"format":"F32P"}]},
+    {"id":8,"type":"Convert","name":"","in_plan":true,"paused":false,"inputs":[{"rate":16000,"channels":2,"format":"F32P"}],"outputs":[{"rate":48000,"channels":2,"format":"F32P"}]},
+    {"id":9,"type":"MultiTone","name":"paused_tone","in_plan":false,"paused":true,"inputs":[],"outputs":[{"rate":48000,"channels":2,"format":"F32P"}]},
+    {"id":10,"type":"Mixer","name":"main_mixer","in_plan":true,"paused":false,"inputs":[{"rate":48000,"channels":2,"format":"F32P"},{"rate":48000,"channels":2,"format":"F32P"},{"rate":48000,"channels":2,"format":"F32P"},{"rate":48000,"channels":2,"format":"F32P"}],"outputs":[{"rate":48000,"channels":2,"format":"F32P"}],"slots":[{"high":false,"muted":false,"suppressed":false},{"high":true,"muted":false,"suppressed":false},{"high":false,"muted":true,"suppressed":false},{"high":false,"muted":false,"suppressed":false}]},
+    {"id":11,"type":"Capture","name":"dangling_cap","in_plan":false,"paused":false,"inputs":[],"outputs":[{"rate":48000,"channels":1,"format":"F32P"}],"queue":{"bound":true,"online":false,"steady":false,"frames":0,"capacity":1920,"underrun":0}},
+    {"id":12,"type":"Matrix","name":"master_gain","in_plan":true,"paused":false,"inputs":[{"rate":48000,"channels":2,"format":"F32P"}],"outputs":[{"rate":48000,"channels":2,"format":"F32P"}],"gain":0.6},
+    {"id":13,"type":"Playback","name":"rec_play","in_plan":true,"paused":false,"inputs":[{"rate":48000,"channels":2,"format":"F32P"}],"outputs":[],"queue":{"bound":true,"online":true,"steady":true,"frames":1440,"capacity":1920,"overflow":0}},
+    {"id":14,"type":"Matrix","name":"monitor_down","in_plan":true,"paused":false,"inputs":[{"rate":48000,"channels":2,"format":"F32P"}],"outputs":[{"rate":48000,"channels":1,"format":"F32P"}],"gain":1},
+    {"id":15,"type":"Playback","name":"paused_play","in_plan":false,"paused":true,"inputs":[{"rate":48000,"channels":2,"format":"F32P"}],"outputs":[],"queue":{"bound":true,"online":false,"steady":false,"frames":0,"capacity":1920,"overflow":0}},
+    {"id":16,"type":"RmsMeter","name":"","in_plan":true,"paused":false,"inputs":[{"rate":16000,"channels":1,"format":"F32P"}],"outputs":[]},
+    {"id":17,"type":"Convert","name":"","in_plan":true,"paused":false,"inputs":[{"rate":48000,"channels":1,"format":"F32P"}],"outputs":[{"rate":16000,"channels":1,"format":"F32P"}]}
+  ],
+  "connections": [
+    {"id":1,"from":[1,0],"to":[2,0],"in_plan":true},
+    {"id":2,"from":[1,0],"to":[3,0],"in_plan":true},
+    {"id":3,"from":[3,0],"to":[7,0],"in_plan":true},
+    {"id":4,"from":[7,0],"to":[10,0],"in_plan":true},
+    {"id":5,"from":[4,0],"to":[5,0],"in_plan":true},
+    {"id":6,"from":[5,0],"to":[8,0],"in_plan":true},
+    {"id":7,"from":[8,0],"to":[10,1],"in_plan":true},
+    {"id":8,"from":[6,0],"to":[10,2],"in_plan":true},
+    {"id":9,"from":[10,0],"to":[12,0],"in_plan":true},
+    {"id":10,"from":[12,0],"to":[13,0],"in_plan":true},
+    {"id":11,"from":[12,0],"to":[14,0],"in_plan":true},
+    {"id":12,"from":[14,0],"to":[17,0],"in_plan":true},
+    {"id":13,"from":[17,0],"to":[16,0],"in_plan":true},
+    {"id":14,"from":[12,0],"to":[15,0],"in_plan":false},
+    {"id":15,"from":[9,0],"to":[10,3],"in_plan":false}
+  ],
+  "backends": [
+    {"node":1,"type":"16ch Source","state":"Running","error":"OK","device":{"rate":44100,"channels":16,"format":"F32P"},"active":false,"async":false,"fir":false,"max_frames":441},
+    {"node":2,"type":"NullPlayback","device":{"rate":44100,"channels":16,"format":"F32LE"},"file":null,"state":"Running","error":"OK","async":false,"active":true,"fir":false,"max_frames":441},
+    {"node":4,"type":"WavCapture","device":{"rate":16000,"channels":1,"format":"F32LE"},"file":"demo_voice_16k.wav","state":"Running","error":"OK","async":false,"active":true,"fir":false,"max_frames":160},
+    {"node":13,"type":"WavPlayback","device":{"rate":48000,"channels":2,"format":"S16LE"},"file":"demo_mix_48k_out.wav","state":"Running","error":"OK","async":false,"active":true,"fir":false,"max_frames":480},
+    {"node":15,"type":"WavPlayback","device":{"rate":48000,"channels":2,"format":"S16LE"},"file":"paused_mix_48k.wav","state":"Stopped","error":"OK","async":false,"active":true,"fir":false,"max_frames":480}
+  ],
+  "positions": {
+    "1": [174,62,138,65], "2": [730,32,153,78], "3": [392,125,147,50], "4": [174,191,138,78],
+    "5": [392,195,147,50], "6": [174,294,138,46], "7": [619,119,106,46], "8": [619,182,106,46],
+    "9": [366,382,138,46], "10": [805,156,149,122], "11": [174,382,142,75], "12": [1034,190,132,56],
+    "13": [1246,85,143,78], "14": [1246,213,146,50], "15": [1246,382,155,76], "16": [1649,213,108,46],
+    "17": [1472,215,97,46]
+  }
+}
+
+===== examples/wave_test.cpp =====
+#include "audio_interface.h"
+
+#include <chrono>
+#include <cstdio>
+#include <fstream>
+#include <initializer_list>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+
+namespace
+{
+
+using namespace aereborn;
+
+NodeId check_node(NodeId id, const char *what)
+{
+    if (!id)
+        throw std::runtime_error(std::string(what) + " failed: " + AudioCenter::last_error().what());
+    return id;
+}
+
+void check_rc(RetCode rc, const char *what)
+{
+    if (!rc)
+        throw std::runtime_error(std::string(what) + " failed: " + rc.what());
+}
+
+void dump_json_now(const AudioCenter &audio)
+{
+    const auto snapshot = audio.dump_json();
+    if (snapshot.empty())
+        throw std::runtime_error(std::string("dump_json failed: ") + AudioCenter::last_error().what());
+    const char *path = "complex_public_scene.json";
+    std::ofstream out(path, std::ios::binary);
+    out << snapshot;
+    out.close();
+    if (!out)
+        throw std::runtime_error(std::string("Failed to write ") + path);
+    std::cout << "Diagnostic snapshot written to " << path << '\n';
+}
+
+void print_help()
+{
+    std::cout << "\nEngine is running continuously. Commands:\n"
+              << "  json         - dump_json() to complex_public_scene.json\n"
+              << "  gain <val>   - set master_gain (e.g. gain 0.5)\n"
+              << "  high         - toggle high priority on main_mix[1] (voice)\n"
+              << "  mute         - toggle mute on main_mix[2] (extra)\n"
+              << "  pause        - toggle pause on rec_paused + live commit()\n"
+              << "  q / quit     - stop engine and finalize WAV files\n";
+}
+
+} // namespace
+
+int main(int argc, char *argv[])
+{
+    if (argc < 3)
+    {
+        std::cerr << "Usage: " << argv[0] << " <bgm.wav> <voice.wav> [extra.wav] (48 kHz stereo inputs)\n";
+        return 1;
+    }
+
+    try
+    {
+        const std::string bgm_path = argv[1];
+        const std::string voice_path = argv[2];
+        const std::string extra_path = argc >= 4 ? argv[3] : argv[1];
+
+        const std::string out_master_path = "scene_out_master_48k.wav";
+        const std::string out_monitor_path = "scene_out_monitor_16k.wav";
+        const std::string out_segment_path = "scene_out_segment_44k.wav";
+        const std::string out_paused_path = "scene_out_paused_48k.wav";
+
+        AudioCenter audio(BlockPeriod::INR_10MS);
+
+        // =====================================================================
+        // 1. 创建节点。示例总线使用 48 kHz 双声道，输入 WAV 循环播放。
+        // =====================================================================
+        const auto src_bgm = check_node(audio.create_iwav(bgm_path, -1), "create_iwav(bgm)");
+        const auto src_voice = check_node(audio.create_iwav(voice_path, -1), "create_iwav(voice)");
+        const auto src_extra = check_node(audio.create_iwav(extra_path, -1), "create_iwav(extra)");
+        const PortSpec stereo{BandWidth::Full, 2, SampleFormat::F32P};
+        for (const auto source : {src_bgm, src_voice, src_extra})
+            if (audio.output_spec(source) != stereo)
+                throw std::runtime_error("wave_test expects 48 kHz stereo input WAV files");
+
+        // 子总线（48kHz 2ch）+ 自定义 ChannelMap（左右互换并衰减右声道）
+        const auto sub_mix = check_node(audio.create_mixer(BandWidth::Full, 2, 2), "create_mixer(sub)");
+        const auto sub_map = ChannelMap::select(2, {1, 0}).scale_output(1, 0.85f);
+        const auto sub_fx = check_node(audio.create_matrix(BandWidth::Full, sub_map, 0.90f), "create_matrix(sub_fx)");
+
+        // 主总线（48kHz 2ch，4 路输入，slot 3 留空）
+        const auto main_mix = check_node(audio.create_mixer(BandWidth::Full, 2, 4), "create_mixer(main)");
+        const auto master_gain =
+            check_node(audio.create_matrix(BandWidth::Full, ChannelMap::identity(2), 0.60f), "create_matrix(master_gain)");
+
+        // 显式单声道混缩矩阵
+        const auto mono_down =
+            check_node(audio.create_matrix(BandWidth::Full, ChannelMap::to_mono(2)), "create_matrix(mono_down)");
+        const auto monitor_convert = check_node(
+            audio.create_convert({BandWidth::Full, 1, SampleFormat::F32P}, {BandWidth::Wide, 1, SampleFormat::F32P}),
+            "create_convert(monitor)");
+        const auto segment_convert = check_node(
+            audio.create_convert(stereo, {BandWidth::CDQuality, 2, SampleFormat::F32P}), "create_convert(segment)");
+
+        // 4 路异构输出（标准录盘 / 16k 单声道监听 / 44.1k 分段录盘 / 可暂停支路）
+        // 单文件 create_owav 独占打开，输入检查通过后清理旧输出。
+        for (const auto &p : {out_master_path, out_monitor_path, out_paused_path})
+            std::remove(p.c_str());
+        const auto rec_master = check_node(
+            audio.create_owav(out_master_path, PortSpec(BandWidth::Full, 2, SampleFormat::S16LE)),
+            "create_owav(master)");
+        const auto rec_monitor = check_node(
+            audio.create_owav(out_monitor_path, PortSpec(BandWidth::Wide, 1, SampleFormat::S16LE)),
+            "create_owav(monitor)");
+        const auto rec_segment = check_node(
+            audio.create_owav(out_segment_path, PortSpec(BandWidth::CDQuality, 2, SampleFormat::F32LE),
+                              std::chrono::seconds(2)),
+            "create_owav(segment)");
+        const auto rec_paused = check_node(
+            audio.create_owav(out_paused_path, PortSpec(BandWidth::Full, 2, SampleFormat::S24_3LE)),
+            "create_owav(paused)");
+        // =====================================================================
+        // 2. 连接同规格端口。监听和分段录制经过上面显式创建的转换节点。
+        // =====================================================================
+        check_rc(audio.connect(src_bgm, sub_mix[0]), "connect(src_bgm -> sub_mix[0])");
+        check_rc(audio.connect(sub_mix, sub_fx), "connect(sub_mix -> sub_fx)");
+        check_rc(audio.connect(sub_fx, main_mix[0]), "connect(sub_fx -> main_mix[0])");
+        check_rc(audio.connect(sub_fx, rec_paused), "connect(sub_fx -> rec_paused)");
+
+        check_rc(audio.connect(src_voice, main_mix[1]), "connect(src_voice -> main_mix[1])");
+        check_rc(audio.connect(src_extra, main_mix[2]), "connect(src_extra -> main_mix[2])");
+
+        check_rc(audio.connect(main_mix, master_gain), "connect(main_mix -> master_gain)");
+        check_rc(audio.connect(master_gain, rec_master), "connect(master_gain -> rec_master)");
+        check_rc(audio.connect(master_gain, mono_down), "connect(master_gain -> mono_down)");
+        check_rc(audio.connect(mono_down, monitor_convert), "connect(mono_down -> monitor_convert)");
+        check_rc(audio.connect(monitor_convert, rec_monitor), "connect(monitor_convert -> rec_monitor)");
+        check_rc(audio.connect(master_gain, segment_convert), "connect(master_gain -> segment_convert)");
+        check_rc(audio.connect(segment_convert, rec_segment), "connect(segment_convert -> rec_segment)");
+
+        // =====================================================================
+        // 3. 初始混音策略与启动（引擎进入持续运行态）
+        // =====================================================================
+        bool voice_high = true;
+        bool extra_muted = true;
+        bool branch_paused = true;
+
+        check_rc(audio.set_high_priority(main_mix[1], voice_high), "set_high_priority(voice)");
+        check_rc(audio.set_muted(main_mix[2], extra_muted), "set_muted(extra)");
+
+        check_rc(audio.start(), "start"); // Plan #1 启动
+
+        // 稍微等几个 tick 进入稳态后，演示运行期热暂停（Plan #2），再输出首次完整诊断
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        check_rc(audio.set_paused(rec_paused, branch_paused), "set_paused(rec_paused)");
+        check_rc(audio.commit(), "commit(Plan #2)");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        dump_json_now(audio);
+        print_help();
+
+        // =====================================================================
+        // 4. 引擎在后台持续运行，主线程按用户输入实时控制与诊断
+        // =====================================================================
+        std::string line;
+        while (std::cout << "\naereborn> " << std::flush && std::getline(std::cin, line))
+        {
+            std::istringstream iss(line);
+            std::string cmd;
+            if (!(iss >> cmd))
+                continue;
+
+            if (cmd == "q" || cmd == "quit")
+            {
+                break;
+            }
+            else if (cmd == "json")
+            {
+                dump_json_now(audio);
+            }
+            else if (cmd == "gain")
+            {
+                float g = 1.0f;
+                if (!(iss >> g))
+                {
+                    std::cout << "Usage: gain <float>\n";
+                    continue;
+                }
+                const RetCode rc = audio.set_gain(master_gain, g);
+                std::cout << "set_gain(" << g << ") -> " << rc.what() << '\n';
+            }
+            else if (cmd == "high")
+            {
+                voice_high = !voice_high;
+                const RetCode rc = audio.set_high_priority(main_mix[1], voice_high);
+                std::cout << "voice high_priority=" << (voice_high ? "true" : "false") << " -> " << rc.what() << '\n';
+            }
+            else if (cmd == "mute")
+            {
+                extra_muted = !extra_muted;
+                const RetCode rc = audio.set_muted(main_mix[2], extra_muted);
+                std::cout << "extra muted=" << (extra_muted ? "true" : "false") << " -> " << rc.what() << '\n';
+            }
+            else if (cmd == "pause")
+            {
+                branch_paused = !branch_paused;
+                check_rc(audio.set_paused(rec_paused, branch_paused), "set_paused");
+                check_rc(audio.commit(), "commit");
+                std::cout << "rec_paused=" << (branch_paused ? "paused" : "resumed") << " (committed)\n";
+            }
+            else
+            {
+                print_help();
+            }
+        }
+
+        // 正常退出：排空队列并在析构时回填所有 WAV 文件头长度
+        std::cout << "Stopping engine...\n";
+        check_rc(audio.stop(), "stop");
+        return 0;
+    }
+    catch (const std::exception &ex)
+    {
+        std::cerr << "Error: " << ex.what() << '\n';
+        return 1;
+    }
+}
+
 ===== backend/alsa_backend.cpp =====
 #include "alsa_backend.h"
 
@@ -4334,8 +4629,8 @@ std::string normalize_device_name(std::string card, unsigned int device)
 
 } // namespace
 
-AlsaBackend::AlsaBackend(std::string card, unsigned int device, bool use_mmap)
-    : ActiveBackend(true), device_(normalize_device_name(std::move(card), device)), use_mmap_(use_mmap)
+AlsaBackend::AlsaBackend(std::string card, unsigned int device, bool use_mmap, bool fail_on_timeout)
+    : ActiveBackend(true, fail_on_timeout), device_(normalize_device_name(std::move(card), device)), use_mmap_(use_mmap)
 {
 }
 
@@ -4669,7 +4964,8 @@ class AlsaBackend final : public ActiveBackend
     /// @param card Bare card name, explicit PCM name, or empty for the default PCM.
     /// @param device Hardware device index for a bare card name.
     /// @param use_mmap Prefer interleaved MMAP over ordinary interleaved I/O.
-    explicit AlsaBackend(std::string card, unsigned int device, bool use_mmap);
+    /// @param fail_on_timeout Stop the worker when PCM I/O times out.
+    explicit AlsaBackend(std::string card, unsigned int device, bool use_mmap, bool fail_on_timeout = true);
     ~AlsaBackend() override
     {
         unbind();
@@ -5395,13 +5691,14 @@ RetCode ActiveBackend::run_async() noexcept
     {
         std::size_t frames = 0;
         const auto result = is_capture() ? transfer_capture(frames) : transfer_playback_async(frames);
-        if (!result)
+        if (!result && result != RetCode::TIMEOUT)
             return result;
 
         const auto now = Clock::now();
-        if (now >= io_deadline_)
+        const auto timed_out = !result || now >= io_deadline_;
+        if (timed_out && fail_on_timeout_)
             return RetCode::TIMEOUT;
-        if (frames)
+        if (frames || timed_out)
             io_deadline_ = now + timeout;
     }
     return {};
@@ -5610,7 +5907,9 @@ class ActiveBackend : public Backend
 
   protected:
     /// @param async True for independent hardware clocks, false for graph-clocked I/O.
-    explicit ActiveBackend(bool async) noexcept : async_(async) {}
+    /// @param fail_on_timeout Stop an asynchronous worker when PCM I/O times out.
+    explicit ActiveBackend(bool async, bool fail_on_timeout = true) noexcept
+        : async_(async), fail_on_timeout_(fail_on_timeout) {}
 
     /// @brief Publish an I/O failure for last_error().
     /// @pre Call from the worker or during control-side cleanup after it joins.
@@ -5687,6 +5986,7 @@ class ActiveBackend : public Backend
     RetCode drain_playback() noexcept;
 
     const bool async_;
+    const bool fail_on_timeout_;
     std::vector<std::uint8_t> device_bytes_;
     ASRC asrc_;
     std::mutex wait_mutex_;
@@ -5963,6 +6263,83 @@ class PushSource final : public PassiveBackend
 
 #endif
 
+===== backend/usr_capture.cpp =====
+#include "usr_capture.h"
+
+#include <cstring>
+#include <utility>
+
+namespace aereborn
+{
+
+UsrCapture::UsrCapture(PortSpec spec, Callback callback)
+    : ActiveBackend(false), spec_(spec), callback_(std::move(callback))
+{
+    if (!valid_pcm_spec(spec_) || !callback_)
+        throw Error(RetCode::EPARAM, "UsrCapture requires valid interleaved PCM and a callback");
+}
+
+Result<PortSpec> UsrCapture::on_open(bool capture, PortSpec, std::chrono::microseconds target_period)
+{
+    if (!capture)
+        return RetCode::EPARAM;
+    const auto frames = frames_in_period(spec_.bandwidth, target_period);
+    if (!frames)
+        return frames.ret_code();
+    set_device_max_frames(frames.value());
+    return spec_;
+}
+
+Result<std::size_t> UsrCapture::on_read(OBBlock output) noexcept
+{
+    const auto bytes = output.byte_view();
+    std::memset(bytes.data(), 0, bytes.size());
+    callback_(output);
+    return output.frames();
+}
+
+} // namespace aereborn
+
+===== backend/usr_capture.h =====
+#ifndef AEREBORN_BACKEND_USR_CAPTURE_H
+#define AEREBORN_BACKEND_USR_CAPTURE_H
+
+#include "backend.h"
+#include <functional>
+
+namespace aereborn
+{
+
+/// @brief Request fixed interleaved PCM batches on a worker thread as queue space becomes available.
+/// @note The callback borrows the writable block for the duration of the call and must return without throwing.
+/// @note Serialize control operations outside the callback. Stop waits for the callback and joins the worker.
+class UsrCapture final : public ActiveBackend
+{
+  public:
+    /// @copydoc Backend::type_name
+    const char *type_name() const noexcept override { return "UsrCapture"; }
+
+    using Callback = std::function<void(OBBlock)>;
+
+    /// @throws Error RetCode::EPARAM if spec is not valid interleaved PCM or callback is empty.
+    UsrCapture(PortSpec spec, Callback callback);
+    ~UsrCapture() override { unbind(); }
+
+    using ActiveBackend::bind;
+    void bind(Playback &) = delete;
+
+  private:
+    Result<PortSpec> on_open(bool capture, PortSpec logical, std::chrono::microseconds target_period) override;
+    Result<std::size_t> on_read(OBBlock output) noexcept override;
+
+    const PortSpec spec_;
+    const Callback callback_;
+};
+
+} // namespace aereborn
+
+#endif
+
 ===== backend/usr_playback.cpp =====
 #include "usr_playback.h"
 
@@ -6048,11 +6425,17 @@ class UsrPlayback final : public ActiveBackend
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <initguid.h>
+#include <functiondiscoverykeys_devpkey.h>
 #include <audioclient.h>
 #include <mmdeviceapi.h>
+#include <propidl.h>
+#include <propsys.h>
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <cwchar>
+#include <limits>
 #include <memory>
 #include <utility>
 
@@ -6087,67 +6470,154 @@ class ComApartment
     bool active = true;
 };
 
+struct PropertyValue
+{
+    PROPVARIANT value{};
+    ~PropertyValue() { PropVariantClear(&value); }
+};
+
 RetCode record_failure(WasapiBackend::Failure &failure, const char *operation, HRESULT error) noexcept
 {
     failure = {operation, static_cast<std::int32_t>(error)};
-    if (error == AUDCLNT_E_WRONG_ENDPOINT_TYPE)
+    if (error == AUDCLNT_E_WRONG_ENDPOINT_TYPE || error == E_INVALIDARG ||
+        error == HRESULT_FROM_WIN32(ERROR_NO_UNICODE_TRANSLATION))
         return RetCode::EPARAM;
     if (error == AUDCLNT_E_UNSUPPORTED_FORMAT)
         return RetCode::INVFMT;
     if (error == AUDCLNT_E_DEVICE_INVALIDATED || error == HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
         return RetCode::DEVLOST;
+    if (error == E_OUTOFMEMORY)
+        return RetCode::TOOLARGE;
     return RetCode::IOFAILED;
 }
 
-RetCode activate(const std::wstring &id, EDataFlow direction, Interface<IAudioClient> &client,
-                 std::wstring *resolved, WasapiBackend::Failure &failure)
+Result<std::wstring> device_name(const std::string &name, WasapiBackend::Failure &failure)
+{
+    if (name.empty() || name == "default")
+        return std::wstring{};
+    if (name.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        return RetCode::TOOLARGE;
+    const auto bytes = static_cast<int>(name.size());
+    const auto size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name.data(), bytes, nullptr, 0);
+    if (!size)
+        return record_failure(failure, "MultiByteToWideChar", HRESULT_FROM_WIN32(GetLastError()));
+    std::wstring wide(static_cast<std::size_t>(size), L'\0');
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name.data(), bytes, &wide[0], size))
+        return record_failure(failure, "MultiByteToWideChar", HRESULT_FROM_WIN32(GetLastError()));
+    return wide;
+}
+
+Result<Interface<IMMDeviceEnumerator>> make_enumerator(WasapiBackend::Failure &failure) noexcept
 {
     IMMDeviceEnumerator *enumerator_ptr = nullptr;
-    auto rc = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                               IID_PPV_ARGS(&enumerator_ptr));
+    const auto rc = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                     IID_PPV_ARGS(&enumerator_ptr));
     if (FAILED(rc))
         return record_failure(failure, "CoCreateInstance(MMDeviceEnumerator)", rc);
-    const Interface<IMMDeviceEnumerator> enumerator(enumerator_ptr);
+    return Interface<IMMDeviceEnumerator>(enumerator_ptr);
+}
 
-    IMMDevice *device_ptr = nullptr;
-    rc = id.empty() ? enumerator->GetDefaultAudioEndpoint(direction, eConsole, &device_ptr)
-                    : enumerator->GetDevice(id.c_str(), &device_ptr);
+Result<Interface<IMMDevice>> find_friendly_name(IMMDeviceEnumerator &enumerator, const std::wstring &name,
+                                                EDataFlow direction, WasapiBackend::Failure &failure)
+{
+    IMMDeviceCollection *devices_ptr = nullptr;
+    auto rc = enumerator.EnumAudioEndpoints(direction, DEVICE_STATE_ACTIVE, &devices_ptr);
     if (FAILED(rc))
-        return record_failure(failure, id.empty() ? "GetDefaultAudioEndpoint" : "GetDevice", rc);
-    const Interface<IMMDevice> device(device_ptr);
-    if (resolved)
+        return record_failure(failure, "EnumAudioEndpoints", rc);
+    const Interface<IMMDeviceCollection> devices(devices_ptr);
+    UINT count = 0;
+    rc = devices->GetCount(&count);
+    if (FAILED(rc))
+        return record_failure(failure, "IMMDeviceCollection::GetCount", rc);
+
+    Interface<IMMDevice> match;
+    bool exact = false;
+    bool ambiguous = false;
+    for (UINT i = 0; i < count; ++i)
     {
-        if (id.empty())
+        IMMDevice *device_ptr = nullptr;
+        rc = devices->Item(i, &device_ptr);
+        if (FAILED(rc))
+            continue;
+        Interface<IMMDevice> device(device_ptr);
+        IPropertyStore *properties_ptr = nullptr;
+        rc = device->OpenPropertyStore(STGM_READ, &properties_ptr);
+        if (FAILED(rc))
+            continue;
+        const Interface<IPropertyStore> properties(properties_ptr);
+        PropertyValue friendly;
+        rc = properties->GetValue(PKEY_Device_FriendlyName, &friendly.value);
+        if (FAILED(rc) || friendly.value.vt != VT_LPWSTR || !friendly.value.pwszVal)
+            continue;
+
+        const auto *value = friendly.value.pwszVal;
+        const auto exact_name = name == value;
+        if (!exact_name && (exact || !std::wcsstr(value, name.c_str())))
+            continue;
+
+        if (match && exact_name == exact)
         {
-            LPWSTR id_ptr = nullptr;
-            rc = device->GetId(&id_ptr);
-            if (FAILED(rc))
-                return record_failure(failure, "IMMDevice::GetId", rc);
-            const std::unique_ptr<wchar_t, FreeComBuffer> device_id(id_ptr);
-            resolved->assign(device_id.get());
+            ambiguous = true;
+            if (exact)
+                break;
+            continue;
         }
-        else
-        {
-            IMMEndpoint *endpoint_ptr = nullptr;
-            rc = device->QueryInterface(IID_PPV_ARGS(&endpoint_ptr));
-            if (FAILED(rc))
-                return record_failure(failure, "QueryInterface(IMMEndpoint)", rc);
-            const Interface<IMMEndpoint> endpoint(endpoint_ptr);
-            EDataFlow flow;
-            rc = endpoint->GetDataFlow(&flow);
-            if (FAILED(rc))
-                return record_failure(failure, "IMMEndpoint::GetDataFlow", rc);
-            if (flow != direction)
-                return record_failure(failure, "WASAPI endpoint direction", AUDCLNT_E_WRONG_ENDPOINT_TYPE);
-            *resolved = id;
-        }
+        match = std::move(device);
+        exact = exact_name;
+        ambiguous = false;
     }
+    if (ambiguous)
+        return record_failure(failure, "Ambiguous WASAPI friendly name", E_INVALIDARG);
+    if (match)
+        return match;
+    return record_failure(failure, "WASAPI friendly name", HRESULT_FROM_WIN32(ERROR_NOT_FOUND));
+}
+
+Result<Interface<IMMDevice>> resolve_device(IMMDeviceEnumerator &enumerator, const std::wstring &name,
+                                            EDataFlow direction, WasapiBackend::Failure &failure)
+{
+    IMMDevice *device_ptr = nullptr;
+    const auto use_default = name.empty();
+    auto rc = use_default ? enumerator.GetDefaultAudioEndpoint(direction, eConsole, &device_ptr)
+                          : enumerator.GetDevice(name.c_str(), &device_ptr);
+    if (FAILED(rc))
+    {
+        if (!use_default && rc == HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
+            return find_friendly_name(enumerator, name, direction, failure);
+        return record_failure(failure, use_default ? "GetDefaultAudioEndpoint" : "GetDevice", rc);
+    }
+
+    Interface<IMMDevice> device(device_ptr);
+    if (use_default)
+        return device;
+    IMMEndpoint *endpoint_ptr = nullptr;
+    rc = device->QueryInterface(IID_PPV_ARGS(&endpoint_ptr));
+    if (FAILED(rc))
+        return record_failure(failure, "QueryInterface(IMMEndpoint)", rc);
+    const Interface<IMMEndpoint> endpoint(endpoint_ptr);
+    EDataFlow flow;
+    rc = endpoint->GetDataFlow(&flow);
+    if (FAILED(rc))
+        return record_failure(failure, "IMMEndpoint::GetDataFlow", rc);
+    if (flow != direction)
+        return record_failure(failure, "WASAPI endpoint direction", AUDCLNT_E_WRONG_ENDPOINT_TYPE);
+    return device;
+}
+
+Result<Interface<IAudioClient>> activate(IMMDevice &device, WasapiBackend::Failure &failure) noexcept
+{
+    DWORD state = 0;
+    auto rc = device.GetState(&state);
+    if (FAILED(rc))
+        return record_failure(failure, "IMMDevice::GetState", rc);
+    if (state != DEVICE_STATE_ACTIVE)
+        return record_failure(failure, "IMMDevice::GetState", AUDCLNT_E_DEVICE_INVALIDATED);
+
     IAudioClient *client_ptr = nullptr;
-    rc = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void **>(&client_ptr));
+    rc = device.Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void **>(&client_ptr));
     if (FAILED(rc))
         return record_failure(failure, "IMMDevice::Activate(IAudioClient)", rc);
-    client.reset(client_ptr);
-    return {};
+    return Interface<IAudioClient>(client_ptr);
 }
 
 SampleFormat sample_format(const WAVEFORMATEX &format) noexcept
@@ -6203,13 +6673,26 @@ Result<PortSpec> WasapiBackend::on_open(bool capture, PortSpec logical, std::chr
     if (FAILED(com.result) && com.result != RPC_E_CHANGED_MODE)
         return record_failure(failure_, "CoInitializeEx", com.result);
 
-    Interface<IAudioClient> probe;
-    std::wstring resolved;
-    const auto code = activate(device_, capture ? eCapture : eRender, probe, &resolved, failure_);
-    if (!code)
-        return code;
+    const auto name = device_name(device_, failure_);
+    if (!name)
+        return name.ret_code();
+    const auto enumerator = make_enumerator(failure_);
+    if (!enumerator)
+        return enumerator.ret_code();
+    const auto device = resolve_device(*enumerator.value(), name.value(), capture ? eCapture : eRender, failure_);
+    if (!device)
+        return device.ret_code();
+    LPWSTR id_ptr = nullptr;
+    auto rc = device.value()->GetId(&id_ptr);
+    if (FAILED(rc))
+        return record_failure(failure_, "IMMDevice::GetId", rc);
+    const std::unique_ptr<wchar_t, FreeComBuffer> id(id_ptr);
+
+    const auto probe = activate(*device.value(), failure_);
+    if (!probe)
+        return probe.ret_code();
     WAVEFORMATEX *format_ptr = nullptr;
-    const auto rc = probe->GetMixFormat(&format_ptr);
+    rc = probe.value()->GetMixFormat(&format_ptr);
     if (FAILED(rc))
         return record_failure(failure_, "IAudioClient::GetMixFormat", rc);
     const std::unique_ptr<WAVEFORMATEX, FreeComBuffer> format(format_ptr);
@@ -6222,7 +6705,7 @@ Result<PortSpec> WasapiBackend::on_open(bool capture, PortSpec logical, std::chr
     if (!budget)
         return budget.ret_code();
 
-    const auto initialized = initialize(*probe, *format, failure_);
+    const auto initialized = initialize(*probe.value(), *format, failure_);
     if (!initialized)
         return initialized.ret_code();
     const auto capacity = initialized.value();
@@ -6244,7 +6727,7 @@ Result<PortSpec> WasapiBackend::on_open(bool capture, PortSpec logical, std::chr
     static_assert(sizeof(WAVEFORMATEXTENSIBLE) == 40, "Unexpected WAVEFORMATEXTENSIBLE layout");
     format_.fill(0);
     std::memcpy(format_.data(), format.get(), sizeof(*format) + format->cbSize);
-    device_id_ = std::move(resolved);
+    device_id_.assign(id.get());
     packet_ = std::move(packet);
     ready_ = ready.release();
     cancelled_ = cancelled.release();
@@ -6272,10 +6755,18 @@ RetCode WasapiBackend::on_start() noexcept
     ComApartment com(COINIT_MULTITHREADED);
     if (FAILED(com.result))
         return record_failure(failure_, "CoInitializeEx", com.result);
-    Interface<IAudioClient> client;
-    const auto code = activate(device_id_, source ? eCapture : eRender, client, nullptr, failure_);
-    if (!code)
-        return code;
+    const auto enumerator = make_enumerator(failure_);
+    if (!enumerator)
+        return enumerator.ret_code();
+    IMMDevice *device_ptr = nullptr;
+    auto rc = enumerator.value()->GetDevice(device_id_.c_str(), &device_ptr);
+    if (FAILED(rc))
+        return record_failure(failure_, "GetDevice", rc);
+    const Interface<IMMDevice> device(device_ptr);
+    auto activated = activate(*device, failure_);
+    if (!activated)
+        return activated.ret_code();
+    auto client = std::move(activated).value();
     WAVEFORMATEXTENSIBLE format;
     std::memcpy(&format, format_.data(), sizeof(format));
     const auto initialized = initialize(*client, format.Format, failure_);
@@ -6284,7 +6775,7 @@ RetCode WasapiBackend::on_start() noexcept
     const auto capacity = initialized.value();
     if (source && capacity > packet_.size() / format.Format.nBlockAlign)
         return RetCode::TOOLARGE;
-    auto rc = client->SetEventHandle(ready_);
+    rc = client->SetEventHandle(ready_);
     if (FAILED(rc))
         return record_failure(failure_, "IAudioClient::SetEventHandle", rc);
 
@@ -6444,7 +6935,8 @@ RetCode WasapiBackend::write(IAudioRenderClient &render, std::uint32_t frames, V
     return FAILED(rc) ? record_failure(failure_, "IAudioRenderClient::ReleaseBuffer", rc) : RetCode{};
 }
 
-WasapiBackend::WasapiBackend(std::wstring device) : ActiveBackend(true), device_(std::move(device))
+WasapiBackend::WasapiBackend(std::string device, bool fail_on_timeout)
+    : ActiveBackend(true, fail_on_timeout), device_(std::move(device))
 {
 }
 
@@ -6487,8 +6979,10 @@ class WasapiBackend final : public ActiveBackend
     };
 
     /// @brief Construct a backend whose direction is selected when it binds.
-    /// @param device Endpoint ID, or empty for the system default in the selected direction.
-    explicit WasapiBackend(std::wstring device);
+    /// @param device UTF-8 endpoint ID or friendly name. Empty or "default" selects the system default.
+    /// @param fail_on_timeout Stop the worker when PCM I/O times out.
+    /// @pre The device name contains no embedded NUL bytes.
+    explicit WasapiBackend(std::string device, bool fail_on_timeout = true);
     ~WasapiBackend() override { unbind(); }
 
     /// @brief Return the latest native failure since binding or starting, or an empty value while running.
@@ -6510,7 +7004,7 @@ class WasapiBackend final : public ActiveBackend
     RetCode write(IAudioRenderClient &render, std::uint32_t frames, View<const std::uint8_t> bytes) noexcept;
 
     Failure failure_;
-    std::wstring device_;
+    std::string device_;
     std::wstring device_id_;
     std::array<std::uint8_t, 40> format_{};
     std::vector<std::uint8_t> packet_;
@@ -7354,6 +7848,47 @@ namespace aereborn
 
 class CommandQueue;
 class GraphService;
+class DeviceService;
+
+/// @brief Hardware endpoint options. RECOVERSOFT and RECOVERHARD are mutually exclusive.
+enum class DevFlags : std::uint32_t
+{
+    NONE        = 0,       ///< No options enabled.
+    RECOVERSOFT = 1u << 0, ///< Wait for unavailable devices and retry I/O failures. Keep running on timeouts.
+    RECOVERHARD = 1u << 1, ///< Also recover on timeouts and reopen periodically.
+    MEMCPY      = 1u << 2  ///< Force ALSA RW_INTERLEAVED. Accepted and ignored on Windows.
+};
+
+constexpr DevFlags operator|(DevFlags lhs, DevFlags rhs) noexcept
+{
+    return static_cast<DevFlags>(static_cast<std::uint32_t>(lhs) | static_cast<std::uint32_t>(rhs));
+}
+
+constexpr DevFlags operator&(DevFlags lhs, DevFlags rhs) noexcept
+{
+    return static_cast<DevFlags>(static_cast<std::uint32_t>(lhs) & static_cast<std::uint32_t>(rhs));
+}
+
+/// @brief Test whether every bit in flag is set.
+constexpr bool has_flag(DevFlags flags, DevFlags flag) noexcept
+{
+    return (flags & flag) == flag;
+}
+
+/// @brief Graph-side configuration for a hardware audio endpoint.
+/// @note Empty name or "default" selects the system default. ALSA passes names containing ':' through
+///       and expands a bare card name to hw:CARD=<name>,DEV=<device>. WASAPI accepts an endpoint ID
+///       or a UTF-8 friendly name and ignores device.
+/// @note The backend negotiates sample format and rate. The opened stream must accept exactly channels.
+///       ALSA hw: applies that constraint to the hardware. ALSA PCM plugins can convert below the stream.
+struct DevConfig
+{
+    std::string name;
+    unsigned int device = 0;
+    BandWidth bandwidth = BandWidth::Full;
+    BlockPeriod period = BlockPeriod::INR_10MS; ///< Device batch and queue budget in milliseconds.
+    std::size_t channels = 2;
+};
 
 /// @brief Build a weighted channel map for AudioCenter::create_matrix().
 /// @note Indices are zero-based and follow the direction from input to output.
@@ -7418,8 +7953,8 @@ class ChannelMap
     RetCode status_{RetCode::EPARAM};
 };
 
-/// @brief Control a graph of WAV endpoints, mixers, and channel matrices.
-/// @note Calls on a live instance serialize on a control thread and may block.
+/// @brief Control a graph of hardware, WAV, callback, and push/pull endpoints, mixers, and channel matrices.
+/// @note Control calls serialize on a control thread and may block.
 /// @pre All external calls must return before destruction begins.
 class AudioCenter
 {
@@ -7433,6 +7968,22 @@ class AudioCenter
 
     AudioCenter(const AudioCenter &) = delete;
     AudioCenter &operator=(const AudioCenter &) = delete;
+
+    /// @brief Create a hardware capture endpoint with an F32P graph output.
+    /// @param config Device selection and graph sample rate, channel count, and device I/O budget.
+    /// @param flags Optional recovery and access mode flags.
+    /// @return A node handle, or an empty handle on failure. See last_error().
+    /// @note With recovery enabled, a device that fails with DEVLOST or IOFAILED can start offline.
+    ///       The endpoint supplies silence while offline and retries while in the running plan.
+    NodeId create_idev(const DevConfig &config = {}, DevFlags flags = DevFlags::NONE);
+
+    /// @brief Create a hardware playback endpoint with an F32P graph input.
+    /// @param config Device selection and graph sample rate, channel count, and device I/O budget.
+    /// @param flags Optional recovery and access mode flags.
+    /// @return A node handle, or an empty handle on failure. See last_error().
+    /// @note With recovery enabled, a device that fails with DEVLOST or IOFAILED can start offline.
+    ///       The endpoint discards input while offline and retries while in the running plan.
+    NodeId create_odev(const DevConfig &config = {}, DevFlags flags = DevFlags::NONE);
 
     /// @brief Probe an existing WAV file and create a source for its sample rate and channels.
     /// @param repeat Zero plays once, a positive value adds passes, and a negative value loops.
@@ -7452,6 +8003,57 @@ class AudioCenter
                        std::chrono::seconds segment_duration = std::chrono::seconds(0),
                        std::chrono::microseconds io_period = std::chrono::milliseconds(10));
 
+    /// @brief Create a callback source with an F32P graph output at spec's sample rate and channel count.
+    /// @param spec Fixed interleaved PCM specification (S16LE, S24_3LE, S24LE, S32LE, or F32LE).
+    /// @param callback Non-null function that fills a zero-initialized output buffer on a worker thread.
+    /// @param user_data Caller pointer that must stay valid while the endpoint can call the callback.
+    /// @param io_period Duration used to size batches and the queue. The batch frame count rounds down.
+    /// @return A node handle, or an empty handle on failure. See last_error().
+    NodeId create_icallback(PortSpec spec, AudioCallback callback, void *user_data = nullptr,
+                            std::chrono::microseconds io_period = std::chrono::milliseconds(10));
+
+    /// @brief Create a callback sink with an F32P graph input at spec's sample rate and channel count.
+    /// @param spec Fixed interleaved PCM specification (S16LE, S24_3LE, S24LE, S32LE, or F32LE).
+    /// @param callback Non-null function that receives read-only input on a worker thread.
+    /// @param user_data Caller pointer that must stay valid while the endpoint can call the callback.
+    /// @param io_period Duration used to size batches and the queue. The batch frame count rounds down.
+    /// @return A node handle, or an empty handle on failure. See last_error().
+    /// @note Stop and committed pause drain buffered audio before returning. The last batch may be shorter.
+    NodeId create_ocallback(PortSpec spec, AudioCallback callback, void *user_data = nullptr,
+                            std::chrono::microseconds io_period = std::chrono::milliseconds(10));
+
+    /// @brief Create a caller-driven PCM source with an F32P graph output.
+    /// @param spec Fixed sample rate, channel count, and interleaved PCM format (S16LE, S24_3LE, S24LE, S32LE, or F32LE).
+    /// @param io_period Burst duration budget used to size the queue.
+    /// @return A node handle, or an empty handle on failure. See last_error().
+    NodeId create_ipush(PortSpec spec, std::chrono::microseconds io_period = std::chrono::milliseconds(10));
+
+    /// @brief Create a caller-driven PCM sink with an F32P graph input.
+    /// @param spec Fixed sample rate, channel count, and one of create_ipush()'s interleaved PCM formats.
+    /// @param io_period Burst duration budget used to size the queue.
+    /// @return A node handle, or an empty handle on failure. See last_error().
+    /// @note Stop and committed pause discard buffered frames.
+    NodeId create_opull(PortSpec spec, std::chrono::microseconds io_period = std::chrono::milliseconds(10));
+
+    /// @brief Offer interleaved PCM to a push source without waiting for queue space.
+    /// @param node Handle from create_ipush(), with port index zero.
+    /// @param data Borrowed PCM in the declared format, valid for this call. May be null for zero frames.
+    /// @param frames Number of input frames to offer.
+    /// @return Frames accepted. Resume a short write at this frame offset.
+    /// @note Intended for application threads. Calls serialize per node with each other and lifecycle changes.
+    ///       Handle lookup and transfer run on the calling thread.
+    /// @note last_error() reports OK on success or backpressure, ESTATE when stopped, or EPORT, ENODE, ETYPE,
+    ///       EPARAM, or TOOLARGE for invalid handles, buffers, or sizes.
+    std::size_t push(NodeId node, const void *data, std::size_t frames) noexcept;
+
+    /// @brief Read available interleaved PCM from a pull sink without waiting for audio.
+    /// @param node Handle from create_opull(), with port index zero.
+    /// @param data Borrowed writable PCM in the declared format, valid for this call. May be null for zero frames.
+    /// @param frames Maximum number of output frames to read.
+    /// @return Frames written. The unwritten suffix is left intact.
+    /// @note Uses the same serialization and last_error() rules as push().
+    std::size_t pull(NodeId node, void *data, std::size_t frames) noexcept;
+
     /// @brief Create an F32P mixer with 1 to 64 inputs. Returns an empty handle on failure.
     NodeId create_mixer(BandWidth bandwidth, std::size_t channels, std::size_t inputs);
     /// @brief Create a node by copying a channel map and applying the given linear gain.
@@ -7464,7 +8066,7 @@ class AudioCenter
     /// @note Use create_matrix() to change the channel count.
     NodeId create_convert(PortSpec input, PortSpec output);
 
-    /// @brief Read the graph-side specification of an output port, including WAV sources.
+    /// @brief Read the graph-side specification of an output port.
     /// @return The port specification, or an invalid specification on failure. See last_error().
     PortSpec output_spec(NodeId port) const;
 
@@ -7474,7 +8076,7 @@ class AudioCenter
     /// @brief Stage removal of the given connection.
     RetCode disconnect(NodeId from, NodeId to);
     /// @brief Stage removal of the connection at the destination input.
-    /// @note Unconnected, unpaused WAV outputs record silence while running.
+    /// @note After commit, unpaused outputs without a source receive silence while the graph runs.
     RetCode disconnect(NodeId to);
     /// @brief Remove a node and its connections from the draft. The handle must select port zero.
     /// @note Endpoint removal unbinds immediately, including when an old plan still contains it.
@@ -7482,11 +8084,13 @@ class AudioCenter
 
     /// @brief Publish the draft and reconcile backend starts and stops while running.
     /// @note Graph preparation failure retains the current plan. If a backend fails to start
-    /// after publication, the new plan remains current and all backends and the clock stop.
+    /// after publication, the new plan remains current and the graph stops. Hardware endpoints
+    /// with recovery enabled handle their start failures locally.
     RetCode commit();
     /// @brief Commit pending edits, start the backends in the plan, and start the clock.
     RetCode start();
-    /// @brief Stop the backends and clock, draining queued audio without closing WAV files.
+    /// @brief Stop the backends and clock. WAV and callback outputs drain and pull sinks discard queued audio.
+    /// @note WAV files stay open.
     RetCode stop() noexcept;
 
     /// @brief Stage a node pause or resume for the next commit. The handle must select port zero.
@@ -7502,13 +8106,14 @@ class AudioCenter
     /// @return The snapshot, or an empty string on failure. See last_error().
     std::string dump_json() const;
 
-    /// @brief Return the status of the most recent control or diagnostic call on this thread.
+    /// @brief Return the status of the most recent control, diagnostic, or push/pull call on this thread.
     /// @note Successful calls store OK. Construction, destruction, and this query leave it alone.
     static RetCode last_error() noexcept;
 
   private:
     std::unique_ptr<CommandQueue> commands_;
     std::unique_ptr<GraphService> graph_;
+    std::unique_ptr<DeviceService> devices_;
 };
 
 } // namespace aereborn
@@ -7708,6 +8313,16 @@ struct PortSpec
     BandWidth bandwidth = BandWidth::Unknown;
     SampleFormat format{};
 };
+
+/// @brief Exchange interleaved PCM with an AudioCenter callback endpoint.
+/// @param input Read-only PCM from the graph. Null for a source callback.
+/// @param output Writable PCM feeding the graph. Null for a sink callback.
+/// @param frames Number of frames in the batch. A sink's final drain batch may be shorter.
+/// @param spec Fixed PCM specification declared at creation.
+/// @param user_data Opaque caller pointer supplied at creation.
+/// @note Each endpoint calls its callback on a dedicated backend worker thread.
+/// @note Buffers are borrowed for this call. Callbacks must return without throwing or calling AudioCenter control methods.
+using AudioCallback = void (*)(const void *input, void *output, std::size_t frames, PortSpec spec, void *user_data);
 
 /// @brief Unified 64-bit node and port handle.
 /// @note High 48 bits identify the node (0 = empty/invalid). Low 16 bits select the zero-based port
@@ -7916,6 +8531,14 @@ void write_json_node(std::ostream &out, const ConfiguredNode &entry, bool in_pla
         }
         out << ']';
     }
+    if (entry.device.state)
+    {
+        out << ",\"device_status\":{\"state\":";
+        write_json_string(out, entry.device.state);
+        out << ",\"error\":";
+        write_json_string(out, error_code_name(entry.device.error.code()));
+        out << '}';
+    }
     out << '}';
 }
 
@@ -8076,11 +8699,18 @@ namespace aereborn
 /// @note Metrics are sampled independently. WAV backends expose only the configured file name.
 std::string dump_json(const Engine &engine, View<const Backend *const> backends = {});
 
+struct DeviceStatus
+{
+    const char *state = nullptr;
+    RetCode error;
+};
+
 struct ConfiguredNode
 {
     NodeId id;
     const Node *node;
     bool paused;
+    DeviceStatus device{};
 };
 
 /// @brief Return JSON of the caller's configured topology, marking members of the committed plan.
@@ -8094,10 +8724,20 @@ std::string dump_json(const Engine &engine, View<const ConfiguredNode> nodes, Vi
 
 ===== app/audio_center.cpp =====
 #include "audio_interface.h"
+#include "backend/pull_sink.h"
+#include "backend/push_source.h"
+#include "backend/usr_capture.h"
+#include "backend/usr_playback.h"
+#include "backend/wav_backend.h"
 #include "core/command_queue.h"
+#include "device_service.h"
+#include "diag/inspect.h"
 #include "graph_service.h"
 #include <functional>
+#include <limits>
+#include <mutex>
 #include <new>
+#include <utility>
 
 namespace aereborn
 {
@@ -8106,12 +8746,11 @@ namespace
 
 thread_local RetCode thread_last_error;
 
-template <class Fn> auto dispatch(CommandQueue &commands, Fn &&fn) noexcept -> decltype(fn())
+template <class Fn> auto invoke(Fn &&fn) noexcept -> decltype(fn())
 {
-    thread_last_error = RetCode::OK;
     try
     {
-        return commands.sync(fn);
+        return fn();
     }
     catch (const Error &error)
     {
@@ -8128,34 +8767,233 @@ template <class Fn> auto dispatch(CommandQueue &commands, Fn &&fn) noexcept -> d
     return decltype(fn())();
 }
 
+template <class Fn> auto dispatch(CommandQueue &commands, Fn &&fn) noexcept -> decltype(fn())
+{
+    thread_last_error = RetCode::OK;
+    return invoke([&] { return commands.sync(fn); });
+}
+
 template <class Fn> RetCode call_status(CommandQueue &commands, Fn &&fn) noexcept
 {
     dispatch(commands, fn);
     return thread_last_error;
 }
 
+template <class Driver>
+struct ActiveBinding final : NodeBinding
+{
+    template <class... Args>
+    explicit ActiveBinding(Args &&...args) : driver(std::forward<Args>(args)...) {}
+
+    const Backend *backend() const noexcept override { return &driver; }
+    void start() override { driver.start(); }
+    void stop() noexcept override { driver.stop(); }
+    void unbind() noexcept override { driver.unbind(); }
+
+    Driver driver;
+};
+
+template <class Driver>
+struct PassiveBinding final : NodeBinding
+{
+    // Constructing the driver validates the PCM spec before the frame limit is calculated.
+    explicit PassiveBinding(PortSpec spec)
+        : driver(spec), max_frames_(std::numeric_limits<std::size_t>::max() / spec.channels / sample_bytes(spec.format))
+    {
+    }
+
+    const Backend *backend() const noexcept override { return &driver; }
+
+    void start() override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        driver.start();
+    }
+
+    void stop() noexcept override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        driver.stop();
+    }
+
+    void unbind() noexcept override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        driver.unbind();
+    }
+
+    Driver driver;
+
+    template <class Byte, class Block>
+    Result<std::size_t> transfer(Byte *data, std::size_t frames, std::size_t (Driver::*operation)(Block))
+    {
+        if (frames && !data)
+            return RetCode::EPARAM;
+        if (frames > max_frames_)
+            return RetCode::TOOLARGE;
+
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (!driver.running())
+            return driver.bound() ? RetCode::ESTATE : RetCode::ENODE;
+        return (driver.*operation)({data, driver.device_spec(), frames});
+    }
+
+  private:
+    std::mutex mutex_;
+    const std::size_t max_frames_;
+};
+
+template <class Endpoint, class Binding>
+NodeId add_endpoint(GraphService &graph, std::unique_ptr<Endpoint> endpoint, std::shared_ptr<Binding> binding)
+{
+    auto *node = endpoint.get();
+    auto *endpoint_binding = binding.get();
+    return graph.add_endpoint(std::move(endpoint), std::move(binding),
+                              [endpoint_binding, node] { endpoint_binding->driver.bind(*node); });
+}
+
+template <class Endpoint, class Binding>
+NodeId add_pcm_endpoint(GraphService &graph, PortSpec spec, std::chrono::microseconds io_period,
+                        std::shared_ptr<Binding> binding)
+{
+    // The binding validates bandwidth. Reject sub-frame periods before allocating the queue.
+    constexpr auto micros_per_second = 1000000u;
+    const auto rate = static_cast<std::uint32_t>(spec.bandwidth);
+    const std::chrono::microseconds min_period{(micros_per_second + rate - 1) / rate};
+    if (io_period < min_period)
+        throw Error(RetCode::EPARAM);
+    auto endpoint = std::make_unique<Endpoint>(spec.bandwidth, spec.channels, io_period);
+    return add_endpoint(graph, std::move(endpoint), std::move(binding));
+}
+
+template <class Binding> bool matches(const NodeBinding &binding) noexcept
+{
+    return dynamic_cast<const Binding *>(&binding) != nullptr;
+}
+
+template <class Driver, class Byte, class Block>
+std::size_t transfer_pcm(GraphService &graph, NodeId node, Byte *data, std::size_t frames,
+                         std::size_t (Driver::*operation)(Block)) noexcept
+{
+    using Binding = PassiveBinding<Driver>;
+    return invoke([&] {
+        const auto endpoint = graph.find_binding(node, matches<Binding>);
+        const auto result = endpoint ? static_cast<Binding &>(*endpoint.value()).transfer(data, frames, operation)
+                                     : Result<std::size_t>(endpoint.ret_code());
+        thread_last_error = result.ret_code();
+        return result ? result.value() : 0;
+    });
+}
+
 } // namespace
 
 AudioCenter::AudioCenter(BlockPeriod period)
-    : commands_(std::make_unique<CommandQueue>()), graph_(std::make_unique<GraphService>(*commands_, period))
+    : commands_(std::make_unique<CommandQueue>())
 {
+    commands_->sync([&] {
+        auto graph = std::make_unique<GraphService>(*commands_, period);
+        auto devices = std::make_unique<DeviceService>(*commands_, *graph);
+        graph_ = std::move(graph);
+        devices_ = std::move(devices);
+    });
 }
 
 AudioCenter::~AudioCenter()
 {
-    const auto shutdown = [this]() noexcept { graph_.reset(); };
+    const auto shutdown = [this]() noexcept {
+        devices_->cancel_poll();
+        graph_.reset();
+        devices_.reset();
+    };
     commands_->stop(std::cref(shutdown)); // stop() joins before the borrowed callable goes out of scope.
+}
+
+NodeId AudioCenter::create_idev(const DevConfig &config, DevFlags flags)
+{
+    return dispatch(*commands_, [&] { return devices_->create_idev(config, flags); });
+}
+
+NodeId AudioCenter::create_odev(const DevConfig &config, DevFlags flags)
+{
+    return dispatch(*commands_, [&] { return devices_->create_odev(config, flags); });
 }
 
 NodeId AudioCenter::create_iwav(const std::string &path, int repeat, std::chrono::microseconds io_period)
 {
-    return dispatch(*commands_, [&] { return graph_->create_iwav(path, repeat, io_period); });
+    return dispatch(*commands_, [&] {
+        using Binding = ActiveBinding<WavCapture>;
+        auto binding = repeat > 0 ? std::make_shared<Binding>(path, WavCapture::Repeat{static_cast<std::size_t>(repeat)})
+                                  : std::make_shared<Binding>(path, repeat < 0);
+        const auto spec = binding->driver.probe().value_or_throw();
+        auto endpoint = std::make_unique<Capture>(spec.bandwidth, spec.channels, io_period);
+        return add_endpoint(*graph_, std::move(endpoint), std::move(binding));
+    });
 }
 
 NodeId AudioCenter::create_owav(const std::string &path, PortSpec spec, std::chrono::seconds segment_duration,
-                                std::chrono::microseconds io_period)
+                               std::chrono::microseconds io_period)
 {
-    return dispatch(*commands_, [&] { return graph_->create_owav(path, spec, segment_duration, io_period); });
+    return dispatch(*commands_, [&] {
+        if (!spec.valid())
+            throw Error(RetCode::EPARAM);
+        throw_if_error(WavFile::max_write_frames(spec).ret_code());
+        auto endpoint = std::make_unique<Playback>(spec.bandwidth, spec.channels, io_period);
+        auto binding = std::make_shared<ActiveBinding<WavPlayback>>(path, spec.format, segment_duration,
+                                                                   WavFile::WriteMode::Exclusive);
+        return add_endpoint(*graph_, std::move(endpoint), std::move(binding));
+    });
+}
+
+NodeId AudioCenter::create_icallback(PortSpec spec, AudioCallback callback, void *user_data,
+                                    std::chrono::microseconds io_period)
+{
+    return dispatch(*commands_, [&] {
+        if (!callback)
+            throw Error(RetCode::EPARAM);
+        auto binding = std::make_shared<ActiveBinding<UsrCapture>>(spec, [callback, user_data](OBBlock block) noexcept {
+            callback(nullptr, block.byte_view().data(), block.frames(), block.spec(), user_data);
+        });
+        return add_pcm_endpoint<Capture>(*graph_, spec, io_period, std::move(binding));
+    });
+}
+
+NodeId AudioCenter::create_ocallback(PortSpec spec, AudioCallback callback, void *user_data,
+                                    std::chrono::microseconds io_period)
+{
+    return dispatch(*commands_, [&] {
+        if (!callback)
+            throw Error(RetCode::EPARAM);
+        auto binding = std::make_shared<ActiveBinding<UsrPlayback>>(spec, [callback, user_data](IBBlock block) noexcept {
+            callback(block.byte_view().data(), nullptr, block.frames(), block.spec(), user_data);
+        });
+        return add_pcm_endpoint<Playback>(*graph_, spec, io_period, std::move(binding));
+    });
+}
+
+NodeId AudioCenter::create_ipush(PortSpec spec, std::chrono::microseconds io_period)
+{
+    return dispatch(*commands_, [&] {
+        auto binding = std::make_shared<PassiveBinding<PushSource>>(spec);
+        return add_pcm_endpoint<Capture>(*graph_, spec, io_period, std::move(binding));
+    });
+}
+
+NodeId AudioCenter::create_opull(PortSpec spec, std::chrono::microseconds io_period)
+{
+    return dispatch(*commands_, [&] {
+        auto binding = std::make_shared<PassiveBinding<PullSink>>(spec);
+        return add_pcm_endpoint<Playback>(*graph_, spec, io_period, std::move(binding));
+    });
+}
+
+std::size_t AudioCenter::push(NodeId node, const void *data, std::size_t frames) noexcept
+{
+    return transfer_pcm(*graph_, node, static_cast<const std::uint8_t *>(data), frames, &PushSource::push);
+}
+
+std::size_t AudioCenter::pull(NodeId node, void *data, std::size_t frames) noexcept
+{
+    return transfer_pcm(*graph_, node, static_cast<std::uint8_t *>(data), frames, &PullSink::pull);
 }
 
 NodeId AudioCenter::create_mixer(BandWidth bandwidth, std::size_t channels, std::size_t inputs)
@@ -8240,7 +9078,9 @@ RetCode AudioCenter::set_high_priority(NodeId mixer_port, bool high)
 
 std::string AudioCenter::dump_json() const
 {
-    return dispatch(*commands_, [&] { return graph_->dump_json(); });
+    return dispatch(*commands_, [&] {
+        return graph_->dump_json([this](NodeId id) noexcept { return devices_->status_of(id); });
+    });
 }
 
 RetCode AudioCenter::last_error() noexcept
@@ -8451,25 +9291,6 @@ ChannelMap &ChannelMap::scale_output(std::size_t to, float factor) noexcept
     return *this;
 }
 
-ChannelMap &ChannelMap::clear_output(std::size_t to) noexcept
-{
-    if (auto *row = output_row(to))
-        std::fill_n(row, input_channels_, 0.0f);
-    return *this;
-}
-
-ChannelMap &ChannelMap::swap_outputs(std::size_t first, std::size_t second) noexcept
-{
-    if (auto *row = output_row(first))
-    {
-        if (second >= output_channels_)
-            status_ = RetCode::EPARAM;
-        else if (first != second)
-            std::swap_ranges(row, row + input_channels_, coefficients_.data() + second * input_channels_);
-    }
-    return *this;
-}
-
 bool ChannelMap::valid() const noexcept
 {
     return static_cast<bool>(status());
@@ -8503,9 +9324,393 @@ float *ChannelMap::output_row(std::size_t to) noexcept
 
 } // namespace aereborn
 
+===== app/device_service.cpp =====
+#include "device_service.h"
+#include "audio_interface.h"
+#include "diag/inspect.h"
+#include "graph_service.h"
+#include "plugins/endpoint.h"
+#if defined(AEREBORN_HAS_ALSA)
+#include "backend/alsa_backend.h"
+#elif WINDOWS_OS_ENVIRONMENT
+#include "backend/wasapi_backend.h"
+#endif
+#include <algorithm>
+#include <cassert>
+#include <new>
+#include <utility>
+
+namespace aereborn
+{
+namespace
+{
+
+constexpr auto recovery_flags = DevFlags::RECOVERSOFT | DevFlags::RECOVERHARD;
+#if defined(AEREBORN_HAS_ALSA) || WINDOWS_OS_ENVIRONMENT
+constexpr auto device_health_interval = std::chrono::seconds(1);
+constexpr auto device_reset_interval = std::chrono::seconds(10); // Shortened during device recovery testing.
+#endif
+
+} // namespace
+
+#if defined(AEREBORN_HAS_ALSA) || WINDOWS_OS_ENVIRONMENT
+struct DeviceService::DeviceBinding final : NodeBinding
+{
+    using Clock = CommandQueue::Clock;
+    enum class Status { Stopped, Online, Waiting, Failed };
+
+    DeviceBinding(const DevConfig &config, DevFlags flags) : config_(config), flags_(flags) {}
+    ~DeviceBinding() override { unbind(); }
+
+    void attach(DeviceService &service, NodeId id) noexcept
+    {
+        service_ = &service;
+        id_ = id;
+    }
+
+    void bind(Capture &node)
+    {
+        capture_ = &node;
+        bind_initial();
+    }
+
+    void bind(Playback &node)
+    {
+        playback_ = &node;
+        bind_initial();
+    }
+
+    const Backend *backend() const noexcept override { return driver_.get(); }
+
+    DeviceStatus device_status() const noexcept
+    {
+        auto status = status_;
+        auto error = last_error_;
+        if (status == Status::Online && !driver_->running())
+        {
+            error = worker_error();
+            status = failure_status(error);
+        }
+        constexpr const char *names[] = {"stopped", "online", "waiting", "failed"};
+        return {names[static_cast<unsigned>(status)], error};
+    }
+
+    void start() override
+    {
+        start_driver();
+        if (needs_poll())
+            service_->on_device_started();
+    }
+
+    void stop() noexcept override
+    {
+        const auto was_polled = needs_poll();
+        status_ = Status::Stopped;
+        if (driver_)
+        {
+            driver_->stop();
+            const auto error = driver_->last_error();
+            if (!error)
+                last_error_ = error;
+            if (!error || config_.name.empty() || config_.name == "default")
+                driver_.reset();
+        }
+        if (was_polled)
+            service_->on_device_stopped();
+    }
+
+    void unbind() noexcept override
+    {
+        if (service_)
+        {
+            service_->unregister(id_);
+            service_ = nullptr;
+        }
+        driver_.reset();
+        status_ = Status::Stopped;
+    }
+
+    bool needs_poll() const noexcept
+    {
+        return recovers() && (status_ == Status::Online || status_ == Status::Waiting);
+    }
+
+    bool poll(Clock::time_point now) noexcept
+    {
+        if (!needs_poll())
+            return false;
+        if (status_ == Status::Online)
+        {
+            if (!driver_->running())
+            {
+                fail(worker_error());
+                if (status_ == Status::Failed)
+                    return false;
+            }
+            else if (!strict() || now < reset_at_)
+                return true;
+            else
+                driver_.reset();
+        }
+        start_driver();
+        return needs_poll();
+    }
+
+  private:
+    bool recovers() const noexcept { return (flags_ & recovery_flags) != DevFlags::NONE; }
+    bool strict() const noexcept { return has_flag(flags_, DevFlags::RECOVERHARD); }
+
+    static bool device_unavailable(RetCode code) noexcept
+    {
+        return code == RetCode::DEVLOST || code == RetCode::IOFAILED;
+    }
+
+    void bind_initial()
+    {
+        try
+        {
+            open_driver();
+        }
+        catch (const Error &error)
+        {
+            if (!recovers() || !device_unavailable(error.code()))
+                throw;
+            last_error_ = error.code();
+        }
+    }
+
+    void open_driver()
+    {
+        const auto fail_on_timeout = !has_flag(flags_, DevFlags::RECOVERSOFT);
+#if defined(AEREBORN_HAS_ALSA)
+        auto driver = std::make_unique<AlsaBackend>(config_.name, config_.device, !has_flag(flags_, DevFlags::MEMCPY),
+                                                    fail_on_timeout);
+#else
+        auto driver = std::make_unique<WasapiBackend>(config_.name, fail_on_timeout);
+#endif
+        if (capture_)
+            driver->bind(*capture_);
+        else
+            driver->bind(*playback_);
+        driver_ = std::move(driver);
+    }
+
+    void start_driver()
+    {
+        try
+        {
+            if (!driver_)
+                open_driver();
+            driver_->start();
+            if (strict())
+                reset_at_ = Clock::now() + device_reset_interval;
+            last_error_ = {};
+            status_ = Status::Online;
+        }
+        catch (const Error &error)
+        {
+            fail(error.code());
+            if (!recovers())
+                throw;
+        }
+        catch (const std::bad_alloc &)
+        {
+            fail(RetCode::TOOLARGE);
+            if (!recovers())
+                throw;
+        }
+        catch (...)
+        {
+            fail(RetCode::FAILED);
+            if (!recovers())
+                throw;
+        }
+    }
+
+    RetCode worker_error() const noexcept
+    {
+        const auto error = driver_->last_error();
+        return error ? RetCode::IOFAILED : error.code();
+    }
+
+    Status failure_status(RetCode error) const noexcept
+    {
+        return recovers() && (device_unavailable(error) || (strict() && error == RetCode::TIMEOUT))
+                   ? Status::Waiting : Status::Failed;
+    }
+
+    void fail(RetCode error) noexcept
+    {
+        last_error_ = error;
+        driver_.reset();
+        status_ = failure_status(error);
+    }
+
+    const DevConfig config_;
+    const DevFlags flags_;
+    DeviceService *service_ = nullptr;
+    NodeId id_;
+    Capture *capture_ = nullptr;
+    Playback *playback_ = nullptr;
+    std::unique_ptr<ActiveBackend> driver_;
+    RetCode last_error_;
+    Status status_ = Status::Stopped;
+    Clock::time_point reset_at_;
+};
+#endif
+
+DeviceService::DeviceService(CommandQueue &commands, GraphService &graph) : commands_(commands), graph_(graph)
+{
+}
+
+DeviceService::~DeviceService()
+{
+    assert(devices_.empty());
+    cancel_poll();
+}
+
+template <class Endpoint> NodeId DeviceService::create_device(const DevConfig &config, DevFlags flags)
+{
+    assert(commands_.on_thread());
+    constexpr auto known_flags = recovery_flags | DevFlags::MEMCPY;
+    if (!is_block_period(config.period) || config.name.find('\0') != std::string::npos ||
+        (flags & known_flags) != flags || has_flag(flags, recovery_flags))
+        throw Error(RetCode::EPARAM);
+
+    const std::chrono::milliseconds period(static_cast<std::uint32_t>(config.period));
+    auto endpoint = std::make_unique<Endpoint>(config.bandwidth, config.channels, period);
+#if defined(AEREBORN_HAS_ALSA) || WINDOWS_OS_ENVIRONMENT
+    auto binding = std::make_shared<DeviceBinding>(config, flags);
+    auto *node = endpoint.get();
+    auto *device = binding.get();
+    const auto id = graph_.add_endpoint(std::move(endpoint), std::move(binding), [device, node] { device->bind(*node); });
+    const auto cleanup = [&]() noexcept { graph_.remove(id); };
+    ScopeExit<decltype(cleanup)> rollback(cleanup);
+    devices_.emplace(id, device);
+    device->attach(*this, id);
+    rollback.dismiss();
+    return id;
+#else
+    throw Error(RetCode::IOFAILED);
+#endif
+}
+
+NodeId DeviceService::create_idev(const DevConfig &config, DevFlags flags)
+{
+    return create_device<Capture>(config, flags);
+}
+
+NodeId DeviceService::create_odev(const DevConfig &config, DevFlags flags)
+{
+    return create_device<Playback>(config, flags);
+}
+
+void DeviceService::cancel_poll() noexcept
+{
+    commands_.cancel(poll_timer_);
+    poll_timer_ = 0;
+}
+
+#if defined(AEREBORN_HAS_ALSA) || WINDOWS_OS_ENVIRONMENT
+DeviceStatus DeviceService::status_of(NodeId node) const noexcept
+{
+    const auto device = devices_.find(node);
+    return device == devices_.end() ? DeviceStatus{} : device->second->device_status();
+}
+
+void DeviceService::on_device_started()
+{
+    if (!poll_timer_)
+        poll_timer_ = commands_.post_every(device_health_interval, [this] { poll_devices(); });
+}
+
+void DeviceService::on_device_stopped() noexcept
+{
+    if (poll_timer_ && std::none_of(devices_.begin(), devices_.end(), [](const auto &entry) {
+            return entry.second->needs_poll();
+        }))
+        cancel_poll();
+}
+
+void DeviceService::unregister(NodeId id) noexcept
+{
+    const auto entry = devices_.find(id);
+    const auto was_polled = entry->second->needs_poll();
+    devices_.erase(entry);
+    if (was_polled)
+        on_device_stopped();
+}
+
+void DeviceService::poll_devices() noexcept
+{
+    const auto now = CommandQueue::Clock::now();
+    bool required = false;
+    for (const auto &entry : devices_)
+        required |= entry.second->poll(now);
+    if (!required)
+        cancel_poll();
+}
+#else
+DeviceStatus DeviceService::status_of(NodeId) const noexcept
+{
+    return {};
+}
+#endif
+
+} // namespace aereborn
+
+===== app/device_service.h =====
+#ifndef AEREBORN_APP_DEVICE_SERVICE_H
+#define AEREBORN_APP_DEVICE_SERVICE_H
+
+#include "core/command_queue.h"
+#include <map>
+
+namespace aereborn
+{
+
+class GraphService;
+struct DeviceStatus;
+struct DevConfig;
+enum class DevFlags : std::uint32_t;
+
+/// @brief Manage hardware binding recovery on the graph's control thread.
+/// @note Destroy the graph before the service so all bindings can unregister.
+class DeviceService
+{
+  public:
+    DeviceService(CommandQueue &commands, GraphService &graph);
+    ~DeviceService();
+
+    NodeId create_idev(const DevConfig &config, DevFlags flags);
+    NodeId create_odev(const DevConfig &config, DevFlags flags);
+
+    /// @brief Query hardware status or return an empty status for other nodes.
+    DeviceStatus status_of(NodeId node) const noexcept;
+    /// @brief Cancel the shared timer before graph teardown.
+    void cancel_poll() noexcept;
+
+  private:
+    struct DeviceBinding;
+    template <class Endpoint> NodeId create_device(const DevConfig &config, DevFlags flags);
+
+    void on_device_started();
+    void on_device_stopped() noexcept;
+    void unregister(NodeId id) noexcept;
+    void poll_devices() noexcept;
+
+    CommandQueue &commands_;
+    GraphService &graph_;
+    CommandQueue::TimerId poll_timer_ = 0;
+    std::map<NodeId, DeviceBinding *> devices_;
+};
+
+} // namespace aereborn
+
+#endif // AEREBORN_APP_DEVICE_SERVICE_H
+
 ===== app/graph_service.cpp =====
 #include "graph_service.h"
-#include "backend/wav_backend.h"
 #include "core/command_queue.h"
 #include "diag/inspect.h"
 #include "plugins/convert.h"
@@ -8528,83 +9733,99 @@ bool contains_node(View<const NodeId> nodes, NodeId id) noexcept
 
 } // namespace
 
-GraphService::GraphService(CommandQueue &commands, BlockPeriod period) : commands_(commands), engine_(period) {}
+GraphService::GraphService(CommandQueue &commands, BlockPeriod period)
+    : commands_(commands), engine_(period)
+{
+}
 
 GraphService::~GraphService()
 {
     assert(commands_.on_thread());
+    // External calls have already returned, so teardown can unbind directly.
     for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it)
-        if (it->second.backend)
-            it->second.backend->unbind();
+        if (const auto &endpoint = it->second.endpoint)
+            endpoint->unbind();
     engine_.stop();
 }
 
-GraphService::NodeMap::iterator GraphService::add_node(std::unique_ptr<Node> node)
+NodeId GraphService::add_node(std::unique_ptr<Node> node)
+{
+    assert(commands_.on_thread());
+    return insert_node(std::move(node), /*published=*/true)->first;
+}
+
+GraphService::NodeMap::iterator GraphService::insert_node(std::unique_ptr<Node> node, bool published)
 {
     const auto id = engine_.add_node(std::move(node));
     const auto cleanup = [&]() noexcept { engine_.remove_node(id); };
     ScopeExit<decltype(cleanup)> rollback(cleanup);
-    const auto entry = nodes_.emplace(id, NodeBinding{}).first;
+    const std::lock_guard<std::mutex> lock(nodes_mutex_);
+    const auto entry = nodes_.emplace(id, NodeEntry{{}, published}).first;
     rollback.dismiss();
     return entry;
 }
 
-template <class Endpoint>
-NodeId GraphService::add_endpoint(std::unique_ptr<Endpoint> endpoint, std::unique_ptr<ActiveBackend> backend)
+std::shared_ptr<NodeBinding> GraphService::detach_node(NodeMap::iterator entry)
 {
-    auto *node = endpoint.get();
-    node->prepare(engine_.block_period());
-    const auto entry = add_node(std::move(endpoint));
+    const std::lock_guard<std::mutex> lock(nodes_mutex_);
+    auto endpoint = std::move(entry->second.endpoint);
+    nodes_.erase(entry);
+    return endpoint;
+}
+
+NodeId GraphService::add_endpoint(std::unique_ptr<Node> endpoint, std::shared_ptr<NodeBinding> binding,
+                                 const std::function<void()> &bind)
+{
+    assert(commands_.on_thread());
+    endpoint->prepare(engine_.block_period());
+    // Reserve the table entry before bind() can create a file, then publish after binding.
+    const auto entry = insert_node(std::move(endpoint), /*published=*/false);
+    const auto id = entry->first;
     const auto cleanup = [&]() noexcept {
-        engine_.remove_node(entry->first);
-        nodes_.erase(entry);
+        binding.reset(); // Destroy the unpublished backend before removing the node it borrows.
+        detach_node(entry);
+        engine_.remove_node(id);
     };
     ScopeExit<decltype(cleanup)> rollback(cleanup);
-    backend->bind(*node);
-    entry->second.backend = std::move(backend);
+    bind();
+    {
+        const std::lock_guard<std::mutex> lock(nodes_mutex_);
+        entry->second.endpoint = std::move(binding);
+        entry->second.published = true;
+    }
     rollback.dismiss();
-    return entry->first;
+    return id;
 }
 
-NodeId GraphService::create_iwav(const std::string &path, int repeat, std::chrono::microseconds io_period)
+Result<std::shared_ptr<NodeBinding>> GraphService::find_binding(NodeId node, BindingMatcher matches) noexcept
 {
-    assert(commands_.on_thread());
-    auto backend = repeat > 0 ? std::make_unique<WavCapture>(path, WavCapture::Repeat{static_cast<std::size_t>(repeat)})
-                              : std::make_unique<WavCapture>(path, repeat < 0);
-    const auto spec = backend->probe().value_or_throw();
-    auto endpoint = std::make_unique<Capture>(spec.bandwidth, spec.channels, io_period);
-    return add_endpoint(std::move(endpoint), std::move(backend));
-}
+    if (node.port() != 0)
+        return RetCode::EPORT;
 
-NodeId GraphService::create_owav(const std::string &path, PortSpec spec, std::chrono::seconds segment_duration,
-                                 std::chrono::microseconds io_period)
-{
-    assert(commands_.on_thread());
-    if (!spec.valid())
-        throw Error(RetCode::EPARAM);
-    throw_if_error(WavFile::max_write_frames(spec).ret_code());
-    auto endpoint = std::make_unique<Playback>(spec.bandwidth, spec.channels, io_period);
-    auto backend = std::make_unique<WavPlayback>(path, spec.format, segment_duration, WavFile::WriteMode::Exclusive);
-    return add_endpoint(std::move(endpoint), std::move(backend));
+    const std::lock_guard<std::mutex> lock(nodes_mutex_);
+    const auto entry = nodes_.find(node);
+    if (entry == nodes_.end() || !entry->second.published)
+        return RetCode::ENODE;
+    const auto &endpoint = entry->second.endpoint;
+    if (endpoint && matches(*endpoint))
+        return endpoint;
+    return RetCode::ETYPE;
 }
 
 NodeId GraphService::create_mixer(BandWidth bandwidth, std::size_t channels, std::size_t inputs)
 {
-    assert(commands_.on_thread());
-    return add_node(std::make_unique<Mixer>(bandwidth, channels, inputs))->first;
+    return add_node(std::make_unique<Mixer>(bandwidth, channels, inputs));
 }
 
 NodeId GraphService::create_matrix(BandWidth bandwidth, std::size_t input_channels, std::size_t output_channels,
                                    View<const float> coefficients, float gain)
 {
-    assert(commands_.on_thread());
-    return add_node(std::make_unique<Matrix>(bandwidth, input_channels, output_channels, coefficients, gain))->first;
+    return add_node(std::make_unique<Matrix>(bandwidth, input_channels, output_channels, coefficients, gain));
 }
 
 NodeId GraphService::create_convert(PortSpec input, PortSpec output)
 {
-    assert(commands_.on_thread());
-    return add_node(std::make_unique<Convert>(input, output))->first;
+    return add_node(std::make_unique<Convert>(input, output));
 }
 
 GraphService::NodeMap::iterator GraphService::find_node(NodeId node)
@@ -8616,12 +9837,6 @@ GraphService::NodeMap::iterator GraphService::find_node(NodeId node)
     if (entry == nodes_.end())
         throw Error(RetCode::ENODE);
     return entry;
-}
-
-Backend *GraphService::backend_of(NodeId node) noexcept
-{
-    const auto entry = nodes_.find(node);
-    return entry == nodes_.end() ? nullptr : entry->second.backend.get();
 }
 
 PortSpec GraphService::port_spec(NodeId port, bool output)
@@ -8677,9 +9892,8 @@ void GraphService::disconnect_input(NodeId to, const NodeId *from)
 
 void GraphService::remove(NodeId node)
 {
-    const auto entry = find_node(node);
-    if (entry->second.backend)
-        entry->second.backend->unbind();
+    if (const auto endpoint = detach_node(find_node(node)))
+        endpoint->unbind();
     for (auto it = links_.begin(); it != links_.end();)
     {
         if (it->first.base() == node || it->second.from.base() == node)
@@ -8688,7 +9902,12 @@ void GraphService::remove(NodeId node)
             ++it;
     }
     engine_.remove_node(node);
-    nodes_.erase(entry);
+}
+
+NodeBinding *GraphService::find_endpoint(NodeId node) noexcept
+{
+    const auto entry = nodes_.find(node);
+    return entry == nodes_.end() ? nullptr : entry->second.endpoint.get();
 }
 
 void GraphService::commit()
@@ -8715,13 +9934,13 @@ void GraphService::commit()
     const auto cleanup = [this]() noexcept { stop(); };
     ScopeExit<decltype(cleanup)> rollback(cleanup);
     for (auto it = previous.rbegin(); it != previous.rend(); ++it)
-        if (auto *backend = backend_of(*it))
+        if (auto *endpoint = find_endpoint(*it))
             if (!contains_node(current, *it))
-                backend->stop();
+                endpoint->stop();
     for (const auto id : current)
-        if (auto *backend = backend_of(id))
+        if (auto *endpoint = find_endpoint(id))
             if (!contains_node(old_plan, id))
-                backend->start();
+                endpoint->start();
     rollback.dismiss();
 }
 
@@ -8734,8 +9953,8 @@ void GraphService::start()
     const auto cleanup = [this]() noexcept { stop(); };
     ScopeExit<decltype(cleanup)> rollback(cleanup);
     for (const auto id : engine_.plan_nodes())
-        if (auto *backend = backend_of(id))
-            backend->start();
+        if (auto *endpoint = find_endpoint(id))
+            endpoint->start();
     engine_.start();
     rollback.dismiss();
 }
@@ -8744,8 +9963,8 @@ void GraphService::stop() noexcept
 {
     assert(commands_.on_thread());
     for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it)
-        if (it->second.backend)
-            it->second.backend->stop();
+        if (const auto &endpoint = it->second.endpoint)
+            endpoint->stop();
     engine_.stop();
 }
 
@@ -8774,7 +9993,7 @@ void GraphService::set_high_priority(NodeId mixer_port, bool high)
     engine_.node<Mixer>(mixer_port.base())->set_high_priority(mixer_port.port(), high);
 }
 
-std::string GraphService::dump_json()
+std::string GraphService::dump_json(const DeviceStatusFn &device_status)
 {
     assert(commands_.on_thread());
     std::vector<const Backend *> drivers;
@@ -8784,9 +10003,11 @@ std::string GraphService::dump_json()
     connections.reserve(links_.size());
     for (const auto &entry : nodes_)
     {
-        nodes.push_back({entry.first, engine_.node(entry.first), entry.second.paused});
-        if (entry.second.backend)
-            drivers.push_back(entry.second.backend.get());
+        const auto &endpoint = entry.second.endpoint;
+        nodes.push_back({entry.first, engine_.node(entry.first), entry.second.paused,
+                         device_status ? device_status(entry.first) : DeviceStatus{}});
+        if (const auto *backend = endpoint ? endpoint->backend() : nullptr)
+            drivers.push_back(backend);
     }
     for (const auto &entry : links_)
         connections.push_back(entry.second);
@@ -8802,29 +10023,44 @@ std::string GraphService::dump_json()
 #define AEREBORN_APP_GRAPH_SERVICE_H
 
 #include "core/engine.h"
-#include <chrono>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace aereborn
 {
 
-class ActiveBackend;
 class Backend;
 class CommandQueue;
+struct DeviceStatus;
 
-/// @brief Own the graph, its public handles, and its WAV backends on the control thread.
+struct NodeBinding
+{
+    virtual ~NodeBinding() = default;
+    virtual const Backend *backend() const noexcept = 0;
+    virtual void start() = 0;
+    virtual void stop() noexcept = 0;
+    virtual void unbind() noexcept = 0;
+};
+
+/// @brief Own the graph, its public handles, and its backends on the control thread.
 class GraphService
 {
   public:
+    using DeviceStatusFn = std::function<DeviceStatus(NodeId)>;
+    using BindingMatcher = bool (*)(const NodeBinding &);
+
     GraphService(CommandQueue &commands, BlockPeriod period);
     /// @brief Unbind backends and stop the engine on the control thread.
     ~GraphService();
 
-    NodeId create_iwav(const std::string &path, int repeat, std::chrono::microseconds io_period);
-    NodeId create_owav(const std::string &path, PortSpec spec, std::chrono::seconds segment_duration,
-                       std::chrono::microseconds io_period);
+    NodeId add_node(std::unique_ptr<Node> node);
+    /// @brief Prepare, bind, and publish an endpoint on the control thread.
+    /// @param bind Synchronous operation borrowing the supplied endpoint and binding.
+    NodeId add_endpoint(std::unique_ptr<Node> endpoint, std::shared_ptr<NodeBinding> binding,
+                        const std::function<void()> &bind);
     NodeId create_mixer(BandWidth bandwidth, std::size_t channels, std::size_t inputs);
     NodeId create_matrix(BandWidth bandwidth, std::size_t input_channels, std::size_t output_channels,
                          View<const float> coefficients, float gain);
@@ -8845,25 +10081,30 @@ class GraphService
     void set_muted(NodeId mixer_port, bool muted);
     void set_high_priority(NodeId mixer_port, bool high);
 
-    std::string dump_json();
+    /// @brief Match an endpoint under the table lock and retain it for a caller-thread transfer.
+    /// @pre matches is a non-throwing predicate.
+    Result<std::shared_ptr<NodeBinding>> find_binding(NodeId node, BindingMatcher matches) noexcept;
+
+    std::string dump_json(const DeviceStatusFn &device_status = {});
 
   private:
-    struct NodeBinding
+    struct NodeEntry
     {
-        std::unique_ptr<Backend> backend;
-        bool paused = false;
+        std::shared_ptr<NodeBinding> endpoint;
+        bool published;
+        bool paused = false; // Control thread only.
     };
-    using NodeMap = std::map<NodeId, NodeBinding>;
+    using NodeMap = std::map<NodeId, NodeEntry>;
 
-    NodeMap::iterator add_node(std::unique_ptr<Node> node);
-    template <class Endpoint>
-    NodeId add_endpoint(std::unique_ptr<Endpoint> endpoint, std::unique_ptr<ActiveBackend> backend);
+    NodeMap::iterator insert_node(std::unique_ptr<Node> node, bool published);
+    std::shared_ptr<NodeBinding> detach_node(NodeMap::iterator entry);
     NodeMap::iterator find_node(NodeId node);
-    Backend *backend_of(NodeId node) noexcept;
+    NodeBinding *find_endpoint(NodeId node) noexcept;
     void disconnect_input(NodeId to, const NodeId *from);
 
     CommandQueue &commands_;
     Engine engine_;
+    std::mutex nodes_mutex_;
     NodeMap nodes_;
     std::map<NodeId, Connection> links_; // Keyed by destination input port.
 };

@@ -14,6 +14,47 @@ namespace aereborn
 
 class CommandQueue;
 class GraphService;
+class DeviceService;
+
+/// @brief Hardware endpoint options. RECOVERSOFT and RECOVERHARD are mutually exclusive.
+enum class DevFlags : std::uint32_t
+{
+    NONE        = 0,       ///< No options enabled.
+    RECOVERSOFT = 1u << 0, ///< Wait for unavailable devices and retry I/O failures. Keep running on timeouts.
+    RECOVERHARD = 1u << 1, ///< Also recover on timeouts and reopen periodically.
+    MEMCPY      = 1u << 2  ///< Force ALSA RW_INTERLEAVED. Accepted and ignored on Windows.
+};
+
+constexpr DevFlags operator|(DevFlags lhs, DevFlags rhs) noexcept
+{
+    return static_cast<DevFlags>(static_cast<std::uint32_t>(lhs) | static_cast<std::uint32_t>(rhs));
+}
+
+constexpr DevFlags operator&(DevFlags lhs, DevFlags rhs) noexcept
+{
+    return static_cast<DevFlags>(static_cast<std::uint32_t>(lhs) & static_cast<std::uint32_t>(rhs));
+}
+
+/// @brief Test whether every bit in flag is set.
+constexpr bool has_flag(DevFlags flags, DevFlags flag) noexcept
+{
+    return (flags & flag) == flag;
+}
+
+/// @brief Graph-side configuration for a hardware audio endpoint.
+/// @note Empty name or "default" selects the system default. ALSA passes names containing ':' through
+///       and expands a bare card name to hw:CARD=<name>,DEV=<device>. WASAPI accepts an endpoint ID
+///       or a UTF-8 friendly name and ignores device.
+/// @note The backend negotiates sample format and rate. The opened stream must accept exactly channels.
+///       ALSA hw: applies that constraint to the hardware. ALSA PCM plugins can convert below the stream.
+struct DevConfig
+{
+    std::string name;
+    unsigned int device = 0;
+    BandWidth bandwidth = BandWidth::Full;
+    BlockPeriod period = BlockPeriod::INR_10MS; ///< Device batch and queue budget in milliseconds.
+    std::size_t channels = 2;
+};
 
 /// @brief Build a weighted channel map for AudioCenter::create_matrix().
 /// @note Indices are zero-based and follow the direction from input to output.
@@ -78,7 +119,7 @@ class ChannelMap
     RetCode status_{RetCode::EPARAM};
 };
 
-/// @brief Control a graph of WAV, callback, and push/pull endpoints, mixers, and channel matrices.
+/// @brief Control a graph of hardware, WAV, callback, and push/pull endpoints, mixers, and channel matrices.
 /// @note Control calls serialize on a control thread and may block.
 /// @pre All external calls must return before destruction begins.
 class AudioCenter
@@ -93,6 +134,22 @@ class AudioCenter
 
     AudioCenter(const AudioCenter &) = delete;
     AudioCenter &operator=(const AudioCenter &) = delete;
+
+    /// @brief Create a hardware capture endpoint with an F32P graph output.
+    /// @param config Device selection and graph sample rate, channel count, and device I/O budget.
+    /// @param flags Optional recovery and access mode flags.
+    /// @return A node handle, or an empty handle on failure. See last_error().
+    /// @note With recovery enabled, a device that fails with DEVLOST or IOFAILED can start offline.
+    ///       The endpoint supplies silence while offline and retries while in the running plan.
+    NodeId create_idev(const DevConfig &config = {}, DevFlags flags = DevFlags::NONE);
+
+    /// @brief Create a hardware playback endpoint with an F32P graph input.
+    /// @param config Device selection and graph sample rate, channel count, and device I/O budget.
+    /// @param flags Optional recovery and access mode flags.
+    /// @return A node handle, or an empty handle on failure. See last_error().
+    /// @note With recovery enabled, a device that fails with DEVLOST or IOFAILED can start offline.
+    ///       The endpoint discards input while offline and retries while in the running plan.
+    NodeId create_odev(const DevConfig &config = {}, DevFlags flags = DevFlags::NONE);
 
     /// @brief Probe an existing WAV file and create a source for its sample rate and channels.
     /// @param repeat Zero plays once, a positive value adds passes, and a negative value loops.
@@ -193,7 +250,8 @@ class AudioCenter
 
     /// @brief Publish the draft and reconcile backend starts and stops while running.
     /// @note Graph preparation failure retains the current plan. If a backend fails to start
-    /// after publication, the new plan remains current and all backends and the clock stop.
+    /// after publication, the new plan remains current and the graph stops. Hardware endpoints
+    /// with recovery enabled handle their start failures locally.
     RetCode commit();
     /// @brief Commit pending edits, start the backends in the plan, and start the clock.
     RetCode start();
@@ -221,6 +279,7 @@ class AudioCenter
   private:
     std::unique_ptr<CommandQueue> commands_;
     std::unique_ptr<GraphService> graph_;
+    std::unique_ptr<DeviceService> devices_;
 };
 
 } // namespace aereborn
