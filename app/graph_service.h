@@ -5,16 +5,16 @@
 #include <chrono>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace aereborn
 {
 
-class ActiveBackend;
-class Backend;
 class CommandQueue;
+struct NodeBinding;
 
-/// @brief Own the graph, its public handles, and its WAV backends on the control thread.
+/// @brief Own the graph, its public handles, and its backends on the control thread.
 class GraphService
 {
   public:
@@ -25,6 +25,12 @@ class GraphService
     NodeId create_iwav(const std::string &path, int repeat, std::chrono::microseconds io_period);
     NodeId create_owav(const std::string &path, PortSpec spec, std::chrono::seconds segment_duration,
                        std::chrono::microseconds io_period);
+    NodeId create_icallback(PortSpec spec, AudioCallback callback, void *user_data, std::chrono::microseconds io_period);
+    NodeId create_ocallback(PortSpec spec, AudioCallback callback, void *user_data, std::chrono::microseconds io_period);
+    NodeId create_ipush(PortSpec spec, std::chrono::microseconds io_period);
+    NodeId create_opull(PortSpec spec, std::chrono::microseconds io_period);
+    Result<std::size_t> push(NodeId node, const void *data, std::size_t frames);
+    Result<std::size_t> pull(NodeId node, void *data, std::size_t frames);
     NodeId create_mixer(BandWidth bandwidth, std::size_t channels, std::size_t inputs);
     NodeId create_matrix(BandWidth bandwidth, std::size_t input_channels, std::size_t output_channels,
                          View<const float> coefficients, float gain);
@@ -48,22 +54,27 @@ class GraphService
     std::string dump_json();
 
   private:
-    struct NodeBinding
+    struct NodeEntry
     {
-        std::unique_ptr<Backend> backend;
-        bool paused = false;
+        std::shared_ptr<NodeBinding> endpoint;
+        bool published;
+        bool paused = false; // Control thread only.
     };
-    using NodeMap = std::map<NodeId, NodeBinding>;
+    using NodeMap = std::map<NodeId, NodeEntry>;
 
-    NodeMap::iterator add_node(std::unique_ptr<Node> node);
-    template <class Endpoint>
-    NodeId add_endpoint(std::unique_ptr<Endpoint> endpoint, std::unique_ptr<ActiveBackend> backend);
+    NodeMap::iterator add_node(std::unique_ptr<Node> node, bool published = true);
+    std::shared_ptr<NodeBinding> detach_node(NodeMap::iterator entry);
+    template <class Endpoint, class Binding>
+    NodeId add_endpoint(std::unique_ptr<Endpoint> endpoint, std::shared_ptr<Binding> binding);
     NodeMap::iterator find_node(NodeId node);
-    Backend *backend_of(NodeId node) noexcept;
+    Result<std::shared_ptr<NodeBinding>> find_io_endpoint(NodeId node);
+    template <class Operation>
+    void visit_endpoint(NodeId node, Operation operation);
     void disconnect_input(NodeId to, const NodeId *from);
 
     CommandQueue &commands_;
     Engine engine_;
+    std::mutex nodes_mutex_;
     NodeMap nodes_;
     std::map<NodeId, Connection> links_; // Keyed by destination input port.
 };

@@ -191,6 +191,16 @@ struct PortSpec
     SampleFormat format{};
 };
 
+/// @brief Exchange interleaved PCM with an AudioCenter callback endpoint.
+/// @param input Read-only PCM from the graph. Null for a source callback.
+/// @param output Writable PCM feeding the graph. Null for a sink callback.
+/// @param frames Number of frames in the batch. A sink's final drain batch may be shorter.
+/// @param spec Fixed PCM specification declared at creation.
+/// @param user_data Opaque caller pointer supplied at creation.
+/// @note Each endpoint calls its callback on a dedicated backend worker thread.
+/// @note Buffers are borrowed for this call. Callbacks must return without throwing or calling AudioCenter control methods.
+using AudioCallback = void (*)(const void *input, void *output, std::size_t frames, PortSpec spec, void *user_data);
+
 /// @brief Unified 64-bit node and port handle.
 /// @note High 48 bits identify the node (0 = empty/invalid). Low 16 bits select the zero-based port
 ///       (default 0; 0xFFFF is reserved as an out-of-range sentinel to prevent wraparound).

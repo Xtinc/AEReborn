@@ -2,6 +2,7 @@
 #include "tests/support/test_backend.h"
 #include "backend/pull_sink.h"
 #include "backend/push_source.h"
+#include "backend/usr_capture.h"
 #include <fstream>
 
 namespace
@@ -10,6 +11,80 @@ using namespace aereborn;
 using namespace aereborn::test;
 using namespace std::chrono_literals;
 const PortSpec pcm(rate, 1, SampleFormat::F32LE);
+
+void user_capture_contract()
+{
+    const auto ignore = [](OBBlock) noexcept {};
+    expect_error(RetCode::EPARAM, [&] { UsrCapture invalid({rate, 1, SampleFormat::F32P}, ignore); });
+    expect_error(RetCode::EPARAM, [] { UsrCapture invalid(pcm, {}); });
+    Capture too_short(rate, 1, 20us);
+    Capture capture(rate, 1, 21us);
+    too_short.prepare(period);
+    UsrCapture source(pcm, ignore);
+    expect_error(RetCode::EPARAM, [&] { source.bind(too_short); });
+    check(!source.bound() && !too_short.bound(), "Failed binding releases the capture endpoint");
+    capture.prepare(period);
+    source.bind(capture);
+    check(source.device_max_frames() == 1, "The minimum whole-frame period at 48 kHz is 21 microseconds");
+    UsrCapture other(pcm, ignore);
+    expect_error(RetCode::BUSY, [&] { other.bind(capture); });
+    source.unbind();
+    other.bind(capture);
+}
+
+void user_capture_samples_and_restart()
+{
+    struct Sample
+    {
+        SampleFormat format;
+        std::uint8_t positive[4];
+        std::uint8_t negative[4];
+    };
+    const Sample samples[]{{SampleFormat::S16LE, {0, 0x20}, {0, 0xc0}},
+                           {SampleFormat::S24_3LE, {0, 0, 0x20}, {0, 0, 0xc0}},
+                           {SampleFormat::F32LE, {0, 0, 0x80, 0x3e}, {0, 0, 0, 0xbf}}};
+    constexpr std::size_t frames = 240;
+    for (const auto &sample : samples)
+    {
+        const PortSpec spec{rate, 2, sample.format};
+        const auto width = sample_bytes(spec.format);
+        Engine engine(period);
+        ClockedGraph clock(engine);
+        const auto from = engine.emplace_node<Capture>(rate, 2, 5ms);
+        const auto to = engine.emplace_node<PacketSink>(PortSpec{rate, 2, SampleFormat::F32P});
+        connect(engine, from, to);
+        engine.commit();
+        const auto *sink = engine.node<PacketSink>(to);
+        bool valid = true;
+        UsrCapture source(spec, [&](OBBlock block) noexcept {
+            const auto bytes = block.byte_view();
+            valid &= block.spec() == spec && block.frames() == frames &&
+                     std::all_of(bytes.begin(), bytes.end(), [](std::uint8_t byte) { return byte == 0; });
+            for (std::size_t frame = 0; frame < block.frames(); ++frame)
+                std::memcpy(bytes.data() + frame * 2 * width, frame % 2 ? sample.negative : sample.positive, width);
+        });
+        source.bind(*engine.node<Capture>(from));
+        check(!source.uses_resampler() && source.device_max_frames() == frames, "Same-rate PCM needs no FIR");
+        for (int run = 0; run < 2; ++run)
+        {
+            source.start();
+            clock.start();
+            for (int block = 0; block < 3; ++block)
+            {
+                wait_for_capture(source, frames);
+                clock.advance();
+                check(sink->active && sink->frames == frames, "Each populated capture block is active");
+                for (std::size_t frame = 0; frame < frames; ++frame)
+                    check(sink->sample(frame, 0) == (frame % 2 ? -0.5f : 0.25f) && sink->sample(frame, 1) == 0,
+                          "Decode each interleaved sample and leave unwritten samples silent");
+            }
+            clock.stop();
+            source.stop();
+            check(valid && !source.running() && !QueueState::queued(source),
+                  "Stop joins the worker and clears queued frames before restart");
+        }
+    }
+}
 
 void endpoint_ownership_and_restart()
 {
@@ -210,6 +285,8 @@ void sample_clock_drift()
 int main(int argc, char **argv)
 {
     return aereborn::test::run_tests(argc, argv, {{"endpoint_ownership_and_restart", endpoint_ownership_and_restart},
+                                                {"user_capture_contract", user_capture_contract},
+                                                {"user_capture_samples_and_restart", user_capture_samples_and_restart},
                                                 {"device_worker_errors", device_worker_errors},
                                                 {"wav_seek_and_padding", wav_seek_and_padding},
                                                 {"sample_clock_drift", sample_clock_drift}});

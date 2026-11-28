@@ -22,7 +22,10 @@ add_executable(aereborn_public_audio_center public/audio_center.cpp)
 target_link_libraries(aereborn_public_audio_center PRIVATE aereborn::aereborn)
 target_include_directories(aereborn_public_audio_center PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/support")
 target_compile_definitions(aereborn_public_audio_center PRIVATE AEREBORN_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/data")
-foreach(case channel_map wav_routing_and_conversion live_control_and_cleanup concurrency_and_teardown)
+foreach(case channel_map wav_routing_and_conversion live_control_and_cleanup concurrency_and_teardown
+    callback_parameters callback_mix_and_diagnostics callback_explicit_conversion callback_live_control
+    callback_isolation_and_drain push_pull_parameters push_pull_pcm push_pull_conversion
+    push_pull_priority push_pull_concurrency push_pull_during_control_wait)
     add_test(NAME public.audio_center_${case} COMMAND aereborn_public_audio_center ${case})
     set_tests_properties(public.audio_center_${case} PROPERTIES LABELS public TIMEOUT 20)
 endforeach()
@@ -46,7 +49,8 @@ aereborn_test_group(dsp plugin_tests.cpp aereborn::aereborn
     mixer_priority_limits mixer_priority_transitions mixer_priority_single_frame_and_reset
     fractional_rate_and_antialias convert_activity_and_tail)
 aereborn_test_group(io backend_tests.cpp aereborn::aereborn
-    endpoint_ownership_and_restart device_worker_errors wav_seek_and_padding sample_clock_drift)
+    endpoint_ownership_and_restart user_capture_contract user_capture_samples_and_restart
+    device_worker_errors wav_seek_and_padding sample_clock_drift)
 aereborn_test_group(io diagnostics_tests.cpp aereborn::aereborn
     diagnostic_reports mixer_priority_diagnostics endpoint_diagnostics)
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")

@@ -11,12 +11,11 @@ namespace
 
 thread_local RetCode thread_last_error;
 
-template <class Fn> auto dispatch(CommandQueue &commands, Fn &&fn) noexcept -> decltype(fn())
+template <class Fn> auto invoke(Fn &&fn) noexcept -> decltype(fn())
 {
-    thread_last_error = RetCode::OK;
     try
     {
-        return commands.sync(fn);
+        return fn();
     }
     catch (const Error &error)
     {
@@ -31,6 +30,21 @@ template <class Fn> auto dispatch(CommandQueue &commands, Fn &&fn) noexcept -> d
         thread_last_error = RetCode::FAILED;
     }
     return decltype(fn())();
+}
+
+template <class Fn> auto dispatch(CommandQueue &commands, Fn &&fn) noexcept -> decltype(fn())
+{
+    thread_last_error = RetCode::OK;
+    return invoke([&] { return commands.sync(fn); });
+}
+
+template <class Fn> std::size_t call_io(Fn &&fn) noexcept
+{
+    return invoke([&] {
+        const auto result = fn();
+        thread_last_error = result.ret_code();
+        return result ? result.value() : 0;
+    });
 }
 
 template <class Fn> RetCode call_status(CommandQueue &commands, Fn &&fn) noexcept
@@ -61,6 +75,38 @@ NodeId AudioCenter::create_owav(const std::string &path, PortSpec spec, std::chr
                                 std::chrono::microseconds io_period)
 {
     return dispatch(*commands_, [&] { return graph_->create_owav(path, spec, segment_duration, io_period); });
+}
+
+NodeId AudioCenter::create_icallback(PortSpec spec, AudioCallback callback, void *user_data,
+                                     std::chrono::microseconds io_period)
+{
+    return dispatch(*commands_, [&] { return graph_->create_icallback(spec, callback, user_data, io_period); });
+}
+
+NodeId AudioCenter::create_ocallback(PortSpec spec, AudioCallback callback, void *user_data,
+                                     std::chrono::microseconds io_period)
+{
+    return dispatch(*commands_, [&] { return graph_->create_ocallback(spec, callback, user_data, io_period); });
+}
+
+NodeId AudioCenter::create_ipush(PortSpec spec, std::chrono::microseconds io_period)
+{
+    return dispatch(*commands_, [&] { return graph_->create_ipush(spec, io_period); });
+}
+
+NodeId AudioCenter::create_opull(PortSpec spec, std::chrono::microseconds io_period)
+{
+    return dispatch(*commands_, [&] { return graph_->create_opull(spec, io_period); });
+}
+
+std::size_t AudioCenter::push(NodeId node, const void *data, std::size_t frames) noexcept
+{
+    return call_io([&] { return graph_->push(node, data, frames); });
+}
+
+std::size_t AudioCenter::pull(NodeId node, void *data, std::size_t frames) noexcept
+{
+    return call_io([&] { return graph_->pull(node, data, frames); });
 }
 
 NodeId AudioCenter::create_mixer(BandWidth bandwidth, std::size_t channels, std::size_t inputs)

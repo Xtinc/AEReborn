@@ -1,7 +1,9 @@
 #include "audio_interface.h"
 #include "test_common.h"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <fstream>
 #include <future>
@@ -116,6 +118,744 @@ void advance(const AudioCenter &audio, std::uint64_t blocks)
 std::string backend_state(NodeId id, const char *state)
 {
     return "\"node\":" + std::to_string(id.node()) + ",\"state\":\"" + state + '"';
+}
+
+const PortSpec stereo_pcm{BandWidth::Full, 2, SampleFormat::S16LE};
+const PortSpec stereo_planar{BandWidth::Full, 2, SampleFormat::F32P};
+
+struct CallbackSource
+{
+    PortSpec spec;
+    std::size_t batch_frames;
+    int levels[2];
+    const std::thread::id control_thread = std::this_thread::get_id();
+    std::atomic<std::size_t> calls{0};
+    std::atomic<bool> valid{true};
+
+    static void fill(const void *input, void *output, std::size_t frames, PortSpec spec, void *data) noexcept
+    {
+        auto &self = *static_cast<CallbackSource *>(data);
+        if (input || !output || spec != self.spec || frames != self.batch_frames ||
+            std::this_thread::get_id() == self.control_thread)
+        {
+            self.valid = false;
+            return;
+        }
+        auto *samples = static_cast<unsigned char *>(output);
+        for (std::size_t frame = 0; frame < frames; ++frame)
+            for (std::size_t ch = 0; ch < spec.channels; ++ch)
+            {
+                const auto value = static_cast<std::uint16_t>(self.levels[ch]);
+                *samples++ = static_cast<unsigned char>(value);
+                *samples++ = static_cast<unsigned char>(value >> 8);
+            }
+        ++self.calls;
+    }
+};
+
+struct CallbackSink
+{
+    static constexpr std::size_t steady_frames = 960;
+
+    CallbackSink(PortSpec spec, std::size_t batch_frames)
+        : spec(spec), batch_frames(batch_frames), samples(96000 * spec.channels * 2)
+    {
+    }
+
+    static void receive(const void *input, void *output, std::size_t frames, PortSpec spec, void *data) noexcept
+    {
+        auto &self = *static_cast<CallbackSink *>(data);
+        const auto delivered = self.delivered.load();
+        const auto frame_bytes = 2 * self.spec.channels;
+        if (!input || output || spec != self.spec || !frames || frames > self.batch_frames ||
+            frames > self.samples.size() / frame_bytes - delivered ||
+            std::this_thread::get_id() == self.control_thread)
+        {
+            self.valid = false;
+            return;
+        }
+        std::memcpy(self.samples.data() + delivered * frame_bytes, input, frames * frame_bytes);
+        self.last_batch = frames;
+        ++self.calls;
+        // Publish the completed prefix. The worker only writes beyond it on subsequent calls.
+        self.delivered = delivered + frames;
+    }
+
+    std::size_t wait_for_levels(std::size_t first_frame, int left, int right, int tolerance = 0) const
+    {
+        auto frame = first_frame;
+        std::size_t matching = 0;
+        wait_for([&] {
+            const auto ready = delivered.load();
+            for (; frame < ready; ++frame)
+            {
+                const auto offset = frame * 4;
+                const auto match = std::abs(sample(samples, offset) - left) <= tolerance &&
+                                   std::abs(sample(samples, offset + 2) - right) <= tolerance;
+                matching = match ? matching + 1 : 0;
+                if (matching == steady_frames)
+                    return true;
+            }
+            return false;
+        }, "Callback output reaches the expected stereo levels for 960 consecutive frames");
+        return frame + 1 - steady_frames;
+    }
+
+    static int sample(const Bytes &samples, std::size_t offset)
+    {
+        const auto word = static_cast<int>(little_endian(samples, offset, 2));
+        return word < 32768 ? word : word - 65536;
+    }
+
+    const PortSpec spec;
+    const std::size_t batch_frames;
+    const std::thread::id control_thread = std::this_thread::get_id();
+    Bytes samples;
+    std::atomic<std::size_t> delivered{0};
+    std::atomic<std::size_t> calls{0};
+    std::size_t last_batch = 0;
+    std::atomic<bool> valid{true};
+};
+
+std::string diagnostic_entry(const std::string &snapshot, const std::string &prefix)
+{
+    const auto start = snapshot.find(prefix);
+    check(start != std::string::npos, "Expected diagnostic entry is present");
+    return snapshot.substr(start, snapshot.find('\n', start) - start);
+}
+
+std::string endpoint_entry(const std::string &snapshot, NodeId id)
+{
+    return diagnostic_entry(snapshot, "{\"id\":" + std::to_string(id.node()) + ",\"type\":");
+}
+
+std::size_t queue_counter(const std::string &entry, const char *name)
+{
+    const auto field = std::string("\"") + name + "\":";
+    const auto start = entry.find(field);
+    check(start != std::string::npos, "Expected queue counter is present");
+    return std::stoull(entry.substr(start + field.size()));
+}
+
+void callback_parameters()
+{
+    AudioCenter audio;
+    const AudioCallback ignore = [](const void *, void *, std::size_t, PortSpec, void *) {};
+    using Factory = NodeId (AudioCenter::*)(PortSpec, AudioCallback, void *, std::chrono::microseconds);
+    for (Factory create : {&AudioCenter::create_icallback, &AudioCenter::create_ocallback})
+    {
+        expect(audio.commit());
+        const auto before = audio.dump_json();
+        for (const auto spec : {PortSpec{}, stereo_planar, PortSpec{BandWidth::Full, 0, SampleFormat::S16LE},
+                                PortSpec{BandWidth::Full, 2, static_cast<SampleFormat>(100)}})
+        {
+            check(!(audio.*create)(spec, ignore, nullptr, 10ms), "Reject an invalid PCM specification");
+            expect(AudioCenter::last_error(), RetCode::EPARAM);
+        }
+        check(!(audio.*create)(stereo_pcm, nullptr, nullptr, 10ms), "Reject a null callback");
+        expect(AudioCenter::last_error(), RetCode::EPARAM);
+        for (const auto period : {-1us, 0us, 20us})
+        {
+            check(!(audio.*create)(stereo_pcm, ignore, nullptr, period), "Reject periods below one frame");
+            expect(AudioCenter::last_error(), RetCode::EPARAM);
+        }
+        check(!(audio.*create)(stereo_pcm, ignore, nullptr, std::chrono::microseconds::max()),
+              "Reject a period that exceeds queue capacity");
+        expect(AudioCenter::last_error(), RetCode::TOOLARGE);
+        check(audio.dump_json() == before, "Rejected callback parameters leave the graph unchanged");
+        for (const auto format : {SampleFormat::S16LE, SampleFormat::S24_3LE, SampleFormat::S24LE,
+                                 SampleFormat::S32LE, SampleFormat::F32LE})
+        {
+            const auto id = (audio.*create)({BandWidth::Full, 2, format}, ignore, nullptr, 21us);
+            check(static_cast<bool>(id), "Accept each interleaved format at the first whole-frame period");
+            expect(audio.remove(id));
+        }
+    }
+}
+
+void callback_mix_and_diagnostics()
+{
+    TempWave files("callback-mix");
+    const auto input = files.path("-input.wav");
+    const auto archive = files.path("-mix.wav");
+    write_constant_stereo(input);
+    CallbackSource source{stereo_pcm, 480, {4096, -4096}};
+    CallbackSink sink(stereo_pcm, 480);
+    AudioCenter audio;
+    const auto user = audio.create_icallback(stereo_pcm, CallbackSource::fill, &source);
+    const auto wave = audio.create_iwav(input, -1);
+    const auto mix = audio.create_mixer(BandWidth::Full, 2, 2);
+    const auto swap = audio.create_matrix(BandWidth::Full, ChannelMap::select(2, {1, 0}));
+    const auto callback = audio.create_ocallback(stereo_pcm, CallbackSink::receive, &sink);
+    const auto wav_sink = audio.create_owav(archive);
+    check(user && wave && mix && swap && callback && wav_sink, "Create the callback and WAV mix graph");
+    check(audio.output_spec(user) == stereo_planar, "The callback source exposes planar float32 to the graph");
+    expect(audio.connect(user, mix[0]));
+    expect(audio.connect(wave, mix[1]));
+    expect(audio.connect(mix, swap));
+    expect(audio.connect(swap, callback));
+    expect(audio.connect(swap, wav_sink));
+    const auto stopped = audio.dump_json();
+    for (const auto id : {user, callback})
+        check(stopped.find(backend_state(id, "Stopped")) != std::string::npos, "New callbacks are stopped");
+    expect(audio.start());
+    const auto first_steady_frame = sink.wait_for_levels(0, 4096, 12288);
+    const auto snapshot = audio.dump_json();
+    for (const auto &prefix : {std::string("{\"type\":\"UsrCapture\",") + backend_state(user, "Running"),
+                               std::string("{\"type\":\"UsrPlayback\",") + backend_state(callback, "Running")})
+    {
+        const auto backend = diagnostic_entry(snapshot, prefix);
+        check(backend.find("\"device\":{\"rate\":48000,\"channels\":2,\"format\":\"S16LE\"},"
+                           "\"max_frames\":480,\"fir\":false,\"async\":false") != std::string::npos,
+              "Callback diagnostics show fixed PCM, batch size, and synchronous conversion without FIR");
+    }
+    for (const auto id : {user, callback})
+    {
+        const auto entry = endpoint_entry(snapshot, id);
+        check(entry.find("\"frames\":null") != std::string::npos ||
+                  queue_counter(entry, "frames") <= queue_counter(entry, "capacity"),
+              "Callback diagnostics show a bounded queue");
+        queue_counter(entry, id == user ? "underrun" : "overflow");
+    }
+    expect(audio.stop());
+    expect(audio.remove(wav_sink));
+    check(source.valid && sink.valid, "Both callbacks have the declared thread and buffer contract");
+    const auto recorded = read_s16(archive, 48000, 2);
+    constexpr std::size_t frame_bytes = 4;
+    constexpr auto steady_bytes = CallbackSink::steady_frames * frame_bytes;
+    const auto first = sink.samples.begin() + first_steady_frame * frame_bytes;
+    for (std::size_t offset = 0; offset + steady_bytes <= recorded.size(); offset += frame_bytes)
+        if (std::equal(first, first + steady_bytes, recorded.begin() + offset))
+            return;
+    check(false, "The WAV branch receives the same stereo mix as the callback");
+}
+
+void callback_explicit_conversion()
+{
+    const PortSpec mono_pcm{BandWidth::Wide, 1, SampleFormat::S16LE};
+    const PortSpec wide_stereo{BandWidth::Wide, 2, SampleFormat::F32P};
+    const PortSpec cd_stereo{BandWidth::CDQuality, 2, SampleFormat::F32P};
+    const PortSpec cd_pcm{BandWidth::CDQuality, 2, SampleFormat::S16LE};
+    CallbackSource source{mono_pcm, 160, {8192, 0}};
+    CallbackSink sink(cd_pcm, 441);
+    AudioCenter audio;
+    const auto user = audio.create_icallback(mono_pcm, CallbackSource::fill, &source);
+    const auto matrix = audio.create_matrix(BandWidth::Wide, ChannelMap::dense(1, 2, {0.75f, -0.375f}));
+    const auto up = audio.create_convert(wide_stereo, stereo_planar);
+    const auto mix = audio.create_mixer(BandWidth::Full, 2, 1);
+    const auto down = audio.create_convert(stereo_planar, cd_stereo);
+    const auto callback = audio.create_ocallback(cd_pcm, CallbackSink::receive, &sink);
+    check(user && matrix && up && mix && down && callback, "Create the explicit channel and rate conversion graph");
+    expect(audio.connect(user, up), RetCode::INVFMT);
+    expect(audio.connect(matrix, mix), RetCode::INVFMT);
+    expect(audio.connect(mix, callback), RetCode::INVFMT);
+    expect(audio.connect(user, matrix));
+    expect(audio.connect(matrix, up));
+    expect(audio.connect(up, mix));
+    expect(audio.connect(mix, down));
+    expect(audio.connect(down, callback));
+    expect(audio.start());
+    sink.wait_for_levels(0, 6144, -3072, 1);
+    expect(audio.stop());
+    check(source.valid && sink.valid, "Conversion keeps each callback's original PCM specification");
+}
+
+void callback_live_control()
+{
+    TempWave files("callback-live-control");
+    const auto input = files.path();
+    write_constant_stereo(input);
+    CallbackSource source{stereo_pcm, 480, {0, 0}};
+    CallbackSink sink(stereo_pcm, 480);
+    AudioCenter audio;
+    const auto high = audio.create_icallback(stereo_pcm, CallbackSource::fill, &source);
+    const auto normal = audio.create_iwav(input, -1);
+    const auto mix = audio.create_mixer(BandWidth::Full, 2, 2);
+    const auto callback = audio.create_ocallback(stereo_pcm, CallbackSink::receive, &sink);
+    check(high && normal && mix && callback, "Create the priority graph");
+    expect(audio.connect(normal, mix[1]));
+    expect(audio.connect(mix, callback));
+    expect(audio.set_high_priority(mix[0], true));
+    expect(audio.start());
+    sink.wait_for_levels(0, 8192, 8192);
+    check(source.calls == 0, "An unconnected callback source has no worker in the plan");
+    expect(audio.connect(high, mix[0]));
+    expect(audio.commit());
+    wait_for([&] { return source.calls > 0; }, "The committed callback source starts");
+    sink.wait_for_levels(sink.delivered, 0, 0);
+    expect(audio.set_paused(high, true));
+    expect(audio.commit());
+    const auto paused = source.calls.load();
+    sink.wait_for_levels(sink.delivered, 8192, 8192);
+    check(source.calls == paused, "Committed pause joins the source and releases high-priority suppression");
+    expect(audio.set_paused(high, false));
+    expect(audio.commit());
+    wait_for([&] { return source.calls > paused; }, "The resumed source starts again");
+    sink.wait_for_levels(sink.delivered, 0, 0);
+    expect(audio.remove(high));
+    const auto removed = source.calls.load();
+    sink.wait_for_levels(sink.delivered, 8192, 8192);
+    check(source.calls == removed && source.valid && sink.valid, "Removal joins the source during playback");
+}
+
+void callback_isolation_and_drain()
+{
+    struct SlowSink
+    {
+        CallbackSink sink{stereo_pcm, 336};
+        std::promise<void> release;
+        std::future<void> ready = release.get_future();
+        std::atomic<bool> entered{false};
+
+        static void receive(const void *input, void *output, std::size_t frames, PortSpec spec, void *data)
+        {
+            auto &self = *static_cast<SlowSink *>(data);
+            if (!self.entered.exchange(true) && self.ready.wait_for(5s) != std::future_status::ready)
+                self.sink.valid = false;
+            CallbackSink::receive(input, output, frames, spec, &self.sink);
+        }
+    };
+    CallbackSource source{stereo_pcm, 480, {4096, -4096}};
+    CallbackSink fast(stereo_pcm, 480);
+    SlowSink slow;
+    std::future<RetCode> pause;
+    AudioCenter audio;
+    const auto user = audio.create_icallback(stereo_pcm, CallbackSource::fill, &source);
+    const auto fast_sink = audio.create_ocallback(stereo_pcm, CallbackSink::receive, &fast);
+    const auto slow_sink = audio.create_ocallback(stereo_pcm, SlowSink::receive, &slow, 7ms);
+    check(user && fast_sink && slow_sink, "Create two independent playback workers");
+    expect(audio.connect(user, fast_sink));
+    expect(audio.connect(user, slow_sink));
+    expect(audio.start());
+    wait_for([&] { return slow.entered.load(); }, "The slow output callback is blocked in its first batch");
+    const auto before = tick(audio);
+    fast.wait_for_levels(fast.delivered, 4096, -4096);
+    wait_for([&] { return queue_counter(endpoint_entry(audio.dump_json(), slow_sink), "overflow") > 0; },
+             "Only the blocked branch fills its playback queue");
+    const auto snapshot = audio.dump_json();
+    const auto slow_entry = endpoint_entry(snapshot, slow_sink);
+    const auto queued = queue_counter(slow_entry, "frames");
+    check(tick(audio) > before && slow.sink.delivered == 0 && queued == queue_counter(slow_entry, "capacity") &&
+              queue_counter(endpoint_entry(snapshot, fast_sink), "overflow") == 0,
+          "The clock and fast branch continue while the slow queue remains full");
+    expect(audio.set_paused(slow_sink, true));
+    expect(audio.disconnect(user, fast_sink));
+    pause = std::async(std::launch::async, [&] { return audio.commit(); });
+    // Silence on the fast branch proves the new plan is active before the slow worker resumes.
+    fast.wait_for_levels(fast.delivered, 0, 0);
+    slow.release.set_value();
+    expect(pause.get());
+    check(source.valid && fast.valid && slow.sink.valid && slow.sink.delivered == 336 + queued &&
+              slow.sink.last_batch == queued % 336 && slow.sink.last_batch > 0,
+          "Pause returns after the in-flight batch and every queued frame, including the short tail");
+    expect(audio.stop());
+
+    CallbackSink tail(stereo_pcm, 480000);
+    AudioCenter draining;
+    check(static_cast<bool>(draining.create_ocallback(stereo_pcm, CallbackSink::receive, &tail, 10s)),
+          "Create a sink whose batch exceeds the test run");
+    expect(draining.start());
+    advance(draining, 3);
+    check(tail.calls == 0, "Steady playback waits for a full batch");
+    expect(draining.stop());
+    check(tail.calls == 1 && tail.valid && tail.last_batch == tail.delivered &&
+              tail.last_batch >= 960 && tail.last_batch < tail.batch_frames && !has_signal(tail.samples),
+          "Stop joins the worker after delivering a single short batch of queued silence");
+}
+
+void push_pull_parameters()
+{
+    AudioCenter audio;
+    for (const auto create : {&AudioCenter::create_ipush, &AudioCenter::create_opull})
+    {
+        for (const auto spec : {stereo_planar, PortSpec{BandWidth::Unknown, 2, SampleFormat::S16LE},
+                                PortSpec{BandWidth::Full, 0, SampleFormat::S16LE}})
+        {
+            check(!(audio.*create)(spec, 10ms), "Reject an invalid interleaved PCM specification");
+            expect(AudioCenter::last_error(), RetCode::EPARAM);
+        }
+        for (const auto period : {-1us, 0us, 20us})
+        {
+            check(!(audio.*create)(stereo_pcm, period), "Reject a period shorter than one frame");
+            expect(AudioCenter::last_error(), RetCode::EPARAM);
+        }
+        check(!(audio.*create)(stereo_pcm, std::chrono::microseconds::max()), "Reject an oversized queue");
+        expect(AudioCenter::last_error(), RetCode::TOOLARGE);
+        for (const auto format : {SampleFormat::S24LE, SampleFormat::S32LE})
+        {
+            const auto node = (audio.*create)({BandWidth::Full, 2, format}, 21us);
+            check(static_cast<bool>(node), "Accept PCM in four-byte slots at the minimum valid period");
+            expect(audio.remove(node));
+        }
+    }
+
+    TempWave files("push-pull-parameters");
+    const auto source = audio.create_ipush(stereo_pcm);
+    const auto sink = audio.create_opull(stereo_pcm);
+    const auto mixer = audio.create_mixer(BandWidth::Full, 2, 1);
+    const auto wav = audio.create_owav(files.path());
+    check(source && sink && mixer && wav, "Create the nodes used by the error checks");
+    check(audio.output_spec(source) == stereo_planar, "A push source exposes the matching F32P graph port");
+    unsigned char pcm[4]{};
+    const auto verify = [&](NodeId push_id, NodeId pull_id, unsigned char *data, std::size_t frames, RetCode error) {
+        check(audio.push(push_id, data, frames) == 0, "Push returns zero frames");
+        expect(AudioCenter::last_error(), error);
+        check(audio.pull(pull_id, data, frames) == 0, "Pull returns zero frames");
+        expect(AudioCenter::last_error(), error);
+    };
+    verify(source[1], sink[1], pcm, 1, RetCode::EPORT);
+    verify({}, {}, pcm, 1, RetCode::ENODE);
+    verify(sink, source, pcm, 1, RetCode::ETYPE);
+    verify(mixer, wav, pcm, 1, RetCode::ETYPE);
+    verify(source, sink, nullptr, 1, RetCode::EPARAM);
+    verify(source, sink, pcm, std::numeric_limits<std::size_t>::max() / sizeof(pcm) + 1, RetCode::TOOLARGE);
+    verify(source, sink, nullptr, 0, RetCode::ESTATE);
+    expect(audio.connect(source, sink));
+    expect(audio.start());
+    verify(source, sink, nullptr, 0, RetCode::OK);
+    advance(audio, 2);
+    check(queue_counter(endpoint_entry(audio.dump_json(), sink), "frames") > 0, "Playback queues frames before pause");
+    expect(audio.set_paused(source, true));
+    expect(audio.set_paused(sink, true));
+    expect(audio.commit());
+    verify(source, sink, pcm, 1, RetCode::ESTATE);
+    check(queue_counter(endpoint_entry(audio.dump_json(), sink), "frames") == 0, "Pause discards the playback queue");
+    expect(audio.remove(source));
+    expect(audio.remove(sink));
+    verify(source, sink, pcm, 1, RetCode::ENODE);
+}
+
+void push_pull_pcm()
+{
+    const auto frames = std::size_t{12000};
+    const auto block = std::size_t{480};
+    for (const auto format : {SampleFormat::S16LE, SampleFormat::S24_3LE, SampleFormat::F32LE})
+    {
+        const PortSpec spec{BandWidth::Full, 2, format};
+        const auto width = format == SampleFormat::S16LE ? 2u : format == SampleFormat::S24_3LE ? 3u : 4u;
+        const auto frame_bytes = 2 * width;
+        Bytes pcm(frames * frame_bytes);
+        for (std::size_t frame = 0; frame < frames; ++frame)
+        {
+            const auto phase = static_cast<std::uint32_t>(frame % 1024);
+            const auto left = format == SampleFormat::F32LE ? 0x3e800000u + (phase << 11) : (0x1000u + phase);
+            const auto right = format == SampleFormat::F32LE ? 0xbe800000u + (phase << 11) : (0xc000u - phase);
+            const auto shift = format == SampleFormat::S24_3LE ? 8u : 0u;
+            for (unsigned byte = 0; byte < width; ++byte)
+            {
+                pcm[frame * frame_bytes + byte] = static_cast<unsigned char>((left << shift) >> (8 * byte));
+                pcm[frame * frame_bytes + width + byte] = static_cast<unsigned char>((right << shift) >> (8 * byte));
+            }
+        }
+        AudioCenter audio;
+        const auto source = audio.create_ipush(spec, 40ms);
+        const auto mix = audio.create_mixer(BandWidth::Full, 2, 1);
+        const auto swap = audio.create_matrix(BandWidth::Full, ChannelMap::select(2, {1, 0}));
+        const auto sink = audio.create_opull(spec, 100ms);
+        check(source && mix && swap && sink, "Create each same-rate PCM route");
+        expect(audio.connect(source, mix));
+        expect(audio.connect(mix, swap));
+        expect(audio.connect(swap, sink));
+        expect(audio.start());
+        const auto offer = [&](std::size_t offset) {
+            const auto count = audio.push(source, pcm.data() + offset * frame_bytes, frames - offset);
+            expect(AudioCenter::last_error());
+            return count;
+        };
+        auto sent = offer(0);
+        check(sent > block && sent < frames, "A burst crosses scratch slices and stops at the queue limit");
+        const auto immediately_accepted = offer(sent);
+        sent += immediately_accepted;
+        bool full = immediately_accepted == 0;
+        advance(audio, 3);
+        const auto snapshot = audio.dump_json();
+        for (const auto &prefix : {std::string("{\"type\":\"PushSource\",") + backend_state(source, "Running"),
+                                   std::string("{\"type\":\"PullSink\",") + backend_state(sink, "Running")})
+        {
+            const auto entry = diagnostic_entry(snapshot, prefix);
+            check(entry.find("\"max_frames\":480,\"fir\":false,\"async\":false,\"active\":false") !=
+                      std::string::npos,
+                  "Passive diagnostics show the slice limit and synchronous PCM without FIR");
+        }
+        const auto source_entry = endpoint_entry(snapshot, source);
+        const auto queued = queue_counter(source_entry, "frames");
+        check(queued > block && queued <= queue_counter(source_entry, "capacity"), "Capture reports live queue fill");
+        queue_counter(source_entry, "underrun");
+        queue_counter(endpoint_entry(snapshot, sink), "overflow");
+
+        Bytes out(4 * block * frame_bytes);
+        std::size_t received = 0;
+        bool sliced_pull = false;
+        wait_for([&] {
+            if (sent < frames)
+            {
+                const auto count = offer(sent);
+                full |= count == 0;
+                sent += count;
+            }
+            std::size_t count;
+            do
+            {
+                std::fill(out.begin(), out.end(), 0xa5);
+                count = audio.pull(sink, out.data(), out.size() / frame_bytes);
+                expect(AudioCenter::last_error());
+                sliced_pull |= count > block;
+                check(std::all_of(out.begin() + count * frame_bytes, out.end(),
+                                  [](unsigned char byte) { return byte == 0xa5; }), "Pull leaves the suffix intact");
+                for (std::size_t frame = 0; frame < count; ++frame)
+                {
+                    const auto actual = out.begin() + frame * frame_bytes;
+                    if (std::all_of(actual, actual + frame_bytes, [](unsigned char byte) { return byte == 0; }))
+                        continue;
+                    check(received < frames, "The burst does not duplicate frames");
+                    const auto expected = pcm.begin() + received * frame_bytes;
+                    check(std::equal(actual, actual + width, expected + width) &&
+                              std::equal(actual + width, actual + frame_bytes, expected),
+                          "Burst chunks preserve every sample in order through the channel swap");
+                    ++received;
+                }
+            } while (count);
+            return received == frames;
+        }, "Receive the entire pushed PCM burst");
+        check(sent == frames && full && sliced_pull, "Short writes resume at the correct offset and pulls span slices");
+    }
+}
+
+void push_pull_conversion()
+{
+    TempWave files("push-pull-conversion");
+    const auto input = files.path("-input.wav");
+    const auto archive = files.path("-mix.wav");
+    write_constant_stereo(input);
+    const PortSpec mono{BandWidth::Wide, 1, SampleFormat::S16LE};
+    const PortSpec wide_stereo{BandWidth::Wide, 2, SampleFormat::F32P};
+    AudioCenter audio;
+    const auto push = audio.create_ipush(mono, 80ms);
+    const auto matrix = audio.create_matrix(BandWidth::Wide, ChannelMap::dense(1, 2, {1.0f, -1.0f}));
+    const auto convert = audio.create_convert(wide_stereo, stereo_planar);
+    const auto wav = audio.create_iwav(input, -1);
+    const auto mix = audio.create_mixer(BandWidth::Full, 2, 2);
+    const auto pull = audio.create_opull(stereo_pcm);
+    const auto writer = audio.create_owav(archive);
+    check(push && matrix && convert && wav && mix && pull && writer, "Create the heterogeneous mix graph");
+    expect(audio.connect(push, convert), RetCode::INVFMT);
+    expect(audio.connect(matrix, mix), RetCode::INVFMT);
+    expect(audio.connect(push, matrix));
+    expect(audio.connect(matrix, convert));
+    expect(audio.connect(convert, mix[0]));
+    expect(audio.connect(wav, mix[1]));
+    expect(audio.connect(mix, pull));
+    expect(audio.connect(mix, writer));
+    expect(audio.start());
+    Bytes pcm(1600 * 2);
+    for (std::size_t byte = 1; byte < pcm.size(); byte += 2)
+        pcm[byte] = 0x10;
+    check(audio.push(push, pcm.data(), 1600) == 1600, "Queue 100 ms of mono PCM for conversion");
+    Bytes out(1920 * 4), steady;
+    wait_for([&] {
+        const auto frames = audio.pull(pull, out.data(), out.size() / 4);
+        expect(AudioCenter::last_error());
+        for (std::size_t frame = 0; frame < frames; ++frame)
+        {
+            const auto offset = frame * 4;
+            if (std::abs(CallbackSink::sample(out, offset) - 12288) > 1 ||
+                std::abs(CallbackSink::sample(out, offset + 2) - 4096) > 1)
+                steady.clear();
+            else
+                steady.insert(steady.end(), out.begin() + offset, out.begin() + offset + 4);
+            if (steady.size() == 960 * 4)
+                return true;
+        }
+        return false;
+    }, "The converted mono signal mixes with stereo WAV at the expected levels");
+    expect(audio.stop());
+    expect(audio.remove(writer));
+    const auto recorded = read_s16(archive, 48000, 2);
+    for (std::size_t offset = 0; offset + steady.size() <= recorded.size(); offset += 4)
+        if (std::equal(steady.begin(), steady.end(), recorded.begin() + offset))
+            return;
+    check(false, "WAV and pull branches receive identical converted stereo samples");
+}
+
+void push_pull_priority()
+{
+    CallbackSource normal{stereo_pcm, 480, {8192, 8192}};
+    AudioCenter audio;
+    const auto voice = audio.create_ipush(stereo_pcm);
+    const auto background = audio.create_icallback(stereo_pcm, CallbackSource::fill, &normal);
+    const auto mix = audio.create_mixer(BandWidth::Full, 2, 2);
+    const auto sink = audio.create_opull(stereo_pcm, 40ms);
+    check(voice && background && mix && sink, "Create the high-priority push route");
+    expect(audio.connect(voice, mix[0]));
+    expect(audio.connect(background, mix[1]));
+    expect(audio.connect(mix, sink));
+    expect(audio.set_high_priority(mix[0], true));
+    expect(audio.start());
+    advance(audio, 4);
+    Bytes out(8 * 480 * 4);
+    while (audio.pull(sink, out.data(), out.size() / 4))
+        expect(AudioCenter::last_error());
+    expect(AudioCenter::last_error());
+    Bytes voice_pcm(2 * 480 * 4, 0);
+    check(audio.push(voice, voice_pcm.data(), 2 * 480) == 2 * 480, "Two intentional silent blocks enter the high-priority queue");
+    std::vector<int> levels;
+    wait_for([&] {
+        const auto frames = audio.pull(sink, out.data(), out.size() / 4);
+        expect(AudioCenter::last_error());
+        for (std::size_t frame = 0; frame < frames; ++frame)
+            levels.push_back(CallbackSink::sample(out, frame * 4));
+        return levels.size() >= 6 * 480;
+    }, "Observe suppression and recovery after the push queue drains");
+    const auto fade = std::find_if(levels.begin(), levels.end(), [](int level) { return level > 0 && level < 8192; });
+    check(levels.end() - fade >= 4 * 480, "The normal input begins fading on the first pushed block");
+    for (int frame = 0; frame < 480; ++frame)
+    {
+        check(std::abs(fade[frame] - 8192 * (479 - frame) / 480) <= 1 &&
+                  fade[480 + frame] == 0 &&
+                  std::abs(fade[960 + frame] - 8192 * (frame + 1) / 480) <= 1 &&
+                  fade[1440 + frame] == 8192,
+              "The two active blocks suppress the normal input and its first empty block fades back in");
+    }
+    expect(audio.stop());
+    check(normal.valid, "The background callback remains active through recovery");
+}
+
+void push_pull_concurrency()
+{
+    AudioCenter audio;
+    const auto source = audio.create_ipush(stereo_pcm);
+    const auto matrix = audio.create_matrix(BandWidth::Full, ChannelMap::identity(2));
+    const auto sink = audio.create_opull(stereo_pcm);
+    check(source && matrix && sink, "Create the concurrent push/pull route");
+    expect(audio.connect(source, matrix));
+    expect(audio.connect(matrix, sink));
+    expect(audio.start());
+
+    struct Counts
+    {
+        std::atomic<std::size_t> frames{0};
+        std::atomic<std::size_t> stopped{0};
+    };
+    Counts sent, received;
+    std::atomic<bool> done{false};
+    const auto push = [&](void *pcm, std::size_t frames) { return audio.push(source, pcm, frames); };
+    const auto pull = [&](void *pcm, std::size_t frames) { return audio.pull(sink, pcm, frames); };
+    const auto run = [&](const auto &transfer, Counts &counts) {
+        unsigned char pcm[4 * 247]{};
+        while (!done)
+        {
+            counts.frames += transfer(pcm, 247);
+            const auto status = AudioCenter::last_error();
+            if (status == RetCode::ENODE)
+            {
+                check(transfer(pcm, 247) == 0, "Subsequent calls return zero after removal");
+                expect(AudioCenter::last_error(), RetCode::ENODE);
+                return;
+            }
+            if (status == RetCode::ESTATE)
+                ++counts.stopped;
+            else
+                expect(status);
+            std::this_thread::yield();
+        }
+    };
+    std::future<void> producer, second_producer, consumer;
+    struct StopTransfers
+    {
+        std::atomic<bool> &done;
+        ~StopTransfers() { done = true; }
+    } stop{done};
+    producer = std::async(std::launch::async, [&] { run(push, sent); });
+    second_producer = std::async(std::launch::async, [&] { run(push, sent); });
+    consumer = std::async(std::launch::async, [&] { run(pull, received); });
+    wait_for([&] { return sent.frames > 0 && received.frames > 0; }, "Both workers transfer frames");
+    for (int iteration = 0; iteration < 8; ++iteration)
+    {
+        expect(audio.set_gain(matrix, iteration % 2 ? 0.5f : 1.0f));
+        const auto unrelated = audio.create_mixer(BandWidth::Full, 1, 1);
+        check(static_cast<bool>(unrelated), "An unrelated node can be created during transfers");
+        expect(audio.remove(unrelated));
+        expect(audio.disconnect(matrix));
+        expect(audio.set_paused(source, true));
+        expect(audio.set_paused(sink, true));
+        expect(audio.commit());
+        const auto stopped_pushes = sent.stopped.load();
+        const auto stopped_pulls = received.stopped.load();
+        wait_for([&] { return sent.stopped > stopped_pushes && received.stopped > stopped_pulls; },
+                 "Both workers observe the committed pause");
+        const auto sent_before = sent.frames.load();
+        const auto received_before = received.frames.load();
+        expect(audio.connect(source, matrix));
+        expect(audio.set_paused(source, false));
+        expect(audio.set_paused(sink, false));
+        expect(audio.commit());
+        wait_for([&] { return sent.frames > sent_before && received.frames > received_before; },
+                 "Both workers resume after reconnection");
+    }
+    expect(audio.stop());
+    const auto stopped_pushes = sent.stopped.load();
+    const auto stopped_pulls = received.stopped.load();
+    wait_for([&] { return sent.stopped > stopped_pushes && received.stopped > stopped_pulls; },
+             "Both workers observe stop");
+    expect(audio.start());
+    expect(audio.remove(source));
+    expect(audio.remove(sink));
+    wait_for([&] {
+        return producer.wait_for(0ms) == std::future_status::ready &&
+               second_producer.wait_for(0ms) == std::future_status::ready &&
+               consumer.wait_for(0ms) == std::future_status::ready;
+    }, "Each worker observes removal");
+    expect(AudioCenter::last_error());
+    producer.get();
+    second_producer.get();
+    consumer.get();
+}
+
+void push_pull_during_control_wait()
+{
+    struct Gate
+    {
+        std::promise<void> release;
+        std::future<void> ready = release.get_future();
+        std::atomic<bool> entered{false};
+
+        static void wait(const void *, void *, std::size_t, PortSpec, void *data)
+        {
+            auto &gate = *static_cast<Gate *>(data);
+            if (!gate.entered.exchange(true))
+                gate.ready.wait_for(5s);
+        }
+    } gate;
+    std::future<RetCode> commit;
+    AudioCenter audio;
+    const auto source = audio.create_ipush(stereo_pcm);
+    const auto sink = audio.create_opull(stereo_pcm);
+    const auto idle = audio.create_ipush(stereo_pcm);
+    const auto blocked = audio.create_ocallback(stereo_pcm, Gate::wait, &gate);
+    const auto mixer = audio.create_mixer(BandWidth::Full, 2, 1);
+    check(source && sink && idle && blocked && mixer, "Create independent passive and callback branches");
+    expect(audio.connect(source, sink));
+    expect(audio.start());
+    unsigned char one_frame[4]{};
+    check(audio.push(idle, one_frame, 1) == 0, "An unused push source is excluded from the plan");
+    expect(AudioCenter::last_error(), RetCode::ESTATE);
+    wait_for([&] { return gate.entered.load(); }, "The callback holds its first playback batch");
+    expect(audio.set_paused(blocked, true));
+    commit = std::async(std::launch::async, [&] { return audio.commit(); });
+    check(commit.wait_for(30ms) == std::future_status::timeout, "The commit waits for the callback");
+    check(audio.push(source, one_frame, 1) == 1, "Push proceeds while commit is held");
+    expect(AudioCenter::last_error());
+    check(audio.pull(sink, one_frame, 1) == 1, "Pull proceeds while commit is held");
+    expect(AudioCenter::last_error());
+    check(audio.push({}, one_frame, 1) == 0, "A missing handle is rejected while commit is held");
+    expect(AudioCenter::last_error(), RetCode::ENODE);
+    check(audio.push(mixer, one_frame, 1) == 0, "A mixer handle is rejected while commit is held");
+    expect(AudioCenter::last_error(), RetCode::ETYPE);
+    check(audio.pull(blocked, one_frame, 1) == 0, "A callback handle is rejected while commit is held");
+    expect(AudioCenter::last_error(), RetCode::ETYPE);
+    check(commit.wait_for(0ms) == std::future_status::timeout, "Transfers and handle errors bypass the control queue");
+    gate.release.set_value();
+    expect(commit.get());
 }
 
 bool runs_before(const std::string &snapshot, NodeId first, NodeId second)
@@ -453,5 +1193,16 @@ int main(int argc, char **argv)
                      {{"channel_map", channel_map},
                       {"wav_routing_and_conversion", wav_routing_and_conversion},
                       {"live_control_and_cleanup", live_control_and_cleanup},
-                      {"concurrency_and_teardown", concurrency_and_teardown}});
+                      {"concurrency_and_teardown", concurrency_and_teardown},
+                      {"callback_parameters", callback_parameters},
+                      {"callback_mix_and_diagnostics", callback_mix_and_diagnostics},
+                      {"callback_explicit_conversion", callback_explicit_conversion},
+                      {"callback_live_control", callback_live_control},
+                      {"callback_isolation_and_drain", callback_isolation_and_drain},
+                      {"push_pull_parameters", push_pull_parameters},
+                      {"push_pull_pcm", push_pull_pcm},
+                      {"push_pull_conversion", push_pull_conversion},
+                      {"push_pull_priority", push_pull_priority},
+                      {"push_pull_concurrency", push_pull_concurrency},
+                      {"push_pull_during_control_wait", push_pull_during_control_wait}});
 }

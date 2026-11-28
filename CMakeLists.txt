@@ -21,6 +21,7 @@ add_library(aereborn STATIC
     backend/null_backend.cpp
     backend/pull_sink.cpp
     backend/push_source.cpp
+    backend/usr_capture.cpp
     backend/usr_playback.cpp
     backend/wav_backend.cpp
     backend/wav_file.cpp

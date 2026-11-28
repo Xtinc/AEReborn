@@ -78,8 +78,8 @@ class ChannelMap
     RetCode status_{RetCode::EPARAM};
 };
 
-/// @brief Control a graph of WAV endpoints, mixers, and channel matrices.
-/// @note Calls on a live instance serialize on a control thread and may block.
+/// @brief Control a graph of WAV, callback, and push/pull endpoints, mixers, and channel matrices.
+/// @note Control calls serialize on a control thread and may block.
 /// @pre All external calls must return before destruction begins.
 class AudioCenter
 {
@@ -112,6 +112,57 @@ class AudioCenter
                        std::chrono::seconds segment_duration = std::chrono::seconds(0),
                        std::chrono::microseconds io_period = std::chrono::milliseconds(10));
 
+    /// @brief Create a callback source with an F32P graph output at spec's sample rate and channel count.
+    /// @param spec Fixed interleaved PCM specification (S16LE, S24_3LE, S24LE, S32LE, or F32LE).
+    /// @param callback Non-null function that fills a zero-initialized output buffer on a worker thread.
+    /// @param user_data Caller pointer that must stay valid while the endpoint can call the callback.
+    /// @param io_period Duration used to size batches and the queue. The batch frame count rounds down.
+    /// @return A node handle, or an empty handle on failure. See last_error().
+    NodeId create_icallback(PortSpec spec, AudioCallback callback, void *user_data = nullptr,
+                            std::chrono::microseconds io_period = std::chrono::milliseconds(10));
+
+    /// @brief Create a callback sink with an F32P graph input at spec's sample rate and channel count.
+    /// @param spec Fixed interleaved PCM specification (S16LE, S24_3LE, S24LE, S32LE, or F32LE).
+    /// @param callback Non-null function that receives read-only input on a worker thread.
+    /// @param user_data Caller pointer that must stay valid while the endpoint can call the callback.
+    /// @param io_period Duration used to size batches and the queue. The batch frame count rounds down.
+    /// @return A node handle, or an empty handle on failure. See last_error().
+    /// @note Stop and committed pause drain buffered audio before returning. The last batch may be shorter.
+    NodeId create_ocallback(PortSpec spec, AudioCallback callback, void *user_data = nullptr,
+                            std::chrono::microseconds io_period = std::chrono::milliseconds(10));
+
+    /// @brief Create a caller-driven PCM source with an F32P graph output.
+    /// @param spec Fixed sample rate, channel count, and interleaved PCM format (S16LE, S24_3LE, S24LE, S32LE, or F32LE).
+    /// @param io_period Burst duration budget used to size the queue.
+    /// @return A node handle, or an empty handle on failure. See last_error().
+    NodeId create_ipush(PortSpec spec, std::chrono::microseconds io_period = std::chrono::milliseconds(10));
+
+    /// @brief Create a caller-driven PCM sink with an F32P graph input.
+    /// @param spec Fixed sample rate, channel count, and one of create_ipush()'s interleaved PCM formats.
+    /// @param io_period Burst duration budget used to size the queue.
+    /// @return A node handle, or an empty handle on failure. See last_error().
+    /// @note Stop and committed pause discard buffered frames.
+    NodeId create_opull(PortSpec spec, std::chrono::microseconds io_period = std::chrono::milliseconds(10));
+
+    /// @brief Offer interleaved PCM to a push source without waiting for queue space.
+    /// @param node Handle from create_ipush(), with port index zero.
+    /// @param data Borrowed PCM in the declared format, valid for this call. May be null for zero frames.
+    /// @param frames Number of input frames to offer.
+    /// @return Frames accepted. Resume a short write at this frame offset.
+    /// @note Intended for application threads. Calls serialize per node with each other and lifecycle changes.
+    ///       Handle lookup and transfer run on the calling thread.
+    /// @note last_error() reports OK on success or backpressure, ESTATE when stopped, or EPORT, ENODE, ETYPE,
+    ///       EPARAM, or TOOLARGE for invalid handles, buffers, or sizes.
+    std::size_t push(NodeId node, const void *data, std::size_t frames) noexcept;
+
+    /// @brief Read available interleaved PCM from a pull sink without waiting for audio.
+    /// @param node Handle from create_opull(), with port index zero.
+    /// @param data Borrowed writable PCM in the declared format, valid for this call. May be null for zero frames.
+    /// @param frames Maximum number of output frames to read.
+    /// @return Frames written. The unwritten suffix is left intact.
+    /// @note Uses the same serialization and last_error() rules as push().
+    std::size_t pull(NodeId node, void *data, std::size_t frames) noexcept;
+
     /// @brief Create an F32P mixer with 1 to 64 inputs. Returns an empty handle on failure.
     NodeId create_mixer(BandWidth bandwidth, std::size_t channels, std::size_t inputs);
     /// @brief Create a node by copying a channel map and applying the given linear gain.
@@ -124,7 +175,7 @@ class AudioCenter
     /// @note Use create_matrix() to change the channel count.
     NodeId create_convert(PortSpec input, PortSpec output);
 
-    /// @brief Read the graph-side specification of an output port, including WAV sources.
+    /// @brief Read the graph-side specification of an output port.
     /// @return The port specification, or an invalid specification on failure. See last_error().
     PortSpec output_spec(NodeId port) const;
 
@@ -134,7 +185,7 @@ class AudioCenter
     /// @brief Stage removal of the given connection.
     RetCode disconnect(NodeId from, NodeId to);
     /// @brief Stage removal of the connection at the destination input.
-    /// @note Unconnected, unpaused WAV outputs record silence while running.
+    /// @note After commit, unpaused outputs without a source receive silence while the graph runs.
     RetCode disconnect(NodeId to);
     /// @brief Remove a node and its connections from the draft. The handle must select port zero.
     /// @note Endpoint removal unbinds immediately, including when an old plan still contains it.
@@ -146,7 +197,8 @@ class AudioCenter
     RetCode commit();
     /// @brief Commit pending edits, start the backends in the plan, and start the clock.
     RetCode start();
-    /// @brief Stop the backends and clock, draining queued audio without closing WAV files.
+    /// @brief Stop the backends and clock. WAV and callback outputs drain and pull sinks discard queued audio.
+    /// @note WAV files stay open.
     RetCode stop() noexcept;
 
     /// @brief Stage a node pause or resume for the next commit. The handle must select port zero.
@@ -162,7 +214,7 @@ class AudioCenter
     /// @return The snapshot, or an empty string on failure. See last_error().
     std::string dump_json() const;
 
-    /// @brief Return the status of the most recent control or diagnostic call on this thread.
+    /// @brief Return the status of the most recent control, diagnostic, or push/pull call on this thread.
     /// @note Successful calls store OK. Construction, destruction, and this query leave it alone.
     static RetCode last_error() noexcept;
 
